@@ -171,3 +171,34 @@ variable "limite_de_permissoes_arn" {
   description = "ARN do permissions boundary aplicado a toda role criada aqui (teto de permissões; vem do ambiente `esteira`)."
   type        = string
 }
+
+variable "janelas_de_pico" {
+  description = "Picos previsíveis (início de mês, datas de pagamento): em `inicio` o mínimo de tasks sobe para `min_tasks` (e o máximo para `max_tasks`, se informado); em `fim` volta ao mínimo/máximo de base. `inicio`/`fim` no formato do Application Auto Scaling, ex.: cron(30 6 1 * ? *). Vazio = só target tracking."
+  type = list(object({
+    nome      = string
+    inicio    = string
+    fim       = string
+    min_tasks = number
+    max_tasks = optional(number)
+  }))
+  default = []
+
+  validation {
+    condition = alltrue([
+      for j in var.janelas_de_pico :
+      j.min_tasks >= 1 && j.min_tasks <= coalesce(j.max_tasks, var.max_tasks) && can(regex("^(cron|at|rate)\\(.+\\)$", j.inicio)) && can(regex("^(cron|at|rate)\\(.+\\)$", j.fim))
+    ])
+    error_message = "Cada janela precisa de 1 <= min_tasks <= máximo e de inicio/fim no formato cron(...), at(...) ou rate(...)."
+  }
+
+  validation {
+    condition     = length(var.janelas_de_pico) == length(distinct([for j in var.janelas_de_pico : j.nome]))
+    error_message = "Os nomes das janelas de pico devem ser únicos."
+  }
+}
+
+variable "fuso_horario" {
+  description = "Fuso (IANA) em que as expressões das janelas de pico são avaliadas."
+  type        = string
+  default     = "America/Sao_Paulo"
+}

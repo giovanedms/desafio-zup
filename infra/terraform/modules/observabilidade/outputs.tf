@@ -6,8 +6,17 @@ output "dashboard_nome" {
 output "alarmes" {
   description = "Nomes dos alarmes."
   value = concat(
-    [aws_cloudwatch_metric_alarm.api_5xx.alarm_name, aws_cloudwatch_metric_alarm.api_p99.alarm_name, aws_cloudwatch_metric_alarm.relay_iterator_age.alarm_name, aws_cloudwatch_metric_alarm.guarda.alarm_name],
+    [
+      aws_cloudwatch_metric_alarm.api_5xx.alarm_name, aws_cloudwatch_metric_alarm.api_p99.alarm_name,
+      aws_cloudwatch_metric_alarm.relay_iterator_age.alarm_name, aws_cloudwatch_metric_alarm.guarda.alarm_name,
+      aws_cloudwatch_metric_alarm.reservas.alarm_name, aws_cloudwatch_metric_alarm.defasagem_legado.alarm_name,
+    ],
     [for a in aws_cloudwatch_metric_alarm.dlq : a.alarm_name],
     [for a in aws_cloudwatch_metric_alarm.reconciliador : a.alarm_name],
   )
+}
+
+output "topico_alarmes_arn" {
+  description = "ARN do tópico SNS que recebe todos os alarmes (assinar o plantão aqui)."
+  value       = aws_sns_topic.alarmes.arn
 }

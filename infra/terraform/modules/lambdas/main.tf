@@ -15,12 +15,23 @@ locals {
     }]
   })
 
+  # Anti-confused-deputy documentado pelo EventBridge Scheduler: aws:SourceAccount + aws:SourceArn do schedule GROUP
+  # (não do schedule). O sweeper usa o grupo `default`.
+  # https://docs.aws.amazon.com/scheduler/latest/UserGuide/cross-service-confused-deputy-prevention.html
+  # A role do Lambda (assume_lambda acima) fica SEM condição: a documentação da execution role do Lambda não traz
+  # aws:SourceAccount/SourceArn, e uma condição não suportada impediria a função de assumir a role.
   assume_scheduler = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect    = "Allow"
       Principal = { Service = "scheduler.amazonaws.com" }
       Action    = "sts:AssumeRole"
+      Condition = {
+        StringEquals = {
+          "aws:SourceAccount" = var.account_id
+          "aws:SourceArn"     = "arn:aws:scheduler:${var.regiao}:${var.account_id}:schedule-group/default"
+        }
+      }
     }]
   })
 
@@ -126,7 +137,7 @@ resource "aws_iam_role_policy" "relay" {
 resource "aws_lambda_function" "relay" {
   #checkov:skip=CKV_AWS_117:Funções fora da VPC de propósito: sandbox sem NAT, e só falam com APIs AWS públicas.
   #checkov:skip=CKV_AWS_116:Falhas do relay vão para a DLQ do ESM (on-failure destination); não há invocação assíncrona.
-  #checkov:skip=CKV_AWS_115:Concorrência reservada consumiria da cota de 400 da conta nova (ADR-0004).
+  #checkov:skip=CKV_AWS_115:Sem concorrência reservada: a conta tem 1.000 (em vigor, ADR-0004) compartilhadas e a reserva tiraria do pool das outras funções; o ESM limita a vazão.
   #checkov:skip=CKV_AWS_173:Variáveis de ambiente não são sensíveis; criptografia padrão basta no sandbox.
   #checkov:skip=CKV_AWS_272:Assinatura de código fora do escopo do sandbox.
   function_name    = local.nomes.relay
@@ -159,7 +170,7 @@ resource "aws_lambda_function" "relay" {
 resource "aws_lambda_function" "sweeper" {
   #checkov:skip=CKV_AWS_117:Funções fora da VPC de propósito: sandbox sem NAT, e só falam com APIs AWS públicas.
   #checkov:skip=CKV_AWS_116:Execução agendada; a próxima rodada (5 min) reprocessa, e o relay é idempotente.
-  #checkov:skip=CKV_AWS_115:Concorrência reservada consumiria da cota de 400 da conta nova (ADR-0004).
+  #checkov:skip=CKV_AWS_115:Sem concorrência reservada: a conta tem 1.000 (em vigor, ADR-0004) compartilhadas e a reserva tiraria do pool das outras funções; uma execução agendada a cada 5 min.
   #checkov:skip=CKV_AWS_173:Variáveis de ambiente não são sensíveis; criptografia padrão basta no sandbox.
   #checkov:skip=CKV_AWS_272:Assinatura de código fora do escopo do sandbox.
   function_name    = local.nomes.sweeper
@@ -233,6 +244,7 @@ resource "aws_iam_role_policy" "scheduler" {
 resource "aws_scheduler_schedule" "sweeper" {
   #checkov:skip=CKV_AWS_297:Sandbox usa a criptografia padrão do Scheduler; a agenda não carrega dado sensível. Produção usa CMK.
   name                = "${local.nomes.sweeper}-5min"
+  group_name          = "default" # a trust policy da role do scheduler aceita só este grupo (aws:SourceArn)
   schedule_expression = "rate(5 minutes)"
 
   flexible_time_window {
@@ -314,7 +326,7 @@ resource "aws_iam_role_policy" "cdc_limites" {
 resource "aws_lambda_function" "cdc_limites" {
   #checkov:skip=CKV_AWS_117:Funções fora da VPC de propósito: sandbox sem NAT, e só falam com APIs AWS públicas.
   #checkov:skip=CKV_AWS_116:Falhas vão para a DLQ do ESM (on-failure destination); não há invocação assíncrona.
-  #checkov:skip=CKV_AWS_115:Concorrência reservada consumiria da cota de 400 da conta nova (ADR-0004).
+  #checkov:skip=CKV_AWS_115:Sem concorrência reservada: a conta tem 1.000 (em vigor, ADR-0004) compartilhadas e a reserva tiraria do pool das outras funções; o ESM limita a vazão.
   #checkov:skip=CKV_AWS_173:Variáveis de ambiente não são sensíveis; criptografia padrão basta no sandbox.
   #checkov:skip=CKV_AWS_272:Assinatura de código fora do escopo do sandbox.
   function_name    = local.nomes.cdc_limites
@@ -423,7 +435,7 @@ resource "aws_iam_role_policy" "contabilizacao" {
 resource "aws_lambda_function" "contabilizacao" {
   #checkov:skip=CKV_AWS_117:Funções fora da VPC de propósito: sandbox sem NAT, e só falam com APIs AWS públicas.
   #checkov:skip=CKV_AWS_116:Falhas voltam à fila e vão para a DLQ pelo redrive (maxReceiveCount 5).
-  #checkov:skip=CKV_AWS_115:Concorrência reservada consumiria da cota de 400 da conta nova (ADR-0004); o ESM limita a concorrência.
+  #checkov:skip=CKV_AWS_115:Sem concorrência reservada: a conta tem 1.000 (em vigor, ADR-0004) compartilhadas e a reserva tiraria do pool das outras funções; o ESM limita a concorrência (maximum_concurrency).
   #checkov:skip=CKV_AWS_173:Variáveis de ambiente não são sensíveis; criptografia padrão basta no sandbox.
   #checkov:skip=CKV_AWS_272:Assinatura de código fora do escopo do sandbox.
   function_name    = local.nomes.contabilizacao

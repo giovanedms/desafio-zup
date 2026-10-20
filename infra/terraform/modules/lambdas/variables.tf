@@ -87,3 +87,14 @@ variable "limite_de_permissoes_arn" {
   description = "ARN do permissions boundary aplicado a toda role criada aqui (teto de permissões; vem do ambiente `esteira`)."
   type        = string
 }
+
+variable "account_id" {
+  description = "ID da conta AWS (condição anti-confused-deputy da trust policy da role do scheduler)."
+  type        = string
+}
+
+variable "regiao" {
+  description = "Região AWS (ARN do schedule group na trust policy da role do scheduler)."
+  type        = string
+  default     = "sa-east-1"
+}

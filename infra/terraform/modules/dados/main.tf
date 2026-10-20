@@ -11,10 +11,11 @@ locals {
     }
     # Autorizações + chaves de idempotência (retenção quente de 30 dias via ttl).
     # GSI esparso gsi_orfas (ADR-0006): só itens EM_PROCESSAMENTO têm orfa_shard/orfa_lease_ms, então o índice
-    # contém apenas as candidatas a órfã; o reconciliador consulta os 10 shards (EP#0..EP#9) por lease vencido.
-    # GSI esparso gsi_vencimentos: só reservas APROVADAS ainda pendentes carregam venc_shard (RV#0..RV#9) e venc_ms
-    # (expira_em em ms); o expirador consulta os 10 shards por vencimento, sem Scan. Ao capturar/estornar/expirar,
-    # o item é regravado sem os atributos e sai do índice.
+    # contém apenas as candidatas a órfã; o reconciliador consulta os N shards (EP#0..EP#N-1) por lease vencido.
+    # GSI esparso gsi_vencimentos: só reservas APROVADAS ainda pendentes carregam venc_shard (RV#0..RV#N-1) e venc_ms
+    # (expira_em em ms); o expirador consulta os N shards por vencimento, sem Scan. Ao capturar/estornar/expirar,
+    # o item é regravado sem os atributos e sai do índice. N (padrão 64) vem de SHARDS_DE_ORFAS/SHARDS_DE_VENCIMENTOS
+    # nos serviços: a sort key é monotônica, então cada valor de shard fica preso a 1.000 WCU/s (ADR-0016).
     autorizacoes = {
       hash_key    = "pk"
       stream_view = null
@@ -90,6 +91,27 @@ resource "aws_dynamodb_table" "this" {
         attribute_name = global_secondary_index.value.range_key
         key_type       = "RANGE"
       }
+
+      # Pré-aquecimento do índice (só quando configurado; ver var.warm_throughput).
+      dynamic "warm_throughput" {
+        for_each = try([var.warm_throughput[each.key].indices[global_secondary_index.key]], [])
+
+        content {
+          read_units_per_second  = warm_throughput.value.leitura
+          write_units_per_second = warm_throughput.value.escrita
+        }
+      }
+    }
+  }
+
+  # Pré-aquecimento da tabela para pico previsível (RN-04, ADR-0013). Desligado por padrão: aumentar é cobrado e
+  # o valor NÃO pode ser reduzido depois. Sem o bloco, o provider só lê o valor atual (computed).
+  dynamic "warm_throughput" {
+    for_each = contains(keys(var.warm_throughput), each.key) ? [var.warm_throughput[each.key]] : []
+
+    content {
+      read_units_per_second  = warm_throughput.value.leitura
+      write_units_per_second = warm_throughput.value.escrita
     }
   }
 

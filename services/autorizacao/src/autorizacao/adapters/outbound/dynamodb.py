@@ -6,19 +6,29 @@ Tabelas:
   - `autorizacoes-outbox`: um item `OUTBOX#<id_evento>` por evento pendente. O relay publica no
     EventBridge e APAGA o item; por isso a tabela fica pequena e o sweeper pode varrê-la barato.
 
-GSI esparso `gsi_orfas` (ADR-0006): só itens EM_PROCESSAMENTO carregam `orfa_shard` (EP#0..EP#9, hash do id)
+GSI esparso `gsi_orfas` (ADR-0006): só itens EM_PROCESSAMENTO carregam `orfa_shard` (EP#0..EP#N-1, hash do id)
 e `orfa_lease_ms`; concluir substitui o item (Put) e os atributos somem, tirando-o do índice. O reconciliador
-consulta os 10 shards por lease vencido, sem Scan na tabela quente. O índice é eventualmente consistente: o
+consulta os N shards por lease vencido, sem Scan na tabela quente. O índice é eventualmente consistente: o
 CAS do `assumir` é quem decide, então uma entrada atrasada no índice é inofensiva.
 
 A fila humana usa o MESMO índice com outro prefixo: RECONCILIACAO_MANUAL (e reserva vencida sem hold) leva
-`orfa_shard` RM#0..RM#9 e `orfa_lease_ms` = quando foi encaminhada. O reconciliador só consulta EP#; o runbook
+`orfa_shard` RM#0..RM#N-1 e `orfa_lease_ms` = quando foi encaminhada. O reconciliador só consulta EP#; o runbook
 consulta RM#. Nada que precise de gente some de todos os índices.
 
 GSI esparso `gsi_vencimentos`, mesmo desenho: só RESERVAs APROVADAS ainda pendentes carregam `venc_shard`
-(RV#0..RV#9) e `venc_ms` (expira_em). Capturar, estornar ou expirar regrava a original com REMOVE desses
-atributos e ela sai do índice. O expirador consulta os 10 shards por vencimento; quem decide é o CAS
+(RV#0..RV#N-1) e `venc_ms` (expira_em). Capturar, estornar ou expirar regrava a original com REMOVE desses
+atributos e ela sai do índice. O expirador consulta os N shards por vencimento; quem decide é o CAS
 "ainda APROVADA" da escrita final.
+
+Quantos shards (N, ADR-0016 e docs/capacidade.md): a sort key dos dois índices cresce com o tempo (lease, vencimento),
+então o DynamoDB não divide uma chave quente por faixa de sort key, e cada valor de `*_shard` fica preso ao teto de
+1.000 WCU/s de uma partição. Toda autorização escreve 2 vezes no `gsi_orfas` (entra ao registrar, sai ao concluir):
+a 5.000 TPS são ~10.000 escritas/s no índice. Com N = 10 isso dava ~1.000 WCU/s por chave, 100% do teto; com o
+padrão N = 64, ~156 WCU/s por chave (~16%). N vem da configuração (SHARDS_DE_ORFAS, SHARDS_DE_VENCIMENTOS).
+SUBIR N é retrocompatível: o leitor consulta 0..N-1, que contém os shards antigos, e o item muda de shard na
+próxima escrita. Leitor (reconciliador) e escritor (autorizacao) devem subir juntos, ou o leitor antes: um
+escritor à frente só atrasa a leitura dos shards novos. REDUZIR N esconde os itens dos shards >= N: não fazer
+sem migrar.
 
 Aqui TransactWriteItems é a escolha certa (diferente do item quente de Limite): os itens tocados são
 desta autorização (e da original, no estorno) — não há contenção — e o estado final precisa sair
@@ -56,19 +66,25 @@ if TYPE_CHECKING:
 
 INDICE_DE_ORFAS = "gsi_orfas"
 INDICE_DE_VENCIMENTOS = "gsi_vencimentos"
+# Padrão de N dos índices esparsos (conta no docstring do módulo); a configuração pode subir, nunca reduzir.
 SHARDS_DE_ORFAS = (
-    10  # distribui a partição do índice esparso (todas as órfãs cairiam numa só chave)
+    64  # distribui a partição do índice esparso (todas as órfãs cairiam numa só chave)
 )
-SHARDS_DE_VENCIMENTOS = 10
+SHARDS_DE_VENCIMENTOS = 64
 RETENCAO_QUENTE = timedelta(days=30)
 RETENCAO_DO_OUTBOX = timedelta(days=7)  # rede de segurança; o normal é o relay apagar em segundos
 _serializar = TypeSerializer().serialize
 _desserializar = TypeDeserializer().deserialize
 
 
-def shard_de_orfas(id_autorizacao: str) -> str:
-    """`EP#<n>`, n = sha256(id) % 10 (estável entre processos; `hash()` do Python não é)."""
-    return f"EP#{int(hashlib.sha256(id_autorizacao.encode()).hexdigest(), 16) % SHARDS_DE_ORFAS}"
+def _shard(id_autorizacao: str, shards: int) -> int:
+    """sha256(id) % shards (estável entre processos; `hash()` do Python não é)."""
+    return int(hashlib.sha256(id_autorizacao.encode()).hexdigest(), 16) % shards
+
+
+def shard_de_orfas(id_autorizacao: str, shards: int = SHARDS_DE_ORFAS) -> str:
+    """`EP#<n>`, n = sha256(id) % shards."""
+    return f"EP#{_shard(id_autorizacao, shards)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,10 +96,15 @@ class _IndiceEsparso:
     shards: int
 
 
-_ORFAS = _IndiceEsparso(INDICE_DE_ORFAS, "orfa_shard", "orfa_lease_ms", "EP", SHARDS_DE_ORFAS)
-_VENCIMENTOS = _IndiceEsparso(
-    INDICE_DE_VENCIMENTOS, "venc_shard", "venc_ms", "RV", SHARDS_DE_VENCIMENTOS
-)
+def _indices(
+    shards_de_orfas: int, shards_de_vencimentos: int
+) -> tuple[_IndiceEsparso, _IndiceEsparso]:
+    if shards_de_orfas < 1 or shards_de_vencimentos < 1:
+        raise ValueError("o número de shards dos índices esparsos deve ser >= 1")
+    return (
+        _IndiceEsparso(INDICE_DE_ORFAS, "orfa_shard", "orfa_lease_ms", "EP", shards_de_orfas),
+        _IndiceEsparso(INDICE_DE_VENCIMENTOS, "venc_shard", "venc_ms", "RV", shards_de_vencimentos),
+    )
 
 
 # "Ainda em curso" na condição: EM_PROCESSAMENTO (1ª execução/retomada) ou COMPENSANDO (reconciliador).
@@ -94,15 +115,14 @@ _VALORES_EM_CURSO = {
 }
 
 
-def shard_da_fila_humana(id_autorizacao: str) -> str:
+def shard_da_fila_humana(id_autorizacao: str, shards: int = SHARDS_DE_ORFAS) -> str:
     """`RM#<n>`: fila de reconciliação manual, no mesmo GSI das órfãs (o reconciliador só lê EP#)."""
-    return "RM#" + shard_de_orfas(id_autorizacao).removeprefix("EP#")
+    return f"RM#{_shard(id_autorizacao, shards)}"
 
 
-def shard_de_vencimentos(id_autorizacao: str) -> str:
-    """`RV#<n>`: espalha as reservas pendentes do dia (todas teriam vencimento próximo) em 10 partições."""
-    n = int(hashlib.sha256(id_autorizacao.encode()).hexdigest(), 16) % SHARDS_DE_VENCIMENTOS
-    return f"RV#{n}"
+def shard_de_vencimentos(id_autorizacao: str, shards: int = SHARDS_DE_VENCIMENTOS) -> str:
+    """`RV#<n>`: espalha as reservas pendentes do dia (todas teriam vencimento próximo) em N partições."""
+    return f"RV#{_shard(id_autorizacao, shards)}"
 
 
 def chave(id_autorizacao: str) -> dict[str, Any]:
@@ -110,10 +130,19 @@ def chave(id_autorizacao: str) -> dict[str, Any]:
 
 
 class RepositorioDeAutorizacoesDynamoDB:
-    def __init__(self, cliente: DynamoDBClient, tabela: str, tabela_outbox: str) -> None:
+    def __init__(
+        self,
+        cliente: DynamoDBClient,
+        tabela: str,
+        tabela_outbox: str,
+        *,
+        shards_de_orfas: int = SHARDS_DE_ORFAS,
+        shards_de_vencimentos: int = SHARDS_DE_VENCIMENTOS,
+    ) -> None:
         self._cliente = cliente
         self._tabela = tabela
         self._outbox = tabela_outbox
+        self._orfas, self._vencimentos = _indices(shards_de_orfas, shards_de_vencimentos)
 
     def obter(self, id_autorizacao: str) -> Autorizacao | None:
         item = self._cliente.get_item(
@@ -125,7 +154,7 @@ class RepositorioDeAutorizacoesDynamoDB:
         try:
             self._cliente.put_item(
                 TableName=self._tabela,
-                Item=_para_item(autorizacao),
+                Item=self._item(autorizacao),
                 ConditionExpression="attribute_not_exists(pk)",
                 ReturnValuesOnConditionCheckFailure="ALL_OLD",
             )
@@ -151,7 +180,7 @@ class RepositorioDeAutorizacoesDynamoDB:
                 ExpressionAttributeNames={"#status": "status"},
                 ExpressionAttributeValues={
                     ":novo": {"N": str(_ms(autorizacao.lease_ate))},
-                    ":shard": {"S": shard_de_orfas(autorizacao.id_autorizacao)},
+                    ":shard": {"S": shard_de_orfas(autorizacao.id_autorizacao, self._orfas.shards)},
                     ":agora": {"S": autorizacao.atualizada_em.isoformat()},
                     **_VALORES_EM_CURSO,
                     ":anterior": {"N": str(_ms(lease_anterior))},
@@ -165,7 +194,7 @@ class RepositorioDeAutorizacoesDynamoDB:
         try:
             self._cliente.put_item(
                 TableName=self._tabela,
-                Item=_para_item(autorizacao),
+                Item=self._item(autorizacao),
                 ConditionExpression=f"{_EM_CURSO} AND lease_ate_ms = :anterior",
                 ExpressionAttributeNames={"#status": "status"},
                 ExpressionAttributeValues={
@@ -194,7 +223,11 @@ class RepositorioDeAutorizacoesDynamoDB:
                     "ExpressionAttributeValues": {
                         ":manual": {"S": StatusAutorizacao.RECONCILIACAO_MANUAL.value},
                         ":m": {"S": encaminhada.motivo_da_reconciliacao.value},
-                        ":fila": {"S": shard_da_fila_humana(encaminhada.id_autorizacao)},
+                        ":fila": {
+                            "S": shard_da_fila_humana(
+                                encaminhada.id_autorizacao, self._orfas.shards
+                            )
+                        },
                         ":agora_ms": {"N": str(_ms(encaminhada.atualizada_em))},
                         ":agora": {"S": encaminhada.atualizada_em.isoformat()},
                         ":aprovada": {"S": StatusAutorizacao.APROVADA.value},
@@ -242,17 +275,17 @@ class RepositorioDeAutorizacoesDynamoDB:
     def listar_orfas(self, lease_vencido_antes_de: datetime, limite: int) -> list[Autorizacao]:
         """EM_PROCESSAMENTO com lease vencido antes do instante dado, mais antigas primeiro.
 
-        Query nos 10 shards do GSI esparso (cada um já ordenado por lease); junta, ordena e corta.
+        Query nos N shards do GSI esparso (cada um já ordenado por lease); junta, ordena e corta.
         Leitura eventualmente consistente (GSI): quem decide é o CAS de `assumir`.
         """
-        orfas = self._consultar_shards(_ORFAS, lease_vencido_antes_de, limite)
+        orfas = self._consultar_shards(self._orfas, lease_vencido_antes_de, limite)
         return sorted(orfas, key=lambda a: a.lease_ate)[:limite]
 
     def listar_reservas_vencidas(
         self, vencidas_antes_de: datetime, limite: int
     ) -> list[Autorizacao]:
         """RESERVAs APROVADAS com validade terminada, mais antigas primeiro (GSI esparso de vencimentos)."""
-        vencidas = self._consultar_shards(_VENCIMENTOS, vencidas_antes_de, limite)
+        vencidas = self._consultar_shards(self._vencimentos, vencidas_antes_de, limite)
         return sorted(vencidas, key=lambda a: a.criada_em)[:limite]
 
     def _consultar_shards(
@@ -296,6 +329,9 @@ class RepositorioDeAutorizacoesDynamoDB:
                 raise OriginalJaEncerrada(expirada.id_autorizacao) from erro
             raise
 
+    def _item(self, autorizacao: Autorizacao) -> dict[str, Any]:
+        return _para_item(autorizacao, self._orfas.shards, self._vencimentos.shards)
+
     def _put_no_outbox(self, evento: EventoDeDominio) -> dict[str, Any]:
         return {
             "Put": {
@@ -317,7 +353,7 @@ class RepositorioDeAutorizacoesDynamoDB:
             {
                 "Put": {
                     "TableName": self._tabela,
-                    "Item": _para_item(autorizacao),
+                    "Item": self._item(autorizacao),
                     "ConditionExpression": f"{_EM_CURSO} AND lease_ate_ms = :lease",
                     "ExpressionAttributeNames": {"#status": "status"},
                     "ExpressionAttributeValues": {
@@ -431,7 +467,11 @@ def _item_do_outbox(evento: EventoDeDominio) -> dict[str, Any]:
     return {k: _serializar(v) for k, v in bruto.items()}
 
 
-def _para_item(a: Autorizacao) -> dict[str, Any]:
+def _para_item(
+    a: Autorizacao,
+    shards_de_orfas: int = SHARDS_DE_ORFAS,
+    shards_de_vencimentos: int = SHARDS_DE_VENCIMENTOS,
+) -> dict[str, Any]:
     em_curso = a.status in EM_CURSO
     na_fila_humana = a.status is StatusAutorizacao.RECONCILIACAO_MANUAL
     bruto: dict[str, object | None] = {
@@ -459,9 +499,9 @@ def _para_item(a: Autorizacao) -> dict[str, Any]:
         "lease_ate_ms": _ms(a.lease_ate),
         # Em curso → índice de órfãs (EP#, pelo lease); reconciliação manual → fila humana (RM#, pela data);
         # qualquer outro estado → fora do índice (os atributos somem no Put).
-        "orfa_shard": shard_de_orfas(a.id_autorizacao)
+        "orfa_shard": shard_de_orfas(a.id_autorizacao, shards_de_orfas)
         if em_curso
-        else shard_da_fila_humana(a.id_autorizacao)
+        else shard_da_fila_humana(a.id_autorizacao, shards_de_orfas)
         if na_fila_humana
         else None,
         "orfa_lease_ms": _ms(a.lease_ate)
@@ -477,7 +517,9 @@ def _para_item(a: Autorizacao) -> dict[str, Any]:
         if a.motivo_da_reconciliacao
         else None,
         # Só RESERVA aprovada e pendente entra no GSI esparso de vencimentos.
-        "venc_shard": shard_de_vencimentos(a.id_autorizacao) if a.reserva_pendente else None,
+        "venc_shard": shard_de_vencimentos(a.id_autorizacao, shards_de_vencimentos)
+        if a.reserva_pendente
+        else None,
         "venc_ms": _ms(a.expira_em) if a.reserva_pendente and a.expira_em else None,
         "correlation_id": a.correlation_id,
         "traceparent": a.traceparent,

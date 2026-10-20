@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import MappingProxyType
 
 import boto3
 import pytest
@@ -99,4 +101,34 @@ def test_guarda_grande_vira_linha_json_para_o_alarme(
         "id_contrato": "CTR-QUENTE",
         "operacoes_na_guarda": tamanho,
         "reservas_ativas": 0,
+    }
+
+
+def test_muitas_reservas_com_guarda_pequena_tambem_vira_linha_json(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Holds vivem até 7 dias no item: o contrato chega aos 400 KB com a guarda quase vazia.
+    reservas = {f"r{i}": Decimal("1.00") for i in range(LIMIAR_DE_ALERTA_DA_GUARDA)}
+    base = Limite.novo("CTR-HOTEL", "0001-1", TipoProduto.CREDITO, Decimal("1000000.00"))
+    depois = replace(
+        base,
+        reservado=Decimal(len(reservas)),
+        disponivel=base.concedido - Decimal(len(reservas)),
+        reservas=MappingProxyType(reservas),
+        operacoes_recentes=MappingProxyType({"ultima": AGORA}),
+    )
+    cliente, stub = _cliente()
+    stub.add_response("update_item", {"Attributes": _para_item(depois)})
+
+    with stub, caplog.at_level(logging.WARNING, logger="limites.guarda"):
+        RepositorioDeLimitesDynamoDB(cliente, "limites").aplicar(  # type: ignore[arg-type]
+            "CTR-HOTEL", Debitar("ultima", Decimal("0.01")), AGORA
+        )
+
+    linhas = [r.getMessage() for r in caplog.records if r.name == "limites.guarda"]
+    assert json.loads(linhas[0]) == {
+        "evento": "guarda_de_idempotencia",
+        "id_contrato": "CTR-HOTEL",
+        "operacoes_na_guarda": 1,
+        "reservas_ativas": LIMIAR_DE_ALERTA_DA_GUARDA,
     }

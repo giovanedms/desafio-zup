@@ -50,7 +50,8 @@ TENTATIVAS_DE_DIAGNOSTICO = 3
 MAX_REMOCOES_POR_ESCRITA = 50  # mantém a UpdateExpression bem abaixo do limite de 4 KB
 MAX_CONTRATOS_NO_CACHE = 10_000
 TENTATIVAS_DE_SINCRONIZACAO = 5
-# Guarda acima disto vira linha de log JSON (metric filter + Contributor Insights por contrato, ADR-0016).
+# Guarda OU mapa de reservas acima disto vira linha de log JSON (metric filters + Contributor Insights por contrato,
+# ADR-0016). Os dois mapas moram no item (teto de 400 KB): a guarda vive 5 min, mas um hold vive até 7 dias.
 LIMIAR_DE_ALERTA_DA_GUARDA = 200
 # Falhas em que o SDK já esgotou os retries e repetir mais tarde é seguro → 503, não 500.
 _CODIGOS_TRANSITORIOS = frozenset(
@@ -284,8 +285,12 @@ class RepositorioDeLimitesDynamoDB:
 
 
 def _observar_guarda(limite: Limite) -> None:
-    """Contrato com guarda grande = contrato quente. Uma linha JSON por escrita acima do limiar."""
-    if len(limite.operacoes_recentes) >= LIMIAR_DE_ALERTA_DA_GUARDA:
+    """Item crescendo = contrato quente. Uma linha JSON por escrita com guarda OU reservas acima do limiar.
+
+    As reservas entram na condição porque um contrato com muitos holds pendentes (pré-autorização de hotel ou
+    posto) enche o item com a guarda vazia: ~45 bytes por reserva, ~9.000 reservas chegam aos 400 KB (ADR-0016).
+    """
+    if max(len(limite.operacoes_recentes), len(limite.reservas)) >= LIMIAR_DE_ALERTA_DA_GUARDA:
         _log_da_guarda.warning(
             json.dumps(
                 {

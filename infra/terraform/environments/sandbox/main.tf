@@ -2,6 +2,29 @@
 # deploy da esteira só cria/altera role que carregue este boundary (sem escalada de privilégio via pipeline).
 locals {
   limite_de_permissoes_arn = "arn:aws:iam::${var.account_id}:policy/desafio-zup-limite-de-permissoes"
+  regiao                   = "sa-east-1"
+
+  # Trust policy das 4 TASK roles com a condição anti-confused-deputy documentada pelo ECS (aws:SourceAccount e
+  # aws:SourceArn com curinga: a AWS não suporta fixar o cluster nesta condição).
+  # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html
+  # As EXECUTION roles (módulo ecs_servico) ficam sem condição: a página da task execution role não a documenta.
+  confianca_ecs_tasks = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Condition = {
+        ArnLike      = { "aws:SourceArn" = "arn:aws:ecs:${local.regiao}:${var.account_id}:*" }
+        StringEquals = { "aws:SourceAccount" = var.account_id }
+      }
+    }]
+  })
+
+  # Load shedding (MAX_EM_VOO): capacidade da task × p99 alvo × 2 (docs/capacidade.md). ~8 ms de CPU por autorização
+  # (medido, 1.0.3) = ~125 rps por vCPU; 0,5 vCPU → 62,5 × 0,15 s × 2 ≈ 18. Deriva da CPU da task, para o portão
+  # acompanhar o tamanho da task (antes era fixo em 32, calibrado para 1 vCPU). var.max_em_voo sobrescreve.
+  max_em_voo = coalesce(var.max_em_voo, floor(var.cpu / 1024 * 125 * 0.15 * 2))
 }
 
 provider "aws" {
@@ -40,6 +63,7 @@ module "dados" {
   source = "../../modules/dados"
 
   deletion_protection = var.deletion_protection
+  warm_throughput     = var.warm_throughput
 }
 
 # Repositórios ECR.
@@ -75,14 +99,7 @@ resource "aws_service_discovery_http_namespace" "this" {
 resource "aws_iam_role" "task_autorizacao" {
   name                 = "desafio-task-autorizacao"
   permissions_boundary = local.limite_de_permissoes_arn
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+  assume_role_policy   = local.confianca_ecs_tasks
 }
 
 # Permissões da `autorizacao`: tabela de autorizações (itens) e PutItem no outbox (mesma transação).
@@ -112,14 +129,7 @@ resource "aws_iam_role_policy" "task_autorizacao" {
 resource "aws_iam_role" "task_limites" {
   name                 = "desafio-task-limites"
   permissions_boundary = local.limite_de_permissoes_arn
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+  assume_role_policy   = local.confianca_ecs_tasks
 }
 
 # Permissões da `limites`: item único do agregado (UpdateItem condicional, ADR-0005).
@@ -158,6 +168,7 @@ module "limites" {
   min_tasks                = var.tasks_min
   max_tasks                = var.tasks_max
   service_connect_publicar = "limites"
+  janelas_de_pico          = var.janelas_de_pico
 
   variaveis_ambiente = {
     AWS_REGION     = "sa-east-1"
@@ -186,15 +197,19 @@ module "autorizacao" {
   min_tasks           = var.tasks_min
   max_tasks           = var.tasks_max
   target_group_arn    = module.api.target_group_arn
+  janelas_de_pico     = var.janelas_de_pico
 
   variaveis_ambiente = {
     AWS_REGION          = "sa-east-1"
     TABELA_AUTORIZACOES = module.dados.nomes["autorizacoes"]
     TABELA_OUTBOX       = module.dados.nomes["autorizacoes-outbox"]
     URL_LIMITES         = "http://limites:8080"
-    # Teto de requisições em voo por task (load shedding → 503 imediato). Medido na AWS (20/10): 1 vCPU sustenta
-    # ~94 rps; com 256 em voo a fila chegava a segundos sob sobrecarga. ~capacidade × p99 alvo × 2 ≈ 32.
-    MAX_EM_VOO = tostring(var.max_em_voo)
+    # Teto de requisições em voo por task (load shedding → 503 imediato), derivado da CPU (local.max_em_voo).
+    # Com 256 em voo a fila chegava a segundos sob sobrecarga (medido na AWS, 20/10).
+    MAX_EM_VOO = tostring(local.max_em_voo)
+    # Shards dos GSIs esparsos: o MESMO valor no escritor (aqui) e no leitor (reconciliador). Ver var.shards_dos_indices.
+    SHARDS_DE_ORFAS       = tostring(var.shards_dos_indices)
+    SHARDS_DE_VENCIMENTOS = tostring(var.shards_dos_indices)
   }
 
   # A chamada a limites só funciona depois que limites publica o alias no namespace.
@@ -205,14 +220,7 @@ module "autorizacao" {
 resource "aws_iam_role" "task_limites_acl" {
   name                 = "desafio-task-limites-acl"
   permissions_boundary = local.limite_de_permissoes_arn
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+  assume_role_policy   = local.confianca_ecs_tasks
 }
 
 # Permissões da ACL: ler/apagar da fila do legado e Get/Put/Update na tabela limites. GetQueueUrl é
@@ -287,14 +295,7 @@ module "limites_acl" {
 resource "aws_iam_role" "task_reconciliador" {
   name                 = "desafio-task-reconciliador"
   permissions_boundary = local.limite_de_permissoes_arn
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+  assume_role_policy   = local.confianca_ecs_tasks
 }
 
 # Permissões do reconciliador: Query nos GSIs de órfãs e de vencimentos (expirador de reservas), Get/Put/Update em autorizacoes (assumir lease e concluir)
@@ -363,10 +364,12 @@ module "reconciliador" {
   ]
 
   variaveis_ambiente = {
-    AWS_REGION          = "sa-east-1"
-    TABELA_AUTORIZACOES = module.dados.nomes["autorizacoes"]
-    TABELA_OUTBOX       = module.dados.nomes["autorizacoes-outbox"]
-    URL_LIMITES         = "http://limites:8080"
+    AWS_REGION            = "sa-east-1"
+    TABELA_AUTORIZACOES   = module.dados.nomes["autorizacoes"]
+    TABELA_OUTBOX         = module.dados.nomes["autorizacoes-outbox"]
+    URL_LIMITES           = "http://limites:8080"
+    SHARDS_DE_ORFAS       = tostring(var.shards_dos_indices)
+    SHARDS_DE_VENCIMENTOS = tostring(var.shards_dos_indices)
   }
 
   # A chamada a limites só funciona depois que limites publica o alias no namespace.
@@ -380,18 +383,21 @@ module "api" {
   limite_de_permissoes_arn = local.limite_de_permissoes_arn
   source                   = "../../modules/api"
 
-  account_id          = var.account_id
-  vpc_id              = module.rede.vpc_id
-  subnet_ids          = module.rede.subnet_ids_publicas
-  contrato_openapi    = local.contrato
-  waf_limite_por_ip   = var.waf_limite_por_ip
-  deletion_protection = var.deletion_protection
+  account_id                = var.account_id
+  vpc_id                    = module.rede.vpc_id
+  subnet_ids                = module.rede.subnet_ids_publicas
+  contrato_openapi          = local.contrato
+  waf_limite_por_ip         = var.waf_limite_por_ip
+  waf_limite_por_consumidor = var.waf_limite_por_consumidor
+  deletion_protection       = var.deletion_protection
 }
 
 # Funções Lambda: relay (outbox -> bus), relay-cdc-limites (stream de limites -> bus), sweeper (agendado) e contabilização (SQS).
 module "lambdas" {
   limite_de_permissoes_arn = local.limite_de_permissoes_arn
   source                   = "../../modules/lambdas"
+  account_id               = var.account_id
+  regiao                   = local.regiao
 
   zip_relay               = local.zip_relay
   zip_contabilizacao      = local.zip_contabilizacao
@@ -415,14 +421,18 @@ module "lambdas" {
 module "observabilidade" {
   source = "../../modules/observabilidade"
 
+  account_id              = var.account_id
+  regiao                  = local.regiao
+  email_alarmes           = var.email_alarmes
   api_nome                = module.api.api_nome
   api_stage               = module.api.stage_nome
   tabelas                 = values(module.dados.nomes)
   tabelas_com_latencia    = [module.dados.nomes["limites"], module.dados.nomes["autorizacoes"]]
   cluster_nome            = aws_ecs_cluster.this.name
   servicos_ecs            = [module.autorizacao.nome, module.limites.nome]
-  filas                   = values(module.eventos.filas_nomes)
-  dlqs                    = concat(values(module.eventos.dlqs_nomes), [module.lambdas.relay_dlq_nome, module.lambdas.cdc_limites_dlq_nome, module.eventos.fila_legado_dlq_nome])
+  filas                   = concat(values(module.eventos.filas_nomes), [module.eventos.fila_legado_nome])
+  fila_legado             = module.eventos.fila_legado_nome
+  dlqs                    = concat(values(module.eventos.dlqs_nomes), [module.lambdas.relay_dlq_nome, module.lambdas.cdc_limites_dlq_nome, module.eventos.fila_legado_dlq_nome, module.eventos.entrega_dlq_nome])
   relay_funcao            = module.lambdas.relay_nome
   log_group_limites       = module.limites.log_group_nome
   log_group_reconciliador = module.reconciliador.log_group_nome

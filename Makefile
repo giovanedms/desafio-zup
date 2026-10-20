@@ -124,9 +124,11 @@ tf-validate:
 	        && $(TF_SEM_AWS) terraform -chdir=infra/terraform/environments/$$env validate || exit 1; \
 	done
 
-# Testes do Terraform com mock_provider (plan apenas; nenhuma chamada à AWS). tests/ do ambiente é symlink para infra/terraform/tests.
+# Testes do Terraform com mock_provider (plan apenas; nenhuma chamada à AWS). Os testes moram num diretório REAL dentro do
+# ambiente (o Terraform 1.16 recusa -test-directory fora da configuração). Antes era um symlink, que vira arquivo de texto
+# no unzip do Windows e fazia o `terraform test` passar sem achar teste nenhum: o grep falha o alvo se nenhum run rodar.
 tf-test: tf-validate
-	$(TF_SEM_AWS) terraform -chdir=$(TF_ENV) test
+	$(TF_SEM_AWS) terraform -chdir=$(TF_ENV) test -test-directory=tests | tee /dev/stderr | grep -Eq '[1-9][0-9]* passed, 0 failed'
 
 # Análise estática de IaC com Checkov.
 tf-checkov:

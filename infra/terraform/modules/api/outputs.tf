@@ -56,3 +56,17 @@ output "respostas_do_gateway" {
   description = "Gateway Responses injetadas no body (problem+json), para teste e inspeção."
   value       = local.respostas_do_gateway
 }
+
+output "validadores" {
+  description = "Validadores de requisição injetados no body (o corpo fica com o serviço), para teste e inspeção."
+  value       = local.especificacao["x-amazon-apigateway-request-validators"]
+}
+
+output "parametros_da_integracao" {
+  description = "Caminho -> método -> requestParameters da integração (headers injetados pelo gateway), para teste."
+  value = {
+    for caminho, operacoes in local.paths : caminho => {
+      for metodo, op in operacoes : metodo => op["x-amazon-apigateway-integration"].requestParameters
+    }
+  }
+}

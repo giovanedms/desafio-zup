@@ -34,3 +34,8 @@ output "dashboard" {
   description = "Dashboard CloudWatch."
   value       = module.observabilidade.dashboard_nome
 }
+
+output "topico_alarmes" {
+  description = "Tópico SNS que recebe todos os alarmes (assinar o plantão; ou var.email_alarmes)."
+  value       = module.observabilidade.topico_alarmes_arn
+}

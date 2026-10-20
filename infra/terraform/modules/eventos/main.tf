@@ -60,7 +60,7 @@ resource "aws_cloudwatch_event_rule" "this" {
   })
 }
 
-# Target: a regra entrega na fila do consumidor.
+# Target: a regra entrega na fila do consumidor; o que esgota as tentativas vai para a DLQ de entrega (sem perda).
 resource "aws_cloudwatch_event_target" "this" {
   for_each = var.assinaturas
 
@@ -68,6 +68,50 @@ resource "aws_cloudwatch_event_target" "this" {
   event_bus_name = aws_cloudwatch_event_bus.this.name
   target_id      = each.key
   arn            = aws_sqs_queue.this[each.key].arn
+
+  retry_policy {
+    maximum_event_age_in_seconds = var.idade_maxima_entrega_segundos
+    maximum_retry_attempts       = var.tentativas_maximas_entrega
+  }
+
+  dead_letter_config {
+    arn = aws_sqs_queue.entrega_dlq.arn
+  }
+}
+
+# ---------------------------------------------------------------- DLQ de entrega dos targets (regra -> fila)
+
+# DLQ dos targets do EventBridge. Sem ela, uma entrega que esgota as tentativas (ou que falha por permissão, que o
+# EventBridge nem tenta de novo) é DESCARTADA depois que o outbox já apagou o item. Uma fila para os 4 targets: cada
+# mensagem traz os atributos RULE_ARN, TARGET_ARN e ERROR_CODE, e o redrive vai para a fila do TARGET_ARN (runbook R1).
+resource "aws_sqs_queue" "entrega_dlq" {
+  name                      = "${var.nome_bus}-entrega-dlq"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+}
+
+# Só o EventBridge, e só a partir das regras deste bus (aws:SourceArn), grava na DLQ de entrega.
+# https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rule-dlq.html
+resource "aws_sqs_queue_policy" "entrega_dlq" {
+  queue_url = aws_sqs_queue.entrega_dlq.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "EventBridgeGravaFalhaDeEntrega"
+      Effect    = "Allow"
+      Principal = { Service = "events.amazonaws.com" }
+      Action    = "sqs:SendMessage"
+      Resource  = aws_sqs_queue.entrega_dlq.arn
+      Condition = {
+        ArnEquals = {
+          "aws:SourceArn" = concat(
+            [for r in aws_cloudwatch_event_rule.this : r.arn],
+            [aws_cloudwatch_event_rule.limite_alterado.arn],
+          )
+        }
+      }
+    }]
+  })
 }
 
 # Queue policy: só o EventBridge, e só a partir da regra correspondente (aws:SourceArn), pode enviar.
@@ -108,12 +152,21 @@ resource "aws_cloudwatch_event_rule" "limite_alterado" {
   })
 }
 
-# Target: entrega o LimiteAlterado na fila do consumidor.
+# Target: entrega o LimiteAlterado na fila do consumidor, com a mesma política de retry e a mesma DLQ de entrega.
 resource "aws_cloudwatch_event_target" "limite_alterado" {
   rule           = aws_cloudwatch_event_rule.limite_alterado.name
   event_bus_name = aws_cloudwatch_event_bus.this.name
   target_id      = var.consumidor_limite_alterado
   arn            = aws_sqs_queue.this[var.consumidor_limite_alterado].arn
+
+  retry_policy {
+    maximum_event_age_in_seconds = var.idade_maxima_entrega_segundos
+    maximum_retry_attempts       = var.tentativas_maximas_entrega
+  }
+
+  dead_letter_config {
+    arn = aws_sqs_queue.entrega_dlq.arn
+  }
 }
 
 # ---------------------------------------------------------------- feed do core legado (RN-05)

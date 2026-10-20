@@ -48,10 +48,16 @@ variable "retencao_logs_dias" {
   default     = 7
 }
 
-variable "waf_limite_por_ip" {
-  description = "Requisições por IP em 5 minutos antes do bloqueio pelo WAF."
+variable "waf_limite_por_consumidor" {
+  description = "Requisições por x-api-key em 5 minutos antes do 429 do WAF. Padrão: 2x o maior plano de canal (plano-padrao, 200 rps = 60.000/5 min), teto de proteção acima do usage plan. A janela de medição com o plano-carga precisa subir este valor."
   type        = number
-  default     = 2000
+  default     = 120000
+}
+
+variable "waf_limite_por_ip" {
+  description = "Requisições por IP em 5 minutos antes do 429 do WAF. Padrão: 1.000 rps (10% do throttle de 10.000 rps da conta), acima do teto por consumidor para não barrar um egress (NAT) que carregue vários canais."
+  type        = number
+  default     = 300000
 }
 
 variable "deletion_protection" {

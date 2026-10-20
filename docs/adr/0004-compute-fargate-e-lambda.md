@@ -16,7 +16,7 @@ Fatos (`01-pesquisa/02-aws-servicos-e-quotas.md`):
   - escala 1.000 ambientes a cada 10 s;
   - cold start em < 1% das invocações;
   - SnapStart e provisioned concurrency são mutuamente exclusivos.
-  - **A conta nova tem concorrência de 400 (pedido de 1.000 em análise).**
+  - **A conta tem 1.000 de concorrência em vigor** (`docs/operacao/infraestrutura.md`, seção 2). Pela regra dos 10×, 1.000 de concorrência sustentam até 10.000 RPS (a quota é da conta, dividida entre as funções), o dobro do pico: **a quota não impede Lambda no síncrono**.
 - **ECS Fargate:** o scale-out reativo leva ~86 s para disparar e ~109 s até servir no melhor caso documentado. Predictive scaling existe em sa-east-1. A conta tem 140 vCPU de quota.
 - **EKS:** plano de controle pago, mais operação (upgrades, add-ons). O App Mesh foi descontinuado em 30/09/2026.
 
@@ -31,7 +31,10 @@ Fatos (`01-pesquisa/02-aws-servicos-e-quotas.md`):
   - SQS/Streams como gatilho, escala a zero, resposta parcial em lote.
   - O mesmo núcleo roda como container *poller* no ambiente local: só o adapter de entrada muda (hexagonal).
 - **Picos (RN-04):**
-  - **Previsíveis** (início de mês, pagamentos): scheduled e predictive scaling, mais warm throughput no DynamoDB a 2× o pico. **Desenhado, não implementado:** o Terraform só tem target tracking de CPU (`modules/ecs_servico`) e nenhum `warm_throughput`. A medição mostra o porquê: o target tracking pediu as tasks extras ~6 min depois do início da sobrecarga (`docs/capacidade.md`, seção 3).
+  - **Previsíveis** (início de mês, pagamentos): o target tracking pediu as tasks extras ~6 min depois do início da sobrecarga (`docs/capacidade.md`, seção 3), então a capacidade sobe **antes** da janela:
+    - **scheduled scaling, implementado:** `var.janelas_de_pico` no módulo `ecs_servico` cria um `aws_appautoscaling_scheduled_action` que sobe o mínimo no início da janela e outro que o devolve no fim. O sandbox tem o exemplo do dia 1 de cada mês, 06:30–12:00 de Brasília, mínimo de 4 tasks em `autorizacao` e `limites`;
+    - **warm throughput no DynamoDB a 2× o pico, implementado e desligado no sandbox:** `var.warm_throughput` no módulo `dados` (tabela e GSI). Aumentar é cobrado e não pode ser desfeito; os valores de produção estão no ADR-0013;
+    - **predictive scaling, só desenhado:** precisa de histórico de carga que o sandbox não tem.
   - **Imprevisíveis** (campanha, Black Friday): mínimo de tasks dimensionado para 60% de utilização no pico esperado, ou seja, 1,6× de folga para atravessar os ~109 s do reativo.
   - **Proteção:** load shedding por concorrência máxima por task (503 + `Retry-After`) e WAF rate-based.
 
@@ -55,7 +58,7 @@ Fatos (`01-pesquisa/02-aws-servicos-e-quotas.md`):
 
 | Opção | Por que não |
 |---|---|
-| Lambda no síncrono | ≥ 500 de concorrência reservada por função (a conta tem 400 hoje). Cold start na cauda do p99. Custo maior em carga sustentada |
+| Lambda no síncrono | Não é a quota: a conta tem 1.000 em vigor, que cobre o pico. É **o p99**: cold start em < 1% das invocações cai exatamente na cauda que o RNF de 150 ms mede, e evitá-lo pede provisioned concurrency de ≥ 500 por função, paga o tempo todo. É **o custo em carga sustentada**: com tráfego alto e contínuo, cobrança por invocação e duração perde para tasks com CPU ocupada. E é **o Service Connect**: `autorizacao` chama `limites` (e o reconciliador também) pelo Service Connect, do qual Lambda não participa; trocar exigiria pôr o `limites` atrás de um ALB ou do VPC Lattice |
 | EKS | Mais operação sem ganho para 3 serviços; vira a escolha certa se for o padrão de plataforma |
 
 ## Referências

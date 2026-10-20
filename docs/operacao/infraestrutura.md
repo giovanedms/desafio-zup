@@ -149,7 +149,7 @@ Os outros 107 têm as 4 tags. O ambiente `esteira` usa as mesmas.
 | NLB | `desafio-autorizacao-nlb` | Interno, cross-zone, sem proteção contra exclusão (sandbox). Listener TCP 80 para o target group `desafio-autorizacao-tg` (TCP 8080, alvo `ip`). Health check HTTP `/saude` a cada 10 s (2 sucessos ou 2 falhas). Deregistration de 30 s |
 | Cognito user pool | `desafio-autorizacao-canais` | Só administrador cria usuário. Domínio `desafio-autorizacao-<conta>`. Resource server `autorizacoes` com escopos `read` e `write` |
 | Cognito app clients | `canal-app`, `canal-pos`, `canal-carga` | Fluxo `client_credentials`, com segredo, escopos `autorizacoes/read` e `autorizacoes/write`. Validade do token: padrão do Cognito |
-| API keys e usage plans | — | `canal-app` → `plano-restrito` (5 rps, burst 10, 1.000/dia). `canal-pos` → `plano-padrao` (200 rps, burst 400, 1 milhão/dia). `canal-carga` → `plano-carga` (6.000 rps, burst 5.000, 50 milhões/dia) |
+| API keys e usage plans | — | `canal-app` → `plano-restrito` (5 rps, burst 10, 1.000/dia). `canal-pos` → `plano-padrao` (200 rps, burst 400, 1 milhão/dia). `canal-carga` → `plano-carga` (6.000 rps, burst 5.000, 50 milhões/dia). A AWS aplica o throttling de usage plan em regime de melhor esforço (ADR-0010). O smoke manda 30 requisições sequenciais pelo `canal-app`, abaixo do balde, e não prova o 429 |
 | WAF | `desafio-autorizacao-waf` | Regional, associado ao stage. Regra 1, `limite-por-ip`: rate-based de 2.000 requisições por IP em 5 min, bloqueia. Regra 2, `aws-common`: `AWSManagedRulesCommonRuleSet`. Ação padrão `allow`. Métricas e amostragem ligadas |
 
 Outputs do ambiente: `invoke_url`, `token_endpoint`, `cognito_client_ids`, `ecr_urls`, `dashboard`, e os **sensíveis** `cognito_client_secrets` e `api_keys`. Os scripts `tests/e2e/aws.py` e `tests/load/aws_k6.py` leem esses outputs e nunca os imprimem.
@@ -314,7 +314,7 @@ As 13 têm o permissions boundary `desafio-zup-limite-de-permissoes` (conferido 
 - Todo `push` e `pull_request` roda o CI.
 - O **deploy** roda só na `main`: em `push`, ou em `workflow_dispatch` com `acao=deploy`.
 - O **destroy** roda só em `workflow_dispatch` na `main`, com `acao=destroy` e `confirmacao` exatamente igual a `CONFIRMO: destroy na conta desafio-zup`.
-- Não há filtro de caminho: **todo commit na `main` faz deploy**, até um que só muda documentação. Como a tag da imagem é o commit, cada push gera imagens novas, novas revisões das task definitions e um rolling deploy dos 4 services. O resto do que muda aparece no resumo do plano de cada execução.
+- Não há filtro de caminho: **todo commit na `main` faz deploy**, até um que só muda documentação. Como a tag da imagem é o commit, cada push gera imagens novas, novas revisões das task definitions e um rolling deploy dos 4 services. As 4 Lambdas também são republicadas: o `make pacotes` refaz os zips, e o hash muda. Medido no push de `e028986`, só com documentação: `4 added, 8 changed, 4 destroyed`. Foram 4 task definitions substituídas, 4 services e 4 funções.
 
 | Job | O que barra | Ferramentas |
 |---|---|---|

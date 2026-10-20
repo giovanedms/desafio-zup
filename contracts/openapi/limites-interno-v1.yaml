@@ -1,0 +1,238 @@
+openapi: 3.0.3
+# Contrato INTERNO (east-west) do BC Limites — Customer/Supplier com o BC Autorização. Não é exposto no API Gateway.
+info:
+  title: API interna de Limites
+  version: 1.0.0
+  contact:
+    name: Plataforma de Finanças — time de Limites
+  description: |
+    Aplica operações no limite de um contrato. Cada operação é atômica e idempotente por `id_operacao`.
+
+    Recusa por regra de negócio NÃO é erro HTTP aqui: volta 200 com `resultado: RECUSADA` e o motivo. O 402 é uma escolha
+    da API pública; entre serviços próprios o resultado de negócio vai no corpo (ADR-0011).
+
+    Concorrência: operações no mesmo contrato são serializadas pelo DynamoDB (escrita condicional de item único), então
+    não existe falha por contenção (ADR-0005). Estrangulamento do banco (contrato quente) volta 503 com Retry-After.
+tags:
+  - name: Limites
+servers:
+  - url: http://limites.interno:8080
+    description: Nome resolvido pelo ECS Service Connect (AWS) ou pela rede do docker compose (local)
+paths:
+  /interno/v1/contratos/{id_contrato}/operacoes:
+    post:
+      tags: [Limites]
+      operationId: aplicarOperacao
+      summary: Aplica uma operação no limite do contrato
+      description: |
+        Repetir a mesma operação (mesmo `id_operacao`) devolve `JA_APLICADA` com os saldos atuais, sem reaplicar.
+
+        **Janela de deduplicação: 5 minutos**, contados da primeira aplicação. É compromisso do contrato: o chamador
+        só pode reenviar um `id_operacao` dentro dela (o BC Autorização reenvia até 4 min depois de criar a autorização
+        e, passado isso, encaminha para reconciliação manual). RESERVAR é deduplicada também enquanto o hold existir.
+        A janela é curta de propósito: a guarda mora no item do contrato e cresce com a taxa × janela (ADR-0005/0016).
+
+        Hold disputado: LIBERAR_RESERVA e CAPTURAR_RESERVA do mesmo `id_reserva` disputam o hold; a primeira que o
+        remove vence e as demais voltam `RECUSADA` com `RESERVA_NAO_ENCONTRADA` (nunca sucesso silencioso).
+      parameters:
+        - $ref: '#/components/parameters/IdContrato'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/PrazoMs'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Operacao' }
+      responses:
+        '200':
+          description: Operação aplicada, já aplicada antes (idempotente) ou recusada por regra de negócio.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResultadoDaOperacao' }
+        '404':
+          description: Contrato inexistente na réplica do core.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+        '400':
+          description: Corpo que não é JSON válido.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+        '422':
+          description: |
+            Operação inválida: valor ausente, ≤ 0 ou com mais de 2 casas; tipo desconhecido; `id_reserva` ausente em
+            LIBERAR_RESERVA/CAPTURAR_RESERVA; `valor_reservado` ausente em CAPTURAR_RESERVA; captura maior que o reservado.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+        '500':
+          $ref: '#/components/responses/ErroInterno'
+        '503':
+          $ref: '#/components/responses/Indisponivel'
+  /interno/v1/contratos/{id_contrato}/operacoes/{id_operacao}:
+    get:
+      tags: [Limites]
+      operationId: consultarOperacao
+      summary: A operação está na guarda? O hold com este id está ativo? (só leitura)
+      description: |
+        Leitura fortemente consistente do item do contrato; nada é escrito. Usada pelo reconciliador para
+        PERGUNTAR se uma operação foi aplicada em vez de aplicá-la para descobrir. `na_guarda` só vale dentro da
+        janela de deduplicação (5 min); `reserva_ativa` vale enquanto o hold existir.
+      parameters:
+        - $ref: '#/components/parameters/IdContrato'
+        - name: id_operacao
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Estado da operação no limite.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id_operacao, na_guarda, reserva_ativa, versao]
+                properties:
+                  id_operacao: { type: string, format: uuid }
+                  na_guarda: { type: boolean }
+                  reserva_ativa: { type: boolean }
+                  versao: { type: integer, minimum: 1 }
+        '404':
+          description: Contrato inexistente na réplica do core.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+        '503':
+          $ref: '#/components/responses/Indisponivel'
+  /interno/v1/contratos/{id_contrato}/limite:
+    get:
+      tags: [Limites]
+      operationId: consultarLimite
+      summary: Retrato atual do limite do contrato
+      description: Leitura fortemente consistente do item do contrato.
+      parameters:
+        - $ref: '#/components/parameters/IdContrato'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Limite atual.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Limite' }
+        '404':
+          description: Contrato inexistente na réplica do core.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+        '500':
+          $ref: '#/components/responses/ErroInterno'
+        '503':
+          $ref: '#/components/responses/Indisponivel'
+components:
+  responses:
+    ErroInterno:
+      description: Falha inesperada (bug). Não traz detalhe interno; use o correlation_id para achar o log.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    Indisponivel:
+      description: |
+        Contenção persistente no diagnóstico ou banco estrangulado/sem resposta depois dos retries do SDK.
+        Seguro repetir com o mesmo id_operacao (a guarda absorve a escrita que talvez tenha sido aplicada).
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+  parameters:
+    IdContrato:
+      name: id_contrato
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[A-Za-z0-9-]{1,20}$' }
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      schema: { type: string, format: uuid }
+    PrazoMs:
+      name: X-Prazo-Ms
+      in: header
+      required: false
+      description: |
+        Epoch em ms até quando o chamador espera. Se a requisição esperar na fila além dele, o serviço NÃO escreve
+        e devolve 503: nenhuma escrita cai muito depois de o chamador desistir (premissa do reconciliador).
+      schema: { type: integer, minimum: 0 }
+    Traceparent:
+      name: traceparent
+      in: header
+      required: false
+      schema: { type: string, pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$' }
+  schemas:
+    Dinheiro:
+      type: number
+      minimum: 0
+      maximum: 9999999999999999.99
+      description: decimal(18,2); escala validada na aplicação (sem multipleOf — ver contrato público).
+    Operacao:
+      type: object
+      additionalProperties: false
+      required: [id_operacao, tipo, valor]
+      properties:
+        id_operacao:
+          type: string
+          format: uuid
+          description: Chave de idempotência da operação. O BC Autorização usa o próprio id_autorizacao.
+        tipo:
+          type: string
+          enum: [RESERVAR, DEBITAR, CREDITAR, LIBERAR_RESERVA, CAPTURAR_RESERVA, ESTORNAR_DEBITO]
+          description: |
+            - RESERVAR: reservado += valor (hold). Exige disponível ≥ valor e contrato ATIVO.
+            - DEBITAR: utilizado += valor. Exige disponível ≥ valor e contrato ATIVO.
+            - CREDITAR: utilizado −= valor. Exige utilizado ≥ valor.
+            - LIBERAR_RESERVA: desfaz o hold `id_reserva` (estorno de reserva, expiração ou compensação).
+            - CAPTURAR_RESERVA: o hold `id_reserva` vira consumo. reservado −= valor_reservado, utilizado += valor, e a
+              sobra (valor_reservado − valor) volta ao disponível, numa escrita. Não exige contrato ATIVO: o hold já foi
+              aprovado.
+            - ESTORNAR_DEBITO: utilizado −= valor de um débito anterior.
+        valor:
+          allOf: [ { $ref: '#/components/schemas/Dinheiro' } ]
+          description: |
+            Obrigatório em todas. Em LIBERAR_RESERVA é conferido contra o valor do hold. Em CAPTURAR_RESERVA é o
+            valor capturado (≤ valor_reservado).
+        id_reserva: { type: string, format: uuid, description: Obrigatório em LIBERAR_RESERVA e CAPTURAR_RESERVA. }
+        valor_reservado:
+          allOf: [ { $ref: '#/components/schemas/Dinheiro' } ]
+          description: Obrigatório em CAPTURAR_RESERVA; conferido contra o hold gravado (diferente → RESERVA_DIVERGENTE).
+    Saldos:
+      type: object
+      required: [limite_concedido, limite_utilizado, saldo_reservado, limite_disponivel, versao]
+      properties:
+        limite_concedido: { $ref: '#/components/schemas/Dinheiro' }
+        limite_utilizado: { $ref: '#/components/schemas/Dinheiro' }
+        saldo_reservado: { $ref: '#/components/schemas/Dinheiro' }
+        limite_disponivel: { type: number, description: Pode ser negativo só se o core reduziu o concedido. }
+        versao: { type: integer, minimum: 1 }
+    ResultadoDaOperacao:
+      type: object
+      required: [resultado, saldos]
+      properties:
+        resultado: { type: string, enum: [APLICADA, JA_APLICADA, RECUSADA] }
+        motivo:
+          type: string
+          enum: [LIMITE_INSUFICIENTE, CONTRATO_INATIVO, CREDITO_EXCEDE_UTILIZADO, RESERVA_DIVERGENTE, RESERVA_NAO_ENCONTRADA]
+          description: |
+            Presente quando resultado = RECUSADA. RESERVA_NAO_ENCONTRADA: o hold já foi capturado, liberado ou expirado
+            por outra operação.
+        saldos: { $ref: '#/components/schemas/Saldos' }
+    Limite:
+      allOf:
+        - $ref: '#/components/schemas/Saldos'
+        - type: object
+          required: [id_contrato, status_contrato, tipo_produto, reservas_ativas]
+          properties:
+            id_contrato: { type: string }
+            status_contrato: { type: string, enum: [ATIVO, BLOQUEADO, ENCERRADO] }
+            tipo_produto: { type: string, enum: [CREDITO, INVESTIMENTO, SEGURO, CONSORCIO] }
+            reservas_ativas: { type: integer, minimum: 0, description: Quantidade de holds ativos. }
+            versao_legado: { type: integer, minimum: 0 }
+    Problema:
+      type: object
+      required: [type, title, status, codigo]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        codigo: { type: string }
+        correlation_id: { type: string, format: uuid }
+        trace_id: { type: string, nullable: true }

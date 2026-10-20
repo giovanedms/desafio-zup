@@ -1,0 +1,20 @@
+# Copie para terraform.tfvars (ignorado pelo git se contiver segredos; aqui não há segredos).
+# Também dá para passar só o essencial: make deploy já faz -var account_id=$(EXPECTED_ACCOUNT_ID).
+
+account_id  = "123456789012" # conta desafio-zup (12 dígitos)
+aws_profile = "desafio-zup"
+
+# Tags imutáveis no ECR: cada release de imagem exige uma tag nova.
+tag_imagem_autorizacao = "1.0.0"
+tag_imagem_limites     = "1.0.0"
+
+# Capacidade (ADR-0004): início de mês pede scheduled/predictive scaling além do target tracking.
+tasks_desejadas = 2
+tasks_min       = 2
+tasks_max       = 20
+
+# Proteção contra exclusão: false no sandbox para o destroy funcionar; true em produção.
+deletion_protection = false
+
+# WAF: requisições por IP em 5 minutos.
+waf_limite_por_ip = 2000

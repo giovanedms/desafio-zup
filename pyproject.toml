@@ -1,0 +1,78 @@
+[project]
+name = "desafio-zup"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+
+[tool.uv.workspace]
+members = [
+  "services/autorizacao",
+  "services/limites",
+  "services/contabilizacao",
+  "libs/plataforma",
+  "relay",
+  "legado-mock",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "pytest-cov",
+  "hypothesis",
+  "mypy",
+  "ruff",
+  "import-linter",
+  "boto3-stubs[dynamodb,dynamodbstreams,sqs,events]",
+  "types-simplejson>=4.2.0.20261006",
+  "jsonschema>=4.26.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "N", "RUF", "PL"]
+ignore = [
+    "PLR0913", "PLR2004",
+    "RUF001", "RUF002", "RUF003",  # notação matemática intencional nas docstrings (−, ≥, Σ, ≠)
+    "N818",  # linguagem ubíqua em português: exceções se chamam pelo fato (ValorMonetarioInvalido)
+]
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 120  # E501: docstrings/comentários em PT até 120; o formatter mantém o código em 100
+
+[tool.ruff.lint.pylint]
+max-returns = 8  # guard clauses em regras de domínio são mais legíveis que condições aninhadas
+
+[tool.ruff.format]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+explicit_package_bases = true
+mypy_path = [
+  "services/autorizacao/src",
+  "services/limites/src",
+  "services/contabilizacao/src",
+  "libs/plataforma/src",
+  "relay/src",
+  "legado-mock/src",
+]
+
+[tool.pytest.ini_options]
+testpaths = [
+  "tests/integracao_bcs",
+  "services/autorizacao/tests",
+  "services/limites/tests",
+  "services/contabilizacao/tests",
+  "libs/plataforma/tests",
+  "relay/tests",
+  "legado-mock/tests",
+  "tests/contract",
+]
+# integracao fica fora por padrão (`make test-integracao` sobrescreve o -m).
+# importlib: vários membros têm tests/unit/test_smoke.py com o mesmo basename, sem __init__.py.
+addopts = "-q --strict-markers -m 'not integracao' --import-mode=importlib"
+markers = [
+  "integracao: precisa da LocalStack (make up)",
+]

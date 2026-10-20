@@ -1,0 +1,29 @@
+{
+  "specversion": "1.0",
+  "id": "e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8a9b",
+  "source": "/financas/autorizacao",
+  "type": "example.financas.autorizacao.TransacaoEmReconciliacaoManual.v1",
+  "time": "2026-10-20T13:45:12.345Z",
+  "subject": "CTR-000123456",
+  "datacontenttype": "application/json",
+  "dataschema": "https://financas.example/schemas/eventos/transacao-em-reconciliacao-manual/1.0.json",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "correlationid": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+  "partitionkey": "CTR-000123456",
+  "data": {
+    "event_id": "e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8a9b",
+    "event_type": "TransacaoEmReconciliacaoManual",
+    "event_version": "1.0",
+    "occurred_at": "2026-10-20T13:45:12.345Z",
+    "id_contrato": "CTR-000123456",
+    "correlation_id": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "id_autorizacao": "7a2d3c1f-4e5b-4c6d-9e8f-0a1b2c3d4e5f",
+    "tipo_operacao": "DEBITO",
+    "valor": 150.0,
+    "id_conta": "0001-12345678-9",
+    "motivo": "DESFAZER_RECUSADO",
+    "aplicacao_confirmada_em": "2026-10-20T13:01:10.000Z",
+    "desfazer_desde": "2026-10-20T13:01:11.000Z"
+  }
+}

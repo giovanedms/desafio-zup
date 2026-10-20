@@ -1,0 +1,76 @@
+# Arquitetura hexagonal: adapters > application > domain; núcleo sem framework nem AWS SDK.
+[importlinter]
+root_packages =
+    autorizacao
+    limites
+    contabilizacao
+include_external_packages = True
+
+[importlinter:contract:autorizacao-layers]
+name = autorizacao: adapters > application > domain
+type = layers
+layers =
+    autorizacao.adapters
+    autorizacao.application
+    autorizacao.domain
+
+[importlinter:contract:autorizacao-nucleo-puro]
+name = autorizacao: domain e application sem framework nem AWS SDK
+type = forbidden
+source_modules =
+    autorizacao.domain
+    autorizacao.application
+forbidden_modules =
+    fastapi
+    starlette
+    pydantic
+    boto3
+    botocore
+    httpx
+    uvicorn
+
+[importlinter:contract:limites-layers]
+name = limites: adapters > application > domain
+type = layers
+layers =
+    limites.adapters
+    limites.application
+    limites.domain
+
+[importlinter:contract:limites-nucleo-puro]
+name = limites: domain e application sem framework nem AWS SDK
+type = forbidden
+source_modules =
+    limites.domain
+    limites.application
+forbidden_modules =
+    fastapi
+    starlette
+    pydantic
+    boto3
+    botocore
+    httpx
+    uvicorn
+
+[importlinter:contract:contabilizacao-layers]
+name = contabilizacao: adapters > application > domain
+type = layers
+layers =
+    contabilizacao.adapters
+    contabilizacao.application
+    contabilizacao.domain
+
+[importlinter:contract:contabilizacao-nucleo-puro]
+name = contabilizacao: domain e application sem framework nem AWS SDK
+type = forbidden
+source_modules =
+    contabilizacao.domain
+    contabilizacao.application
+forbidden_modules =
+    fastapi
+    starlette
+    pydantic
+    boto3
+    botocore
+    httpx
+    uvicorn

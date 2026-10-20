@@ -1,0 +1,30 @@
+{
+  "specversion": "1.0",
+  "id": "c3d4e5f6-a7b8-4c9d-8e0f-2a3b4c5d6e7f",
+  "source": "/financas/autorizacao",
+  "type": "example.financas.autorizacao.TransacaoEstornada.v1",
+  "time": "2026-10-20T13:45:12.345Z",
+  "subject": "CTR-000123456",
+  "datacontenttype": "application/json",
+  "dataschema": "https://financas.example/schemas/eventos/transacao-estornada/1.0.json",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "correlationid": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+  "partitionkey": "CTR-000123456",
+  "data": {
+    "event_id": "c3d4e5f6-a7b8-4c9d-8e0f-2a3b4c5d6e7f",
+    "event_type": "TransacaoEstornada",
+    "event_version": "1.0",
+    "occurred_at": "2026-10-20T13:45:12.345Z",
+    "id_contrato": "CTR-000123456",
+    "correlation_id": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "id_autorizacao": "8b3e4d2a-5f6c-4d7e-8f9a-1b2c3d4e5f6a",
+    "id_autorizacao_original": "6f1c2b0e-3d4a-5b6c-8d7e-9f0a1b2c3d4e",
+    "tipo_operacao_original": "RESERVA",
+    "valor": 150.0,
+    "saldo_reservado": 0.0,
+    "limite_disponivel": 1000.0,
+    "limite_utilizado": 0.0,
+    "versao_limite": 43
+  }
+}

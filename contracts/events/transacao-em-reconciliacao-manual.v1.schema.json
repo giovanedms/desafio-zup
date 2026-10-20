@@ -1,0 +1,174 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "id": "https://financas.example/schemas/eventos/transacao-em-reconciliacao-manual/1.0.json",
+  "title": "TransacaoEmReconciliacaoManual v1 (CloudEvent estruturado)",
+  "description": "Autorização (ou reserva sem hold) que não dava para concluir com segurança de forma automática e foi para a fila humana. É a trilha durável do caso de efeito incerto. Publicado pelo BC Autorização; evolução só com campos opcionais.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "time",
+    "datacontenttype",
+    "dataschema",
+    "subject",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "type": "string",
+      "enum": [
+        "1.0"
+      ]
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "Gerado no outbox; estável entre reentregas. Dedup por (source, id)."
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "/financas/autorizacao"
+      ]
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "example.financas.autorizacao.TransacaoEmReconciliacaoManual.v1"
+      ]
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "subject": {
+      "type": "string",
+      "description": "id_contrato"
+    },
+    "datacontenttype": {
+      "type": "string",
+      "enum": [
+        "application/json"
+      ]
+    },
+    "dataschema": {
+      "type": "string",
+      "enum": [
+        "https://financas.example/schemas/eventos/transacao-em-reconciliacao-manual/1.0.json"
+      ]
+    },
+    "traceparent": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$",
+      "description": "Extensão CE Distributed Tracing."
+    },
+    "correlationid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "Extensão própria (nomes de atributo CE não aceitam `_`)."
+    },
+    "partitionkey": {
+      "type": "string",
+      "description": "Extensão CE Partitioning = id_contrato (útil se o stream migrar para Kinesis/Kafka)."
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "event_id",
+        "event_type",
+        "event_version",
+        "occurred_at",
+        "id_contrato",
+        "correlation_id",
+        "trace_id",
+        "id_autorizacao",
+        "tipo_operacao",
+        "valor",
+        "id_conta",
+        "motivo"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "description": "Espelho do atributo CE `id` (campo do enunciado)."
+        },
+        "event_type": {
+          "type": "string",
+          "enum": [
+            "TransacaoEmReconciliacaoManual"
+          ],
+          "description": "Espelho do nome curto (campo do enunciado)."
+        },
+        "event_version": {
+          "type": "string",
+          "pattern": "^1\\.[0-9]+$",
+          "description": "Versão do schema; major também no CE `type`."
+        },
+        "occurred_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Instante do fato de negócio (UTC); espelho do CE `time`."
+        },
+        "id_contrato": {
+          "type": "string"
+        },
+        "correlation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "trace_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "W3C trace-id; o traceparent completo vai na extensão CE `traceparent`."
+        },
+        "id_autorizacao": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "tipo_operacao": {
+          "type": "string",
+          "enum": [
+            "DEBITO",
+            "CREDITO",
+            "RESERVA",
+            "ESTORNO"
+          ]
+        },
+        "valor": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMinimum": true,
+          "maximum": 1e+16
+        },
+        "id_conta": {
+          "type": "string"
+        },
+        "motivo": {
+          "type": "string",
+          "enum": [
+            "FORA_DO_PRAZO",
+            "DESFAZER_FORA_DO_PRAZO",
+            "DESFAZER_RECUSADO",
+            "RESERVA_SEM_HOLD"
+          ]
+        },
+        "aplicacao_confirmada_em": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "desfazer_desde": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

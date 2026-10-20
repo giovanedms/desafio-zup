@@ -1,0 +1,387 @@
+openapi: 3.0.3
+# Contrato PÚBLICO (contract-first). Versão 3.0.3 de propósito: o API Gateway REST importa 2.0/3.0, não 3.1 (ADR-0011).
+# Extensões x-amazon-apigateway-* NÃO ficam aqui — o Terraform as acrescenta no deploy, para o contrato não depender de fornecedor.
+info:
+  title: API de Autorização de Transações
+  version: 1.0.0
+  description: |
+    Autorização síncrona de transações financeiras com verificação e reserva de limite por contrato.
+
+    **Idempotência:** toda operação mutante exige `Idempotency-Key`. O escopo é `(client_id do token, método, URI concreta, chave)`.
+    Repetir a mesma chave com o mesmo corpo devolve o resultado original: aprovação 201 → 200 com corpo idêntico; recusa → o mesmo 402.
+    Mesma chave com corpo diferente → 422. Mesma chave ainda em processamento → 409. A chave vale enquanto a autorização
+    estiver na retenção quente (30 dias), que é maior que a vida de uma reserva (7 dias).
+
+    **Erros:** `application/problem+json` conforme RFC 9457 (sucessora da RFC 7807 citada no enunciado), inclusive os gerados
+    pelo gateway (401, 403, 429, 5xx). Extensões: `codigo`, `correlation_id`, `trace_id`.
+
+    **Versionamento:** major no path (`/v1`). Dentro de um major só entram mudanças aditivas. Depreciação anunciada com os headers
+    `Deprecation` (RFC 9745) e `Sunset` (RFC 8594) e `Link rel="deprecation"`; prazo mínimo de 6 meses entre Deprecation e Sunset.
+  contact:
+    name: Plataforma de Finanças — time de Autorização
+servers:
+  - url: https://api.financas.example
+    description: Ambiente ilustrativo (domínio reservado .example, RFC 2606)
+tags:
+  - name: Autorizações
+security:
+  - oauth2: [autorizacoes/write]
+paths:
+  /v1/contratos/{id_contrato}/autorizacoes:
+    post:
+      tags: [Autorizações]
+      operationId: autorizarTransacao
+      summary: Autoriza (ou recusa) uma transação contra o limite do contrato
+      description: |
+        Decide de forma síncrona. Aprovação reserva/consome o limite de forma atômica (sem 409 por contenção) e publica
+        TransacaoAutorizada; recusa por limite devolve 402, fica registrada e publica TransacaoRecusada.
+      parameters:
+        - $ref: '#/components/parameters/IdContrato'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PedidoDeAutorizacao'
+            examples:
+              reserva:
+                summary: Reserva (hold) de R$ 150,00
+                value:
+                  id_conta: "0001-12345678-9"
+                  valor: 150.00
+                  moeda: BRL
+                  tipo_operacao: RESERVA
+                  id_estabelecimento: "EST-998877"
+                  metadata: { canal: POS, id_rastreio_canal: "pos-7f3a", geo: { uf: SP, municipio_ibge: "3509502" } }
+              captura:
+                summary: Captura parcial de uma reserva (DEBITO que referencia a RESERVA)
+                value:
+                  id_conta: "0001-12345678-9"
+                  valor: 120.00
+                  moeda: BRL
+                  tipo_operacao: DEBITO
+                  id_estabelecimento: "EST-998877"
+                  id_autorizacao_original: "6f1c2b0e-3d4a-5b6c-8d7e-9f0a1b2c3d4e"
+              estorno:
+                summary: Estorno de uma autorização anterior
+                value:
+                  id_conta: "0001-12345678-9"
+                  valor: 150.00
+                  moeda: BRL
+                  tipo_operacao: ESTORNO
+                  id_autorizacao_original: "6f1c2b0e-3d4a-5b6c-8d7e-9f0a1b2c3d4e"
+      responses:
+        '201':
+          description: Autorização aprovada (primeira execução).
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutorizacaoAprovada' }
+        '200':
+          description: Replay idempotente de uma aprovação — corpo idêntico ao da resposta original.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' }
+            Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutorizacaoAprovada' }
+        '400': { $ref: '#/components/responses/RequisicaoMalFormada' }
+        '401': { $ref: '#/components/responses/NaoAutenticado' }
+        '402': { $ref: '#/components/responses/LimiteInsuficiente' }
+        '403': { $ref: '#/components/responses/SemPermissao' }
+        '404': { $ref: '#/components/responses/ContratoNaoEncontrado' }
+        '409': { $ref: '#/components/responses/Conflito' }
+        '415': { $ref: '#/components/responses/TipoDeMidiaNaoSuportado' }
+        '422': { $ref: '#/components/responses/RegraDeDominioViolada' }
+        '429': { $ref: '#/components/responses/LimiteDeRequisicoes' }
+        '500': { $ref: '#/components/responses/ErroInterno' }
+        '503': { $ref: '#/components/responses/Indisponivel' }
+        '504': { $ref: '#/components/responses/TempoEsgotado' }
+  /v1/contratos/{id_contrato}/autorizacoes/{id_autorizacao}:
+    get:
+      tags: [Autorizações]
+      operationId: consultarAutorizacao
+      summary: Consulta o estado atual de uma autorização (útil após timeout do cliente)
+      description: Leitura do estado atual. Não altera nada e não exige Idempotency-Key.
+      security:
+        - oauth2: [autorizacoes/read]
+      parameters:
+        - $ref: '#/components/parameters/IdContrato'
+        - $ref: '#/components/parameters/IdAutorizacao'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: Autorização encontrada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Autorizacao' }
+        '401': { $ref: '#/components/responses/NaoAutenticado' }
+        '403': { $ref: '#/components/responses/SemPermissao' }
+        '404': { $ref: '#/components/responses/AutorizacaoNaoEncontrada' }
+        '429': { $ref: '#/components/responses/LimiteDeRequisicoes' }
+        '500': { $ref: '#/components/responses/ErroInterno' }
+        '503': { $ref: '#/components/responses/Indisponivel' }
+
+components:
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      description: OAuth 2.0 client credentials (sistemas consumidores). Na AWS, Amazon Cognito com resource server `autorizacoes`.
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.financas.example/oauth2/token
+          scopes:
+            autorizacoes/write: Criar autorizações (formato de escopo do Cognito, resource-server/escopo)
+            autorizacoes/read: Consultar autorizações
+
+  parameters:
+    IdContrato:
+      name: id_contrato
+      in: path
+      required: true
+      description: Identificador do contrato (crédito, investimento, seguro ou consórcio).
+      schema: { type: string, pattern: '^[A-Za-z0-9-]{1,20}$', example: CTR-000123456 }
+    IdAutorizacao:
+      name: id_autorizacao
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        UUID gerado pelo cliente por operação lógica. Aceito com ou sem aspas (o draft IETF usa sf-string entre aspas).
+        Ausente ou inválido → 400.
+      schema: { type: string, pattern: '^"?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"?$' }
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: Correlação de negócio ponta a ponta. Se ausente, o serviço gera um. Valor fora do formato é ignorado (proteção contra log injection).
+      schema: { type: string, format: uuid }
+    Traceparent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context.
+      schema: { type: string, pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$' }
+
+  headers:
+    Location:
+      description: URI da autorização criada.
+      schema: { type: string }
+    CorrelationId:
+      description: Correlação de negócio usada no processamento.
+      schema: { type: string, format: uuid }
+    IdempotentReplayed:
+      description: Presente (valor `true`) quando a resposta é um replay idempotente.
+      schema: { type: string, enum: ['true'] }
+    RetryAfter:
+      description: Segundos sugeridos antes de tentar de novo.
+      schema: { type: integer, minimum: 1 }
+
+  schemas:
+    Dinheiro:
+      type: number
+      description: |
+        Valor monetário decimal(18,2), como no enunciado. O servidor faz parse exato (Decimal, sem ponto flutuante) e rejeita
+        mais de 2 casas decimais com 422. Não usamos `multipleOf: 0.01` de propósito: validadores que dividem em ponto flutuante
+        rejeitam valores válidos (0.29 / 0.01 = 28.999999999999996 → R$ 19,99 seria recusado; testado com jsonschema).
+        A alternativa string-com-pattern (Open Finance Brasil, RFC 7493) está discutida no ADR-0011.
+      minimum: 0
+      maximum: 9999999999999999.99
+    ValorPositivo:
+      allOf: [ { $ref: '#/components/schemas/Dinheiro' } ]
+      minimum: 0
+      exclusiveMinimum: true
+    TipoOperacao:
+      type: string
+      enum: [DEBITO, CREDITO, RESERVA, ESTORNO]
+      description: |
+        - RESERVA: bloqueia limite (hold) por até 7 dias. Sem captura nem estorno nesse prazo, expira e o limite volta.
+        - DEBITO: consome limite imediatamente. Com `id_autorizacao_original` apontando para uma RESERVA aprovada, é a
+          CAPTURA do hold (total ou parcial, até o valor reservado): o hold sai, o capturado vira utilizado e a sobra
+          volta ao disponível, numa escrita só.
+        - CREDITO: recompõe limite utilizado (ex.: pagamento). Não pode exceder o utilizado.
+        - ESTORNO: reverte uma autorização anterior aprovada (exige `id_autorizacao_original`).
+        Uma RESERVA sai de APROVADA por um único caminho (captura, estorno ou expiração): quem chega depois recebe 409.
+    Metadata:
+      type: object
+      description: Allowlist de atributos de rastreio. Chaves fora da lista → 422. Sem dado pessoal (geo é só UF e município).
+      additionalProperties: false
+      properties:
+        canal: { type: string, enum: [APP, WEB, POS, PIX, BACKOFFICE] }
+        id_rastreio_canal: { type: string, maxLength: 64, pattern: '^[A-Za-z0-9._:-]+$' }
+        geo:
+          type: object
+          additionalProperties: false
+          properties:
+            uf: { type: string, pattern: '^[A-Z]{2}$' }
+            municipio_ibge: { type: string, pattern: '^[0-9]{7}$' }
+    PedidoDeAutorizacao:
+      type: object
+      additionalProperties: false
+      required: [id_conta, valor, moeda, tipo_operacao]
+      properties:
+        id_contrato:
+          type: string
+          description: Opcional no corpo (o enunciado o lista como path param). Se presente e diferente do path → 422.
+        id_conta: { type: string, pattern: '^[A-Za-z0-9-]{1,16}$', description: Número da conta corrente. }
+        valor:
+          allOf: [ { $ref: '#/components/schemas/ValorPositivo' } ]
+          description: Valor da transação em BRL, maior que zero, no máximo 2 casas decimais.
+        moeda: { type: string, pattern: '^[A-Z]{3}$', description: 'Código ISO 4217. Na v1 só BRL é aceito (outro código válido → 422).' }
+        tipo_operacao: { $ref: '#/components/schemas/TipoOperacao' }
+        id_estabelecimento: { type: string, maxLength: 64, pattern: '^[A-Za-z0-9._:-]+$' }
+        id_autorizacao_original: { type: string, format: uuid, description: 'Obrigatório em ESTORNO. Em DEBITO, indica captura da RESERVA referenciada. Proibido em RESERVA e CREDITO.' }
+        metadata: { $ref: '#/components/schemas/Metadata' }
+    Saldos:
+      type: object
+      required: [saldo_reservado, limite_disponivel, limite_utilizado, versao_limite]
+      properties:
+        saldo_reservado:
+          allOf: [ { $ref: '#/components/schemas/Dinheiro' } ]
+          description: Total reservado (em holds) no contrato após a operação — nome e semântica do enunciado.
+        limite_disponivel:
+          type: number
+          description: Concedido − utilizado − reservado após a operação. Pode ser negativo só se o core reduziu o limite concedido.
+        limite_utilizado: { $ref: '#/components/schemas/Dinheiro' }
+        versao_limite: { type: integer, minimum: 1, description: Versão do agregado Limite após a operação (ordem por contrato). }
+    AutorizacaoAprovada:
+      allOf:
+        - $ref: '#/components/schemas/Saldos'
+        - type: object
+          required: [id_autorizacao, id_contrato, status, tipo_operacao, valor, moeda, criada_em, correlation_id]
+          properties:
+            id_autorizacao: { type: string, format: uuid }
+            id_contrato: { type: string }
+            status: { type: string, enum: [APROVADA] }
+            tipo_operacao: { $ref: '#/components/schemas/TipoOperacao' }
+            valor: { $ref: '#/components/schemas/Dinheiro' }
+            moeda: { type: string }
+            id_autorizacao_original: { type: string, format: uuid }
+            criada_em: { type: string, format: date-time }
+            correlation_id: { type: string, format: uuid }
+    Autorizacao:
+      type: object
+      required: [id_autorizacao, id_contrato, status, tipo_operacao, valor, moeda, criada_em]
+      properties:
+        id_autorizacao: { type: string, format: uuid }
+        id_contrato: { type: string }
+        status:
+          type: string
+          enum: [EM_PROCESSAMENTO, APROVADA, RECUSADA, ESTORNADA, CAPTURADA, EXPIRADA, COMPENSANDO, COMPENSADA, RECONCILIACAO_MANUAL]
+          description: |
+            COMPENSANDO/COMPENSADA: o processamento foi interrompido e o reconciliador está desfazendo (ou desfez) o
+            efeito; a mesma chave não é mais retomada (use uma nova).
+            RECONCILIACAO_MANUAL: não dá para concluir com segurança de forma automática (passou do prazo em que
+            reenviar ao limite é seguro, ou a reversão foi recusada); uma pessoa decide. Raro: exige o reconciliador
+            ou o limite parados por minutos.
+        motivo_recusa:
+          type: string
+          enum: [LIMITE_INSUFICIENTE, CONTRATO_INATIVO, CREDITO_EXCEDE_UTILIZADO, CONTRATO_NAO_ENCONTRADO, ORIGINAL_JA_ENCERRADA, RESERVA_DIVERGENTE, RESERVA_NAO_ENCONTRADA, ESTORNO_EM_ANDAMENTO, RECUSA_DO_LIMITE]
+        tipo_operacao: { $ref: '#/components/schemas/TipoOperacao' }
+        valor: { $ref: '#/components/schemas/Dinheiro' }
+        moeda: { type: string }
+        saldos: { $ref: '#/components/schemas/Saldos' }
+        criada_em: { type: string, format: date-time }
+        atualizada_em: { type: string, format: date-time }
+    Problema:
+      type: object
+      description: RFC 9457 Problem Details + extensões do domínio.
+      required: [type, title, status, codigo, correlation_id]
+      properties:
+        type: { type: string, format: uri, example: 'https://financas.example/problemas/limite-insuficiente' }
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string }
+        instance: { type: string }
+        codigo: { type: string, description: Código estável e legível por máquina (o "código" pedido pelo enunciado). }
+        correlation_id: { type: string, format: uuid }
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$', nullable: true }
+        id_autorizacao: { type: string, format: uuid, description: Presente em recusas (402) — a recusa também é registrada. }
+        erros:
+          type: array
+          description: Detalhe por campo em erros de validação (400/422).
+          items:
+            type: object
+            required: [campo, mensagem]
+            properties:
+              campo: { type: string }
+              mensagem: { type: string }
+
+  responses:
+    RequisicaoMalFormada:
+      description: Sintaxe inválida (JSON malformado, Idempotency-Key ausente/ inválida, tipo errado). Ver `/problemas/requisicao-mal-formada`.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    NaoAutenticado:
+      description: Token ausente/ inválido (emitido pelo gateway). Ver `/problemas/nao-autenticado`.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    SemPermissao:
+      description: Escopo insuficiente (emitido pelo gateway). Ver `/problemas/sem-permissao`.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    LimiteInsuficiente:
+      description: Recusa por regra de negócio — limite disponível menor que o valor. A recusa é registrada e publicada (TransacaoRecusada).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problema' }
+          example:
+            type: https://financas.example/problemas/limite-insuficiente
+            title: Limite insuficiente
+            status: 402
+            detail: O limite disponível do contrato não cobre o valor solicitado.
+            codigo: LIMITE_INSUFICIENTE
+            id_autorizacao: 6f1c2b0e-3d4a-5b6c-8d7e-9f0a1b2c3d4e
+            correlation_id: 0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b
+            trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+    ContratoNaoEncontrado:
+      description: Contrato inexistente na réplica do core (fail-closed). Ver `/problemas/contrato-nao-encontrado`.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    AutorizacaoNaoEncontrada:
+      description: Autorização inexistente para o contrato informado, ou criada por outro canal (não revela a existência).
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    Conflito:
+      description: |
+        Dois tipos distintos (campo `type`):
+        - `/problemas/requisicao-em-andamento`: a mesma Idempotency-Key ainda está sendo processada (com Retry-After).
+        - `/problemas/conflito-de-estado`: o estado mudou durante a operação (ex.: estorno ou captura de reserva já
+          capturada/estornada/expirada; captura que perdeu o hold para um estorno concorrente; outro estorno da
+          mesma autorização ainda em andamento; chave cuja órfã foi compensada ou está em reconciliação manual, sem
+          Retry-After: repetir não muda o desfecho, consulte com GET).
+        Não existe 409 por contenção de concorrência: reservas no mesmo contrato são serializadas pelo banco (ADR-0005).
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    TipoDeMidiaNaoSuportado:
+      description: Content-Type diferente de application/json.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    RegraDeDominioViolada:
+      description: |
+        Payload sintaticamente válido mas que viola regra de domínio (`erros` traz o detalhe). Inclui: valor ≤ 0 ou com mais de 2 casas;
+        moeda ≠ BRL; ESTORNO sem `id_autorizacao_original`; `id_autorizacao_original` em RESERVA/CREDITO; captura maior que
+        a reserva ou de algo que não é RESERVA; `id_contrato` do corpo ≠ path; mesma Idempotency-Key com corpo diferente;
+        contrato não ATIVO; CREDITO maior que o utilizado.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    LimiteDeRequisicoes:
+      description: Rate limit/quota do plano do consumidor (usage plan + WAF) ou proteção do serviço. Sempre com Retry-After.
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    ErroInterno:
+      description: Falha inesperada. Seguro repetir com a mesma Idempotency-Key.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    Indisponivel:
+      description: Degradação — circuit breaker aberto ou load shedding (fail-fast). Seguro repetir com a mesma Idempotency-Key após Retry-After.
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    TempoEsgotado:
+      description: Timeout na integração (gateway). O resultado pode ter sido aplicado — repetir com a mesma Idempotency-Key ou consultar via GET.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }

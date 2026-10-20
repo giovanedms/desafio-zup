@@ -1,0 +1,255 @@
+"""Verificação da janela na AWS (sandbox): carga de contratos pela ACL, borda do API Gateway e corrida.
+
+Uso (depois do `make deploy`):
+    AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py contratos [N] [PREFIXO]   # legado → SQS → limites-acl
+    AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py borda       # 201, replay, 401, 429, problem+json
+    AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py corrida     # 100 reservas paralelas no DynamoDB real
+
+Segredos (client secrets do Cognito, API keys) vêm de `terraform output -json` e NUNCA são impressos.
+Local: o profile precisa ser explícito (o shell do operador exporta credenciais de OUTRA conta, que são removidas).
+Na esteira (GitHub Actions + OIDC): sem profile, as credenciais temporárias vêm do ambiente.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
+
+import boto3
+import httpx
+from limites.adapters.inbound.legado.traducao import formatar
+from limites.domain.legado import AtualizacaoDoLegado
+from limites.domain.limite import StatusContrato, TipoProduto
+
+AMBIENTE = "infra/terraform/environments/sandbox"
+
+
+def ambiente_aws() -> dict[str, str]:
+    """Variáveis para subprocessos (terraform): local, tira as chaves exportadas; na esteira, mantém as do OIDC."""
+    if os.environ.get("AWS_PROFILE"):
+        chaves = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"}
+        return {k: v for k, v in os.environ.items() if k not in chaves}
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        return dict(os.environ)
+    sys.exit("defina AWS_PROFILE=desafio-zup (o shell exporta credenciais de outra conta)")
+
+
+def saidas() -> dict[str, Any]:
+    env = ambiente_aws()
+    bruto = subprocess.run(
+        ["terraform", f"-chdir={AMBIENTE}", "output", "-json"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout
+    return {k: v["value"] for k, v in json.loads(bruto).items()}
+
+
+def sessao() -> boto3.Session:
+    ambiente_aws()  # mesma trava: sem profile só dentro da esteira
+    return boto3.Session(
+        profile_name=os.environ.get("AWS_PROFILE") or None, region_name="sa-east-1"
+    )
+
+
+def token(s: dict[str, Any], canal: str) -> str:
+    resposta = httpx.post(
+        s["token_endpoint"],
+        data={"grant_type": "client_credentials", "scope": "autorizacoes/write autorizacoes/read"},
+        auth=(s["cognito_client_ids"][canal], s["cognito_client_secrets"][canal]),
+        timeout=10,
+    )
+    resposta.raise_for_status()
+    return str(resposta.json()["access_token"])
+
+
+def cabecalhos(s: dict[str, Any], canal: str, tk: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {tk}",
+        "x-api-key": s["api_keys"][canal],
+        "Content-Type": "application/json",
+    }
+
+
+def enviar_ao_legado(registros: list[str]) -> None:
+    sqs = sessao().client("sqs")
+    url = sqs.get_queue_url(QueueName="legado-contratos")["QueueUrl"]
+    for inicio in range(0, len(registros), 10):  # SendMessageBatch aceita até 10 mensagens
+        lote = registros[inicio : inicio + 10]
+        resposta = sqs.send_message_batch(
+            QueueUrl=url,
+            Entries=[{"Id": str(i), "MessageBody": r} for i, r in enumerate(lote)],
+        )
+        if resposta.get("Failed"):
+            sys.exit(f"SQS recusou {len(resposta['Failed'])} mensagens do lote {inicio // 10}")
+
+
+def registro(id_contrato: str, concedido: str, versao: int = 1) -> str:
+    return formatar(
+        AtualizacaoDoLegado(
+            id_contrato,
+            "0001-77777777-7",
+            TipoProduto.CREDITO,
+            Decimal(concedido),
+            StatusContrato.ATIVO,
+            versao,
+            datetime.now(UTC),
+        )
+    )
+
+
+def contratos() -> None:
+    n = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+    prefixo = sys.argv[3] if len(sys.argv) > 3 else "CTR-CARGA-"
+    largura = 4 if prefixo == "CTR-CARGA-" else 6
+    registros = [registro(f"{prefixo}{i:0{largura}d}", "99999999.00") for i in range(1, n + 1)]
+    enviar_ao_legado(registros)
+    print(
+        f"{len(registros)} registros do legado enviados à fila legado-contratos (ACL cria os contratos)"
+    )
+
+
+def autorizar(
+    http: httpx.Client,
+    s: dict[str, Any],
+    hdr: dict[str, str],
+    contrato: str,
+    corpo: dict[str, Any],
+    *,
+    chave: str | None = None,
+) -> httpx.Response:
+    return http.post(
+        f"{s['invoke_url']}/v1/contratos/{contrato}/autorizacoes",
+        json=corpo,
+        headers={**hdr, "Idempotency-Key": chave or str(uuid.uuid4())},
+    )
+
+
+def esperar_contrato(contrato: str) -> None:
+    tabela = sessao().client("dynamodb")
+    for _ in range(60):
+        if tabela.get_item(TableName="limites", Key={"id_contrato": {"S": contrato}}).get("Item"):
+            return
+        time.sleep(1)
+    sys.exit(f"contrato {contrato} não apareceu em 60 s (limites-acl de pé?)")
+
+
+def borda() -> None:
+    s = saidas()
+    contrato = f"CTR-AWS-{uuid.uuid4().hex[:6].upper()}"
+    enviar_ao_legado([registro(contrato, "1000.00")])
+    esperar_contrato(contrato)
+    corpo = {"id_conta": "0001-1", "valor": 150.00, "moeda": "BRL", "tipo_operacao": "RESERVA"}
+    with httpx.Client(timeout=15) as http:
+        hdr = cabecalhos(s, "canal-pos", token(s, "canal-pos"))
+        chave = str(uuid.uuid4())
+        r1 = autorizar(http, s, hdr, contrato, corpo, chave=chave)
+        r2 = autorizar(http, s, hdr, contrato, corpo, chave=chave)
+        print(f"201 esperado: {r1.status_code}  saldo_reservado={r1.json().get('saldo_reservado')}")
+        print(
+            f"replay: {r2.status_code}  replayed={r2.headers.get('Idempotent-Replayed')}  "
+            f"idêntico={r1.content == r2.content}"
+        )
+        sem_token = http.post(
+            f"{s['invoke_url']}/v1/contratos/{contrato}/autorizacoes",
+            json=corpo,
+            headers={"x-api-key": s["api_keys"]["canal-pos"], "Idempotency-Key": str(uuid.uuid4())},
+        )
+        print(
+            f"sem token: {sem_token.status_code}  {sem_token.headers.get('content-type')}  {sem_token.text[:120]}"
+        )
+        restrito = cabecalhos(s, "canal-app", token(s, "canal-app"))
+        status = Counter(
+            autorizar(http, s, restrito, contrato, {**corpo, "valor": 0.01}).status_code
+            for _ in range(30)
+        )
+        ultimo = autorizar(http, s, restrito, contrato, {**corpo, "valor": 0.01})
+        print(
+            f"plano restrito (30 rápidas): {dict(status)}  último: {ultimo.status_code} "
+            f"{ultimo.headers.get('content-type')} Retry-After={ultimo.headers.get('Retry-After')}"
+        )
+    falhas = [
+        o_que
+        for ok, o_que in [
+            (r1.status_code == 201, "1ª autorização deveria ser 201"),
+            (
+                r2.status_code == 200 and r1.content == r2.content,
+                "replay deveria ser 200 e idêntico",
+            ),
+            (
+                sem_token.status_code == 401
+                and sem_token.headers.get("content-type") == "application/problem+json",
+                "sem token deveria ser 401 application/problem+json (gateway response)",
+            ),
+        ]
+        if not ok
+    ]
+    print("✅ borda conforme o contrato" if not falhas else "❌ " + "; ".join(falhas))
+    if falhas:
+        sys.exit(1)
+
+
+def autorizar_como_um_canal_correto(
+    http: httpx.Client, s: dict[str, Any], hdr: dict[str, str], contrato: str, corpo: dict[str, Any]
+) -> tuple[httpx.Response, list[str]]:
+    """503/429 são "tente de novo": repete com a MESMA Idempotency-Key depois do Retry-After."""
+    chave, vistos = str(uuid.uuid4()), []
+    for _ in range(10):
+        resposta = autorizar(http, s, hdr, contrato, corpo, chave=chave)
+        if resposta.status_code not in (429, 503):
+            return resposta, vistos
+        vistos.append(f"{resposta.status_code} {resposta.json().get('codigo', '?')}")
+        time.sleep(float(resposta.headers.get("Retry-After", "1")))
+    return resposta, vistos
+
+
+def corrida() -> None:
+    s = saidas()
+    contrato = f"CTR-AWS-{uuid.uuid4().hex[:6].upper()}"
+    enviar_ao_legado([registro(contrato, "1000.00")])
+    esperar_contrato(contrato)
+    corpo = {"id_conta": "0001-1", "valor": 100.00, "moeda": "BRL", "tipo_operacao": "RESERVA"}
+    with httpx.Client(timeout=30, limits=httpx.Limits(max_connections=100)) as http:
+        hdr = cabecalhos(s, "canal-carga", token(s, "canal-carga"))
+        with ThreadPoolExecutor(max_workers=100) as pool:
+            resultados = list(
+                pool.map(
+                    lambda _: autorizar_como_um_canal_correto(http, s, hdr, contrato, corpo),
+                    range(100),
+                )
+            )
+    respostas = [r for r, _ in resultados]
+    repetidas = Counter(v for _, vistos in resultados for v in vistos)
+    if repetidas:
+        print(f"repetidas pelo canal (load shedding/cota, mesma chave): {dict(repetidas)}")
+    status = Counter(r.status_code for r in respostas)
+    item = (
+        sessao()
+        .client("dynamodb")
+        .get_item(TableName="limites", Key={"id_contrato": {"S": contrato}}, ConsistentRead=True)[
+            "Item"
+        ]
+    )
+    print(f"AWS — 100 reservas paralelas de R$ 100 em R$ 1.000: {dict(sorted(status.items()))}")
+    print(
+        f"DynamoDB real: disponivel={item['disponivel']['N']} "
+        f"reservado={item['reservado']['N']} versao={item['versao']['N']}"
+    )
+    ok = status == {201: 10, 402: 90} and item["disponivel"]["N"] == "0"
+    print("✅ invariante preservada" if ok else "❌ DIVERGÊNCIA")
+    if not ok:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    {"contratos": contratos, "borda": borda, "corrida": corrida}[sys.argv[1]]()

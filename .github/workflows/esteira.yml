@@ -1,0 +1,338 @@
+# Esteira do desafio: CI em todo push e PR; CD para o sandbox AWS (conta desafio-zup) a partir da main.
+#
+#   qualidade ─┐
+#   integracao ┤
+#   contratos ─┼─▶ deploy (OIDC, sem chave longa) ─▶ smoke na AWS
+#   terraform ─┤
+#   seguranca ─┤
+#   e2e ───────┘
+#   destroy: só manual (workflow_dispatch), na main, com a frase de confirmação exata.
+#
+# Actions fixadas por SHA de commit (a tag fica no comentário): tag de action é mutável; SHA não.
+# Segredos do repositório: AWS_ROLE_ARN (role da esteira, ambiente infra/terraform/environments/esteira) e
+# AWS_ACCOUNT_ID. A role só confia em workflows da main deste repositório (claim `sub` do token OIDC).
+name: esteira
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      acao:
+        description: "deploy (padrão) ou destroy do sandbox"
+        type: choice
+        options: [deploy, destroy]
+        default: deploy
+      confirmacao:
+        description: 'Destroy exige exatamente: CONFIRMO: destroy na conta desafio-zup'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+# Execuções antigas do mesmo ref são canceladas, exceto na main: lá um apply nunca é interrompido no meio.
+concurrency:
+  group: esteira-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  PYTHON_VERSION: "3.13"
+  TERRAFORM_VERSION: "1.16.1"
+  AWS_REGION: sa-east-1
+
+jobs:
+  # ---------------------------------------------------------------- CI
+  # Lint, tipos (mypy strict), regras de arquitetura (import-linter) e testes unitários/contrato/propriedade.
+  qualidade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Dependências (uv.lock congelado)
+        run: uv sync --all-packages --frozen
+      - name: make check (lint + typecheck + arch + test)
+        run: make check
+
+  # Os mesmos testes de contrato das portas contra o DynamoDB/SQS/EventBridge da LocalStack (fixada por digest).
+  integracao:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      localstack:
+        image: localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: dynamodb,dynamodbstreams,sqs,events,sts,logs
+          EAGER_SERVICE_LOADING: "1"
+        options: >-
+          --health-cmd "curl -fs http://localhost:4566/_localstack/health"
+          --health-interval 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --all-packages --frozen
+      - name: Testes de integração (LocalStack)
+        run: make test-integracao
+
+  # Contract-first: lint e estrutura dos OpenAPI, exemplos de evento contra os schemas e, em PR, compatibilidade.
+  contratos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Spectral (lint OpenAPI)
+        run: npx --yes @stoplight/spectral-cli@6 lint contracts/openapi/*.yaml --ruleset .spectral.yaml
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Validação estrutural OpenAPI 3.0
+        run: for f in contracts/openapi/*.yaml; do uvx openapi-spec-validator "$f"; done
+      - name: Exemplos de evento cumprem os schemas (JSON Schema draft-04)
+        run: |
+          uvx --with jsonschema python - <<'PY'
+          import json, pathlib, sys
+          import jsonschema
+          base = pathlib.Path("contracts/events")
+          erros = 0
+          for exemplo in sorted((base / "examples").glob("*.json")):
+              schema = json.loads((base / f"{exemplo.stem}.schema.json").read_text())
+              validador = jsonschema.Draft4Validator(schema, format_checker=jsonschema.Draft4Validator.FORMAT_CHECKER)
+              falhas = [e.message for e in validador.iter_errors(json.loads(exemplo.read_text()))]
+              print(exemplo.name, "OK" if not falhas else falhas)
+              erros += len(falhas)
+          sys.exit(1 if erros else 0)
+          PY
+      - name: Compatibilidade com a base do PR (ADR-0008)
+        if: github.event_name == 'pull_request'
+        run: scripts/compat_contratos.sh origin/${{ github.base_ref }}
+
+  # IaC: formato, validação dos dois ambientes e testes com mock_provider (nenhuma chamada à AWS).
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - run: make tf-fmt tf-validate tf-test
+
+  # SCA + segredos + misconfiguração (Trivy) e política de IaC (Checkov).
+  seguranca:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Trivy filesystem (vuln, secret, misconfig)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Checkov em infra/terraform
+        uses: bridgecrewio/checkov-action@6f26dc90000b74feb589a906cdfae540f5119895 # v12.3134.0
+        with:
+          directory: infra/terraform
+          framework: terraform
+          quiet: true
+
+  # Ponta a ponta: a stack inteira em containers (LocalStack + 6 serviços) e a demo, que confere cada seção.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --all-packages --frozen
+      - name: Sobe a stack local (bootstrap idempotente + build + up --wait)
+        run: make up
+      - name: Demo ponta a ponta (sai com 1 em qualquer divergência)
+        run: make demo
+      - name: Logs dos serviços (se falhar)
+        if: failure()
+        run: docker compose -f infra/local/docker-compose.yml logs --tail 200
+      - name: Derruba
+        if: always()
+        run: make down
+
+  # ---------------------------------------------------------------- CD
+  # Deploy do sandbox: só da main, depois de TODO o CI verde. Ordem: repositórios ECR → imagens (tag do commit,
+  # imutável) → plan → apply → serviços ECS estáveis.
+  deploy:
+    needs: [qualidade, integracao, contratos, terraform, seguranca, e2e]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.acao == 'deploy'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write # token OIDC para o STS
+    concurrency:
+      group: aws-sandbox
+      cancel-in-progress: false
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_VAR_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
+      TF_VAR_aws_profile: "" # sem profile: as credenciais do OIDC vêm do ambiente
+      TF_VAR_arquitetura_cpu: X86_64
+      TF_ENV: infra/terraform/environments/sandbox
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Credenciais temporárias (OIDC → role da esteira)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: esteira-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+      - name: Tag imutável das imagens = commit
+        run: |
+          tag="git-${GITHUB_SHA::12}"
+          {
+            echo "TAG=$tag"
+            echo "TF_VAR_tag_imagem_limites=$tag"
+            echo "TF_VAR_tag_imagem_autorizacao=$tag"
+          } >> "$GITHUB_ENV"
+      - name: Pacotes das Lambdas (arm64, py3.13)
+        run: make pacotes
+      - name: terraform init (state em S3, lock nativo)
+        run: terraform -chdir="$TF_ENV" init -input=false -backend-config="bucket=desafio-zup-tfstate-${TF_VAR_account_id}"
+      - name: Repositórios ECR primeiro (as tasks precisam da imagem para subir)
+        run: terraform -chdir="$TF_ENV" apply -input=false -auto-approve -target=module.ecr
+      - name: Login no ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      - name: Build e push (tag que já existe é pulada)
+        env:
+          REGISTRO: ${{ steps.ecr.outputs.registry }}
+        run: |
+          for s in limites autorizacao; do
+            if aws ecr describe-images --repository-name "desafio-zup/$s" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+              echo "desafio-zup/$s:$TAG já existe; pulando"; continue
+            fi
+            docker buildx build --platform linux/amd64 -f "services/$s/Dockerfile" \
+              --cache-from "type=gha,scope=$s" --cache-to "type=gha,mode=max,scope=$s" \
+              -t "$REGISTRO/desafio-zup/$s:$TAG" --push .
+          done
+      - name: terraform plan
+        run: terraform -chdir="$TF_ENV" plan -input=false -out=tfplan
+      - name: Resumo do plano (só endereços; nenhum valor)
+        run: |
+          {
+            echo "### Plano do sandbox (tag \`$TAG\`)"
+            echo '```'
+            terraform -chdir="$TF_ENV" show -no-color tfplan | grep -E '^  # |^Plan:' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: terraform apply do plano revisado
+        run: terraform -chdir="$TF_ENV" apply -input=false tfplan
+      - name: Serviços ECS estáveis
+        run: aws ecs wait services-stable --cluster desafio --services autorizacao limites limites-acl reconciliador
+
+  # Smoke na AWS real: borda do gateway (201, replay idêntico, 401 problem+json) e corrida no DynamoDB real.
+  smoke:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: aws-sandbox
+      cancel-in-progress: false
+    env:
+      TF_VAR_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
+      TF_VAR_aws_profile: ""
+      TF_ENV: infra/terraform/environments/sandbox
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: esteira-smoke-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+      - run: uv sync --all-packages --frozen
+      - name: terraform init (os scripts leem os outputs; segredos nunca são impressos)
+        run: terraform -chdir="$TF_ENV" init -input=false -backend-config="bucket=desafio-zup-tfstate-${TF_VAR_account_id}"
+      - name: Borda do API Gateway
+        run: uv run python tests/e2e/aws.py borda
+      - name: Corrida de 100 reservas no DynamoDB real
+        run: uv run python tests/e2e/aws.py corrida
+
+  # Destroy: só manual, na main, com a mesma frase exata exigida pelo Makefile.
+  destroy:
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' &&
+      inputs.acao == 'destroy' && inputs.confirmacao == 'CONFIRMO: destroy na conta desafio-zup'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: aws-sandbox
+      cancel-in-progress: false
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_VAR_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
+      TF_VAR_aws_profile: ""
+      TF_ENV: infra/terraform/environments/sandbox
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: esteira-destroy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+      - name: Pacotes das Lambdas (o plan de destroy lê os zips)
+        run: make pacotes
+      - run: terraform -chdir="$TF_ENV" init -input=false -backend-config="bucket=desafio-zup-tfstate-${TF_VAR_account_id}"
+      - name: terraform destroy
+        run: terraform -chdir="$TF_ENV" destroy -input=false -auto-approve

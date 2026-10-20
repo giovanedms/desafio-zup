@@ -1,0 +1,2 @@
+# Lint dos contratos OpenAPI: regras padrão OAS do Spectral; CI falha em severidade "error".
+extends: ["spectral:oas"]

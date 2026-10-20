@@ -1,0 +1,21 @@
+# Contexto de build = raiz do workspace. Fica de fora tudo que não entra na imagem.
+.git
+.github
+.venv
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.hypothesis
+.import_linter_cache
+.coverage
+htmlcov
+**/tests
+infra/terraform/.terraform
+**/.terraform
+*.tfstate*
+.env
+.env.*
+!.env.example
+*.zip

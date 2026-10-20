@@ -1,0 +1,30 @@
+{
+  "specversion": "1.0",
+  "id": "d4e5f6a7-b8c9-4d0e-9f1a-3b4c5d6e7f8a",
+  "source": "/financas/limites",
+  "type": "example.financas.limites.LimiteAlterado.v1",
+  "time": "2026-10-20T13:45:12.345Z",
+  "subject": "CTR-000123456",
+  "datacontenttype": "application/json",
+  "dataschema": "https://financas.example/schemas/eventos/limite-alterado/1.0.json",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "correlationid": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+  "partitionkey": "CTR-000123456",
+  "data": {
+    "event_id": "d4e5f6a7-b8c9-4d0e-9f1a-3b4c5d6e7f8a",
+    "event_type": "LimiteAlterado",
+    "event_version": "1.0",
+    "occurred_at": "2026-10-20T13:45:12.345Z",
+    "id_contrato": "CTR-000123456",
+    "correlation_id": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "limite_concedido_anterior": 1000.0,
+    "limite_concedido": 1500.0,
+    "status_contrato_anterior": "ATIVO",
+    "status_contrato": "ATIVO",
+    "limite_disponivel": 1500.0,
+    "versao_limite": 44,
+    "versao_legado": 17,
+    "origem": "CORE_LEGADO"
+  }
+}

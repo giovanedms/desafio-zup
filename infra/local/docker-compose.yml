@@ -1,0 +1,138 @@
+# Ambiente local offline. LocalStack 4.14.0 = último build Community que roda sem token
+# (ver ADR-0018), fixado também por digest para o pull ser reprodutível.
+# Credenciais nos serviços são FICTÍCIAS e explícitas: nada do shell do host vaza para os containers.
+services:
+  localstack:
+    image: localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      SERVICES: dynamodb,dynamodbstreams,sqs,events,sts,logs
+      DEBUG: "0"
+      EAGER_SERVICE_LOADING: "1"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      retries: 30
+    networks:
+      - desafio
+
+  # BC Limites: API interna (porta 18081 só para inspeção na demo; em produção não é exposta).
+  limites:
+    build: { context: ../.., dockerfile: services/limites/Dockerfile }
+    image: desafio-zup/limites:dev
+    environment: &aws_local
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: sa-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      TABELA_LIMITES: limites
+    ports:
+      - "127.0.0.1:18081:8080"
+    depends_on:
+      localstack: { condition: service_healthy }
+    networks: [desafio]
+
+  # ACL do legado (RN-05): fila `legado-contratos` (registros de 84 posições) → limites no DynamoDB.
+  # Mesma imagem do limites, outro command; na AWS roda como serviço ECS (long polling) sem NLB.
+  # Sem HTTP: o loop toca /tmp/limites-acl.heartbeat; saudável se mexeu nos últimos 30 s.
+  limites-acl:
+    image: desafio-zup/limites:dev
+    pull_policy: never  # a imagem é construída pelo serviço `limites`
+    command: ["python", "-m", "limites.adapters.inbound.legado.consumidor"]
+    environment:
+      <<: *aws_local
+      FILA_LEGADO: legado-contratos
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/limites-acl.heartbeat')<30 else 1)"
+      interval: 15s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      localstack: { condition: service_healthy }
+      limites: { condition: service_healthy }
+    networks: [desafio]
+
+  # BC Autorização: API pública v1 (o API Gateway não é emulado localmente; ver ADR-0018).
+  autorizacao:
+    build: { context: ../.., dockerfile: services/autorizacao/Dockerfile }
+    image: desafio-zup/autorizacao:dev
+    environment:
+      <<: *aws_local
+      TABELA_AUTORIZACOES: autorizacoes
+      TABELA_OUTBOX: autorizacoes-outbox
+      URL_LIMITES: http://limites:8080
+      # Teto de requisições em voo = capacidade × latência. Na AWS (~10 ms por escrita) 32 basta; aqui cada
+      # requisição leva ~1–2 s no emulador e a demo dispara 50 em paralelo, então o teto local é maior.
+      MAX_EM_VOO: "256"
+    ports:
+      - "127.0.0.1:18080:8080"
+    depends_on:
+      limites: { condition: service_healthy }
+    networks: [desafio]
+
+  # Reconciliador de órfãs (ADR-0006): loop que compensa/conclui autorizações EM_PROCESSAMENTO sem dono.
+  # Mesma imagem da autorizacao; na AWS é serviço ECS (precisa do Service Connect para chamar o limites).
+  # Sem HTTP: o loop toca /tmp/reconciliador.heartbeat a cada rodada; saudável se mexeu nos últimos 90 s.
+  reconciliador:
+    image: desafio-zup/autorizacao:dev
+    pull_policy: never  # a imagem é construída pelo serviço `autorizacao`
+    command: ["python", "-m", "autorizacao.adapters.inbound.reconciliador"]
+    environment:
+      <<: *aws_local
+      TABELA_AUTORIZACOES: autorizacoes
+      TABELA_OUTBOX: autorizacoes-outbox
+      URL_LIMITES: http://limites:8080
+      INTERVALO_RECONCILIADOR_S: "30"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/reconciliador.heartbeat')<90 else 1)"
+      interval: 15s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      localstack: { condition: service_healthy }
+      limites: { condition: service_healthy }
+      autorizacao: { condition: service_healthy }
+    networks: [desafio]
+
+  # Relay do outbox (ADR-0007): Stream da tabela de outbox → EventBridge (bus financas) → filas.
+  # Mesmo núcleo que roda como Lambda na AWS; aqui faz polling do Stream da LocalStack.
+  relay:
+    build: { context: ../.., dockerfile: relay/Dockerfile }
+    image: desafio-zup/relay:dev
+    environment:
+      <<: *aws_local
+      TABELA_OUTBOX: autorizacoes-outbox
+      TABELA_LIMITES: limites  # CDC: Stream da tabela de limites → LimiteAlterado (source financas.limites)
+      BUS: financas
+    depends_on:
+      localstack: { condition: service_healthy }
+    networks: [desafio]
+
+  # BC Contabilização: fila SQS (assinada no bus financas) → lançamentos em partidas dobradas.
+  # Mesmo caso de uso que roda como Lambda na AWS; aqui faz long polling da fila na LocalStack.
+  contabilizacao:
+    build: { context: ../.., dockerfile: services/contabilizacao/Dockerfile }
+    image: desafio-zup/contabilizacao:dev
+    environment:
+      <<: *aws_local
+      TABELA_LANCAMENTOS: contabilizacao-lancamentos
+      TABELA_INBOX: contabilizacao-inbox
+      FILA_CONTABILIZACAO: contabilizacao
+    depends_on:
+      localstack: { condition: service_healthy }
+    networks: [desafio]
+
+networks:
+  desafio:
+    name: desafio

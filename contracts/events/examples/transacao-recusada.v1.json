@@ -1,0 +1,29 @@
+{
+  "specversion": "1.0",
+  "id": "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
+  "source": "/financas/autorizacao",
+  "type": "example.financas.autorizacao.TransacaoRecusada.v1",
+  "time": "2026-10-20T13:45:12.345Z",
+  "subject": "CTR-000123456",
+  "datacontenttype": "application/json",
+  "dataschema": "https://financas.example/schemas/eventos/transacao-recusada/1.0.json",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "correlationid": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+  "partitionkey": "CTR-000123456",
+  "data": {
+    "event_id": "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
+    "event_type": "TransacaoRecusada",
+    "event_version": "1.0",
+    "occurred_at": "2026-10-20T13:45:12.345Z",
+    "id_contrato": "CTR-000123456",
+    "correlation_id": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "id_autorizacao": "7a2d3c1f-4e5b-4c6d-9e8f-0a1b2c3d4e5f",
+    "valor": 2000.0,
+    "tipo_operacao": "DEBITO",
+    "motivo": "LIMITE_INSUFICIENTE",
+    "moeda": "BRL",
+    "limite_disponivel": 850.0,
+    "versao_limite": 42
+  }
+}

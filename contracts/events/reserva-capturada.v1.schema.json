@@ -1,0 +1,179 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "id": "https://financas.example/schemas/eventos/reserva-capturada/1.0.json",
+  "title": "ReservaCapturada v1 (CloudEvent estruturado)",
+  "description": "Hold convertido em consumo por um DEBITO que referencia a RESERVA (captura total ou parcial; a sobra volta ao disponível na mesma escrita). Sai junto com a TransacaoAutorizada da captura, que carrega o débito. Publicado em EventBridge com o CloudEvent inteiro em `detail` (DetailType = nome curto). Evolução: só campos opcionais novos dentro do major (BACKWARD); consumidores ignoram campos desconhecidos.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "time",
+    "datacontenttype",
+    "dataschema",
+    "subject",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "type": "string",
+      "enum": [
+        "1.0"
+      ]
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "Gerado no outbox; estável entre reentregas. Dedup por (source, id)."
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "/financas/autorizacao"
+      ]
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "example.financas.autorizacao.ReservaCapturada.v1"
+      ]
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "subject": {
+      "type": "string",
+      "description": "id_contrato"
+    },
+    "datacontenttype": {
+      "type": "string",
+      "enum": [
+        "application/json"
+      ]
+    },
+    "dataschema": {
+      "type": "string",
+      "enum": [
+        "https://financas.example/schemas/eventos/reserva-capturada/1.0.json"
+      ]
+    },
+    "traceparent": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$",
+      "description": "Extensão CE Distributed Tracing."
+    },
+    "correlationid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "Extensão própria (nomes de atributo CE não aceitam `_`)."
+    },
+    "partitionkey": {
+      "type": "string",
+      "description": "Extensão CE Partitioning = id_contrato (útil se o stream migrar para Kinesis/Kafka)."
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "event_id",
+        "event_type",
+        "event_version",
+        "occurred_at",
+        "id_contrato",
+        "correlation_id",
+        "trace_id",
+        "id_reserva",
+        "id_autorizacao",
+        "valor_reservado",
+        "valor_capturado",
+        "saldo_reservado",
+        "limite_utilizado",
+        "versao_limite"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "description": "Espelho do atributo CE `id` (campo do enunciado)."
+        },
+        "event_type": {
+          "type": "string",
+          "enum": [
+            "ReservaCapturada"
+          ],
+          "description": "Espelho do nome curto (campo do enunciado)."
+        },
+        "event_version": {
+          "type": "string",
+          "pattern": "^1\\.[0-9]+$",
+          "description": "Versão do schema; major também no CE `type`."
+        },
+        "occurred_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Instante do fato de negócio (UTC); espelho do CE `time`."
+        },
+        "id_contrato": {
+          "type": "string"
+        },
+        "correlation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "trace_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "W3C trace-id; o traceparent completo vai na extensão CE `traceparent`."
+        },
+        "id_reserva": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "description": "Igual ao id_autorizacao da RESERVA."
+        },
+        "id_autorizacao": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "description": "A autorização de captura (DEBITO); o débito em si sai na TransacaoAutorizada com este id."
+        },
+        "valor_reservado": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMinimum": true,
+          "maximum": 1e+16,
+          "description": "Valor do hold que saiu do limite (baixa da conta de compensação)."
+        },
+        "valor_capturado": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMinimum": true,
+          "maximum": 1e+16,
+          "description": "Valor consumido; menor ou igual ao reservado."
+        },
+        "saldo_reservado": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1e+16
+        },
+        "limite_utilizado": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1e+16
+        },
+        "limite_disponivel": {
+          "type": "number",
+          "description": "Pode ser negativo só se o core reduziu o limite concedido."
+        },
+        "versao_limite": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

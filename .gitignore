@@ -1,0 +1,40 @@
+# Terraform: state e planos contêm segredos em plaintext (api keys, client secrets) — nunca versionar
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+# Segredos e configuração local
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mutmut-cache
+.hypothesis/
+.import_linter_cache/
+# Java
+target/
+build/
+.gradle/
+*.class
+# Artefatos
+dist/
+*.zip
+localstack-data/
+# Zips das Lambdas gerados por `make pacotes`
+infra/terraform/build/
+# O .terraform.lock.hcl NÃO é ignorado de propósito: o lock deve ser versionado (fixa as versões/hashes dos providers).

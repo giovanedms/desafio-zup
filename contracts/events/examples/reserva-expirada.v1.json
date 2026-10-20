@@ -1,0 +1,27 @@
+{
+  "specversion": "1.0",
+  "id": "e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8a9b",
+  "source": "/financas/autorizacao",
+  "type": "example.financas.autorizacao.ReservaExpirada.v1",
+  "time": "2026-10-20T13:45:12.345Z",
+  "subject": "CTR-000123456",
+  "datacontenttype": "application/json",
+  "dataschema": "https://financas.example/schemas/eventos/reserva-expirada/1.0.json",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "correlationid": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+  "partitionkey": "CTR-000123456",
+  "data": {
+    "event_id": "e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8a9b",
+    "event_type": "ReservaExpirada",
+    "event_version": "1.0",
+    "occurred_at": "2026-10-20T13:45:12.345Z",
+    "id_contrato": "CTR-000123456",
+    "correlation_id": "0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "id_reserva": "6f1c2b0e-3d4a-5b6c-8d7e-9f0a1b2c3d4e",
+    "valor": 150.0,
+    "saldo_reservado": 0.0,
+    "limite_disponivel": 1000.0,
+    "versao_limite": 45
+  }
+}

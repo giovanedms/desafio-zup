@@ -120,7 +120,7 @@ Ele praticamente **não escala com concorrência**. Com ~5 operações de banco 
 
 **Teto da stack entregue e quota:** com `tasks_max = 20` tasks de 0,5 vCPU, o `autorizacao` satura em ~730 rps a 60% de CPU (20 × 0,5 × 73). A 60% de CPU o alvo cabe na quota de Fargate da conta (106 de **140 vCPU**, `docs/operacao/infraestrutura.md`, seção 2), mas exige subir `tasks_max` (~136 tasks de 0,5 vCPU ou ~68 de 1 vCPU no `autorizacao`). Perto do RNF de latência (~33%) são ~200 vCPU: pedir o aumento da quota antes.
 
-O RNF de p99 ≤ 150 ms **não foi atingido com folga** em nenhum degrau; o mais perto foi 164 ms no gateway a 33% de CPU. A distância é Python mais a transação de ~21 ms. Fechar isso pede a alavanca 1 da seção 5 (tira a transação do caminho comum) e, se ainda faltar, um runtime compilado nos dois serviços quentes (ADR-0003).
+O RNF de p99 ≤ 150 ms **não foi atingido** em nenhum degrau; o mais perto foi 164 ms no gateway a 33% de CPU. A distância é Python mais a transação de ~21 ms. Fechar isso pede a alavanca 1 da seção 5 (tira a transação do caminho comum) e, se ainda faltar, um runtime compilado nos dois serviços quentes (ADR-0003).
 
 ## 4. Custo (ordem de grandeza, sandbox)
 

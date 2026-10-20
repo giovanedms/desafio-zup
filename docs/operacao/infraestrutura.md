@@ -350,7 +350,7 @@ As 13 têm o permissions boundary `desafio-zup-limite-de-permissoes` (conferido 
 | `seguranca` | Vulnerabilidade de dependências, segredo e misconfiguração (HIGH e CRITICAL), e política de IaC | Trivy (fs), Checkov |
 | `e2e` | A stack local inteira e a demo de 7 seções, que sai com 1 em qualquer divergência | `make up`, `make demo` |
 | `deploy` | Depende dos 6 jobs acima, na `main` | OIDC, ECR, buildx, Terraform |
-| `smoke` | Borda do gateway (201, replay idêntico, 401 `problem+json`) e corrida de 100 reservas no DynamoDB real | `tests/e2e/aws.py borda` e `corrida` |
+| `smoke` | Borda do gateway (201, replay idêntico, 401 `problem+json`, 422 do serviço com `valor: 0`, 429 `problem+json` com `Retry-After` numa rajada concorrente pelo `canal-app`) e corrida de 100 reservas no DynamoDB real | `tests/e2e/aws.py borda` e `corrida` |
 | `destroy` | Só manual, com a frase | `terraform destroy` |
 
 **Passos do `deploy`, em ordem:**

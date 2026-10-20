@@ -63,7 +63,11 @@ def _construir_nucleo(config: Configuracao) -> Nucleo:
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
     )
     repositorio = RepositorioDeAutorizacoesDynamoDB(
-        dynamodb, config.tabela_autorizacoes, config.tabela_outbox
+        dynamodb,
+        config.tabela_autorizacoes,
+        config.tabela_outbox,
+        shards_de_orfas=config.shards_de_orfas,
+        shards_de_vencimentos=config.shards_de_vencimentos,
     )
     limites = GatewayDeLimitesHttp(http_limites, Disjuntor())
     autorizar = AutorizarTransacao(repositorio, limites, RelogioDoSistema(), GeradorDeIdsUuid())

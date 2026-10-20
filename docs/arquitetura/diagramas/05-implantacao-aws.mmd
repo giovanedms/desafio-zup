@@ -18,7 +18,10 @@ flowchart TB
     REC --> LIMS
     DDB[("DynamoDB<br/>5 tabelas")]
     EB{{EventBridge}}
-    SQS[[SQS]]
+    SQS[["SQS<br/>filas dos consumidores"]]
+    LEG[["SQS legado-contratos"]]
+    CORE["Core legado<br/>(feed de contratos)"]
+    SNS["SNS alarmes<br/>(KMS do cliente)"]
     LAM["Lambdas<br/>(fora da VPC)"]
     ECR[ECR]
     CW[CloudWatch]
@@ -32,7 +35,9 @@ flowchart TB
     LAM --> EB
     EB --> SQS
     SQS --> LAM
-    SQS --> ACL
+    CORE --> LEG
+    LEG --> ACL
+    CW -. alarmes .-> SNS
     ECS -.-> CW
     LAM -.-> CW
     GW -.-> CW

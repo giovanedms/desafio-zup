@@ -4,7 +4,7 @@ Base dos `type`: `https://financas.example/problemas/<slug>` (domínio reservado
 O registro IANA de problem types não tem tipos para este domínio, por isso os tipos são próprios.
 
 Todo problema traz `type`, `title`, `status`, `codigo` e `correlation_id`. Também traz `trace_id` quando houver trace, e `erros[]` em validação.
-As exceções vêm do WAF e estão em **Desvios declarados**, no fim.
+A exceção é o 429 das regras rate-based do WAF, em **Desvios declarados**, no fim.
 `codigo` é o identificador estável para máquina, o "código" pedido no enunciado. `title` é para gente e pode mudar.
 
 | codigo | slug (`type`) | HTTP | Quem emite | Quando | Repetir? |
@@ -12,7 +12,7 @@ As exceções vêm do WAF e estão em **Desvios declarados**, no fim.
 | REQUISICAO_MAL_FORMADA | requisicao-mal-formada | 400 | serviço / gateway (`BAD_REQUEST_PARAMETERS`) | Corpo que não é JSON (serviço). Na AWS, também header obrigatório ausente ou vazio, como `Idempotency-Key` (gateway: ele só confere a presença dos parâmetros e não valida o corpo). Tipo errado e campo desconhecido no corpo são 422 | Não (corrigir) |
 | IDEMPOTENCY_KEY_INVALIDA | idempotency-key-invalida | 400 | serviço | `Idempotency-Key` fora do formato UUID, ou ausente quando o pedido não passa pelo gateway (local) | Não (corrigir) |
 | NAO_AUTENTICADO | nao-autenticado | 401 | gateway (`UNAUTHORIZED`) | Token ausente, expirado ou inválido | Após renovar o token |
-| SEM_PERMISSAO | sem-permissao | 403 | gateway (`ACCESS_DENIED`) | Escopo insuficiente (o 403 do WAF não é este: ver desvios) | Não |
+| SEM_PERMISSAO | sem-permissao | 403 | gateway (`ACCESS_DENIED`, `INVALID_API_KEY`, `MISSING_AUTHENTICATION_TOKEN`, `WAF_FILTERED`) | Escopo insuficiente, API key inválida, rota inexistente, ou bloqueio por regra gerenciada do WAF (`AWSManagedRulesCommonRuleSet`, que sai pela gateway response `WAF_FILTERED`) | Não |
 | LIMITE_INSUFICIENTE | limite-insuficiente | 402 | serviço | Disponível < valor (recusa registrada e publicada). Extensões `id_autorizacao` e `limite_disponivel` (o disponível no momento da recusa) | Mesma chave → mesma recusa |
 | CONTRATO_NAO_ENCONTRADO | contrato-nao-encontrado | 404 | serviço | Contrato ausente na réplica do core (fail-closed) | Não |
 | AUTORIZACAO_NAO_ENCONTRADA | autorizacao-nao-encontrada | 404 | serviço | GET de autorização inexistente | Não |
@@ -40,9 +40,9 @@ As exceções vêm do WAF e estão em **Desvios declarados**, no fim.
 
 O 400 de parâmetro ausente, o 401, o 403 e o 429 da borda acontecem antes de qualquer uma dessas.
 
-**Erros do gateway em problem+json:** Gateway Responses do API Gateway REST (`UNAUTHORIZED`, `ACCESS_DENIED`, `THROTTLED`, `QUOTA_EXCEEDED`, `BAD_REQUEST_PARAMETERS`, `INTEGRATION_TIMEOUT`, `DEFAULT_4XX`, `DEFAULT_5XX`) configuradas com `Content-Type: application/problem+json` e template com `type`, `title`, `status`, `codigo` e `correlation_id` (= `$context.requestId`), via Terraform (ADR-0010). `BAD_REQUEST_BODY` continua configurada, mas não dispara: o gateway não valida o corpo.
+**Erros do gateway em problem+json:** Gateway Responses do API Gateway REST (`UNAUTHORIZED`, `ACCESS_DENIED`, `INVALID_API_KEY`, `MISSING_AUTHENTICATION_TOKEN`, `WAF_FILTERED`, `THROTTLED`, `QUOTA_EXCEEDED`, `BAD_REQUEST_PARAMETERS`, `INTEGRATION_TIMEOUT`, `DEFAULT_4XX`, `DEFAULT_5XX`) configuradas com `Content-Type: application/problem+json` e template com `type`, `title`, `status`, `codigo` e `correlation_id` (= `$context.requestId`), via Terraform (ADR-0010). `BAD_REQUEST_BODY` continua configurada, mas não dispara: o gateway não valida o corpo.
 
 **Desvios declarados (WAF, avaliado antes do gateway):**
 
-- **Bloqueio por regra gerenciada** (`AWSManagedRulesCommonRuleSet`): **403 com o corpo padrão do WAF**, fora do problem+json e sem `codigo`. Não é o `SEM_PERMISSAO` da tabela; o cliente trata como 403 genérico e não repete.
-- **429 da regra rate-based**: resposta customizada em problem+json com `Retry-After`, mas de **corpo fixo**: sem `correlation_id`, porque o WAF não tem o id da requisição.
+- **Por que `WAF_FILTERED` é definida:** sem ela, o bloqueio do WAF herdaria a `DEFAULT_4XX`, fixada em 400 `REQUISICAO_MAL_FORMADA`, e o cliente veria "requisição mal formada" para um bloqueio de proteção.
+- **429 das regras rate-based** (por consumidor, `x-api-key`, e por IP): resposta customizada do WAF, que tem precedência sobre as gateway responses, com `Retry-After: 60` e o corpo do catálogo (`codigo` `LIMITE_DE_REQUISICOES`). Dois desvios: o `Content-Type` sai **`application/json`**, porque o WAF não permite sobrescrever esse header e só aceita JSON, HTML ou texto; e o corpo é **fixo**, sem `correlation_id`, porque o WAF não tem o id da requisição.

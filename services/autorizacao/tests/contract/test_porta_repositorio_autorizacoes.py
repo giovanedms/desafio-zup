@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from autorizacao.adapters.outbound.dynamodb import RepositorioDeAutorizacoesDynamoDB
@@ -14,6 +14,7 @@ from autorizacao.adapters.outbound.memoria import RepositorioDeAutorizacoesEmMem
 from autorizacao.application.portas import (
     LeasePerdido,
     OriginalJaEncerrada,
+    RegistroDeCompensacao,
     RepositorioDeAutorizacoes,
 )
 from autorizacao.domain.autorizacao import (
@@ -134,6 +135,38 @@ def test_assumir_e_compare_and_set_no_lease(ambiente: Ambiente) -> None:
     assert not r.assumir(
         a.assumir(depois + timedelta(seconds=30)), a.lease_ate
     )  # lease anterior mudou
+
+
+def test_regravar_e_compare_and_set_no_lease_de_quem_esta_em_curso(ambiente: Ambiente) -> None:
+    """Cada passo da compensação (ADR-0006) só grava se o lease gravado ainda é o que o reconciliador leu."""
+    r = ambiente.repositorio
+    registro = cast(RegistroDeCompensacao, r)
+    a = nova()
+    r.registrar(a)
+    depois = AGORA + DURACAO_DO_LEASE + timedelta(seconds=1)
+    compensando = a.iniciar_compensacao(depois)
+
+    assert registro.regravar(compensando, a.lease_ate)
+    assert not registro.regravar(
+        compensando.confirmar_aplicacao(depois), a.lease_ate
+    )  # lease anterior mudou: outra execução avançou
+    confirmada = compensando.confirmar_aplicacao(depois + timedelta(seconds=1))
+    assert registro.regravar(confirmada, compensando.lease_ate)
+
+    assert r.obter("aut-1") == confirmada.sem_eventos()
+
+
+def test_regravar_nao_toca_autorizacao_ja_encerrada(ambiente: Ambiente) -> None:
+    r = ambiente.repositorio
+    a = nova()
+    r.registrar(a)
+    r.concluir(a.aprovar(SALDOS, AGORA, "ev-1"), None)
+    aprovada = r.obter("aut-1")
+
+    assert not cast(RegistroDeCompensacao, r).regravar(
+        a.iniciar_compensacao(AGORA + DURACAO_DO_LEASE), a.lease_ate
+    )
+    assert r.obter("aut-1") == aprovada
 
 
 def test_estorno_conclui_e_marca_a_original_atomicamente(ambiente: Ambiente) -> None:

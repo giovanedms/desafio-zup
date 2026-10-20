@@ -110,8 +110,9 @@ zip:
 	git archive --format=zip -o ../entrega-desafio-zup.zip HEAD
 
 # Ambiente Terraform do sandbox (alvos tf-*). Nenhum deles fala com a AWS: init sem backend e credenciais removidas.
+# Diretório de dados próprio: o .terraform de quem já fez deploy guarda o backend S3, e o validate o leria.
 TF_ENV = infra/terraform/environments/sandbox
-TF_SEM_AWS = env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN
+TF_SEM_AWS = env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN TF_DATA_DIR=.terraform-offline
 
 # Verifica a formatação do HCL (não altera arquivos).
 tf-fmt:

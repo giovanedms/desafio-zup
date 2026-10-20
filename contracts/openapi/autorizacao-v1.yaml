@@ -14,8 +14,8 @@ info:
 
     **Erros:** `application/problem+json` conforme RFC 9457 (sucessora da RFC 7807 citada no enunciado), inclusive os gerados
     pelo gateway (400 de parâmetro ausente, 401, 403, 429, 5xx). Extensões: `codigo`, `correlation_id`, `trace_id` e, conforme
-    o caso, `erros`, `id_autorizacao` e `limite_disponivel`. Desvio: o bloqueio por regra gerenciada do WAF sai como 403 com o
-    corpo padrão do WAF, fora do problem+json (ver o catálogo).
+    o caso, `erros`, `id_autorizacao` e `limite_disponivel`. Desvio: o 429 das regras rate-based do WAF sai com
+    `Content-Type: application/json` e corpo fixo, sem `correlation_id` (ver o catálogo).
 
     **Validação do corpo:** a autoridade é o serviço. O gateway não valida o corpo (só a presença dos parâmetros obrigatórios),
     então o mesmo corpo recebe o mesmo status local e na AWS: fora deste schema ou da regra de domínio → 422.
@@ -345,8 +345,8 @@ components:
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     SemPermissao:
       description: |
-        Escopo insuficiente (emitido pelo gateway). Ver `/problemas/sem-permissao`.
-        Desvio: bloqueio por regra gerenciada do WAF também é 403, mas com o corpo padrão do WAF, não este schema.
+        Escopo insuficiente, API key inválida ou bloqueio por regra gerenciada do WAF (gateway responses
+        `ACCESS_DENIED`, `INVALID_API_KEY` e `WAF_FILTERED`). Ver `/problemas/sem-permissao`.
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     LimiteInsuficiente:
       description: Recusa por regra de negócio — limite disponível menor que o valor. A recusa é registrada e publicada (TransacaoRecusada).
@@ -402,7 +402,9 @@ components:
       description: |
         Só a borda emite 429; o serviço nunca (a proteção dele é o 503 de load shedding). Sempre com Retry-After.
         - Gateway: throttling (`THROTTLED`) ou quota diária (`QUOTA_EXCEEDED`) do usage plan do consumidor.
-        - WAF: regra rate-based. Resposta customizada com corpo fixo, sem `correlation_id` (o WAF não tem o id da requisição).
+        - WAF: regras rate-based por consumidor (`x-api-key`) e por IP, tetos de proteção acima dos planos. Resposta
+          customizada com o mesmo `codigo`, mas com `Content-Type: application/json` (o WAF não permite
+          `application/problem+json`) e corpo fixo, sem `correlation_id` (o WAF não tem o id da requisição).
       headers:
         Retry-After: { $ref: '#/components/headers/RetryAfter' }
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }

@@ -43,6 +43,8 @@ Fatos (`01-pesquisa/03` e `02`):
    | `TransacaoEstornada` | Autorização |
    | `ReservaExpirada` | Autorização, dono do ciclo de vida |
    | `ReservaCapturada` | Autorização |
+   | `TransacaoCompensada` (órfã desfeita pelo reconciliador; `havia_efeito`) | Autorização |
+   | `TransacaoEmReconciliacaoManual` (caso encaminhado à fila humana, com o motivo) | Autorização |
    | `LimiteAlterado` (só alteração do limite concedido ou status vinda do core; **não** a cada reserva) | Limites |
 
 ## Consequências

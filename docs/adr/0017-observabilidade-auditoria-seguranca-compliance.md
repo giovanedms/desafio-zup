@@ -19,7 +19,7 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
   - `id_autorizacao`: entidade.
 - **Os três atravessam:** HTTP → serviço → chamada ao `limites` → item gravado → CloudEvent (extensões `traceparent` e `correlationid`) → fila → consumidor → lançamento.
 - O `X-Correlation-Id` recebido só é aceito se for UUID canônico; senão é gerado, o que protege contra log injection.
-- **Na AWS:** X-Ray no API Gateway, access log JSON com `requestId`, `extendedRequestId` e latências, logs estruturados nos serviços. A instrumentação OpenTelemetry (ADOT) fica como evolução.
+- **Na AWS:** X-Ray no API Gateway, access log JSON com `requestId`, `extendedRequestId` e latências (o registro por requisição: o access log do uvicorn foi desligado por custar CPU, `docs/capacidade.md`). Nos serviços, logs de erro com `correlation_id` e `gateway_request_id` (o `requestId` do gateway, repassado em `X-Gateway-Request-Id`) como campos, e linhas JSON operacionais no `limites` (guarda e reservas) e no reconciliador, que alimentam os metric filters. A instrumentação OpenTelemetry (ADOT) fica como evolução.
 - **Junção borda × serviço:** a integração do gateway injeta `X-Gateway-Request-Id` = `$context.requestId`, o mesmo valor da linha do access log e do `correlation_id` das gateway responses, sobrescrevendo qualquer valor do cliente. A AWS avisa que o cliente pode influenciar o `requestId`; por isso o access log grava também o `extendedRequestId`, único e gerado pelo gateway, para desempatar.
 
 ### Trilha de auditoria

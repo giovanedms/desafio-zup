@@ -1,1 +1,1 @@
-"""Serviço contabilizacao (BC Contabilização): partidas dobradas imutáveis e ACL de saída."""
+"""Serviço contabilizacao (BC Contabilização): partidas dobradas imutáveis com inbox de deduplicação."""

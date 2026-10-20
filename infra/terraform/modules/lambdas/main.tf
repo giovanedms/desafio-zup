@@ -36,7 +36,7 @@ locals {
   })
 
   # Variáveis de ambiente esperadas pelo código: relay (BUS, TABELA_OUTBOX).
-  # contabilizacao: nomes ASSUMIDOS (o handler ainda não existe) — alinhar quando o pacote for escrito.
+  # contabilizacao: TABELA_LANCAMENTOS e TABELA_INBOX (contabilizacao/config.py).
   env_relay = {
     BUS           = var.bus_nome
     TABELA_OUTBOX = var.outbox_tabela_nome

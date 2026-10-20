@@ -33,6 +33,11 @@ flowchart LR
   R2 --> Q2
   R3 --> Q3
   R4 --> Q3
+  DLQE[[financas-entrega-dlq<br/>entrega regra → fila que falhou]]
+  R1 -.-> DLQE
+  R2 -.-> DLQE
+  R3 -.-> DLQE
+  R4 -.-> DLQE
 
   CTB["Lambda desafio-contabilizacao"]
   INB[("DynamoDB<br/>contabilizacao-inbox")]

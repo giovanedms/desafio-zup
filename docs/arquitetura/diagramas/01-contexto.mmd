@@ -1,0 +1,16 @@
+flowchart LR
+  subgraph Canais
+    POS[Autorizador de cartões]
+    PIX[Pix / crédito direto]
+    APP[Canais digitais via BFF próprio]
+  end
+  PLAT["Plataforma de Limites e Autorização<br/>(este sistema)"]
+  LEG[(Core banking legado<br/>mainframe)]
+  CONS["Consumidores de eventos<br/>contabilidade · antifraude · notificações · data platform"]
+  IDP[Amazon Cognito<br/>OAuth2 client credentials]
+  POS -->|"REST v1 + OAuth2"| PLAT
+  PIX -->|"REST v1 + OAuth2"| PLAT
+  APP -->|"REST v1 + OAuth2"| PLAT
+  PLAT -->|tokens| IDP
+  LEG -.->|"feed de contratos e limites concedidos (ACL)"| PLAT
+  PLAT -.->|"CloudEvents via EventBridge"| CONS

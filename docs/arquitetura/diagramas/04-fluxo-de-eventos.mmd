@@ -1,0 +1,42 @@
+flowchart LR
+  OUT[("DynamoDB<br/>autorizacoes-outbox")]
+  RELAY["Lambda desafio-relay<br/>(Stream do outbox)"]
+  SWEEP["Lambda desafio-sweeper"]
+  SCHED["EventBridge Scheduler<br/>rate(5 minutes)"]
+  LIM[("DynamoDB limites")]
+  CDC["Lambda desafio-relay-cdc-limites<br/>(Stream, só MODIFY)"]
+  BUS{{"Bus EventBridge financas"}}
+  ARC[("Archive financas-archive<br/>30 dias")]
+
+  OUT -- Stream --> RELAY
+  SCHED --> SWEEP
+  SWEEP -- "lê o outbox" --> OUT
+  RELAY -- PutEvents --> BUS
+  SWEEP -- PutEvents --> BUS
+  LIM -- Stream --> CDC
+  CDC -- "PutEvents: LimiteAlterado" --> BUS
+  BUS --> ARC
+
+  R1["regra para-antifraude<br/>Autorizada, Recusada"]
+  R2["regra para-contabilizacao<br/>Autorizada, Estornada,<br/>ReservaExpirada, ReservaCapturada"]
+  R3["regra para-notificacoes<br/>Autorizada, Recusada, Estornada"]
+  R4["regra limite-alterado-para-notificacoes<br/>LimiteAlterado"]
+  BUS --> R1
+  BUS --> R2
+  BUS --> R3
+  BUS --> R4
+
+  Q1[[SQS antifraude]] --> D1[[antifraude-dlq]]
+  Q2[[SQS contabilizacao]] --> D2[[contabilizacao-dlq]]
+  Q3[[SQS notificacoes]] --> D3[[notificacoes-dlq]]
+  R1 --> Q1
+  R2 --> Q2
+  R3 --> Q3
+  R4 --> Q3
+
+  CTB["Lambda desafio-contabilizacao"]
+  INB[("DynamoDB<br/>contabilizacao-inbox")]
+  LAN[("DynamoDB<br/>contabilizacao-lancamentos")]
+  Q2 --> CTB
+  CTB --> INB
+  CTB --> LAN

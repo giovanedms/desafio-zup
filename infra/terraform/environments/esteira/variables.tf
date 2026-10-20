@@ -15,6 +15,18 @@ variable "repositorio_github" {
   default     = "giovanedms/desafio-zup"
 }
 
+variable "id_dono_github" {
+  description = "ID numérico (imutável) do dono do repositório no GitHub: `gh api repos/<dono>/<repo> --jq .owner.id`."
+  type        = string
+  default     = "194153057"
+}
+
+variable "id_repositorio_github" {
+  description = "ID numérico (imutável) do repositório no GitHub: `gh api repos/<dono>/<repo> --jq .id`."
+  type        = string
+  default     = "1427358154"
+}
+
 variable "branch_de_deploy" {
   description = "Única branch cujos workflows podem assumir a role (claim `sub` do token OIDC)."
   type        = string

@@ -19,6 +19,12 @@ provider "aws" {
 
 locals {
   emissor_oidc = "token.actions.githubusercontent.com"
+  # Claim `sub` no formato de identificadores imutáveis que o GitHub emite para este repositório
+  # (dono@id/repo@id). Visto no CloudTrail no 1º deploy: o formato só com nomes era recusado. Os IDs não
+  # mudam com rename e não são reaproveitados: um repositório recriado com o mesmo nome não assume a role.
+  dono         = split("/", var.repositorio_github)[0]
+  repo         = split("/", var.repositorio_github)[1]
+  sub_do_token = "repo:${local.dono}@${var.id_dono_github}/${local.repo}@${var.id_repositorio_github}:ref:refs/heads/${var.branch_de_deploy}"
   nome_role    = "desafio-zup-esteira"
   nome_limite  = "desafio-zup-limite-de-permissoes"
   arn_limite   = "arn:aws:iam::${var.account_id}:policy/${local.nome_limite}"
@@ -110,7 +116,7 @@ resource "aws_iam_role" "esteira" {
       Condition = {
         StringEquals = {
           "${local.emissor_oidc}:aud" = "sts.amazonaws.com"
-          "${local.emissor_oidc}:sub" = "repo:${var.repositorio_github}:ref:refs/heads/${var.branch_de_deploy}"
+          "${local.emissor_oidc}:sub" = local.sub_do_token
         }
       }
     }]

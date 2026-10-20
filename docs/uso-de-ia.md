@@ -8,7 +8,7 @@ O enunciado permite e encoraja IA, desde que eu saiba explicar cada decisão e c
 |---|---|
 | **Eu (Giovane)** | Escolhas de negócio e de escopo: linguagem (Python), prazo, conta AWS e nomes, aceitar ou recusar cada ADR, revisão final e defesa |
 | **IA, modelo orquestrador** | Pesquisa dirigida, plano, ADRs, **domínio e casos de uso** (limites, autorização, contabilização, ACL, reconciliador), contratos (OpenAPI, eventos, problem types), revisão linha a linha de tudo que foi delegado |
-| **IA, modelo executor** | Trabalho mecânico com especificação fechada e critério de aceite: adapters HTTP, Dockerfiles, relay, Terraform, k6, CI. **Sem acesso** ao material de terceiros |
+| **IA, modelo executor** | Trabalho mecânico com especificação fechada e critério de aceite: adapters HTTP, Dockerfiles, relay, Terraform, k6, CI |
 
 ## Processo
 
@@ -18,9 +18,8 @@ O enunciado permite e encoraja IA, desde que eu saiba explicar cada decisão e c
    - o Schema Registry do EventBridge não valida eventos;
    - RFC 7807 → 9457.
 2. **Plano revisado por um painel de "juízes"** (modelos instruídos a reprovar). **O plano v1 foi reprovado.** O ponto central: eu tinha posto o item de limite numa transação do DynamoDB, que cancela sob contenção. Isso virou o ADR-0005.
-3. **Benchmark ético.** Busquei soluções públicas do mesmo enunciado e achei três no GitHub. Usei como **referência de falhas** (por exemplo, a mais madura aprovava 2 de 20 reservas onde cabiam 5) e não copiei código: o executor nem tinha acesso ao material.
-4. **Código com testes como especificação.** Cada regra tem teste; invariantes com **property-based** (Hypothesis); cada porta com **suíte de contrato rodando nos dois adapters** (memória e DynamoDB/LocalStack); integração com threads reais.
-5. **Revisão de tudo que foi delegado:** o orquestrador rodou os gates de novo e leu o código; nenhum "tudo verde" relatado foi aceito sem execução.
+3. **Código com testes como especificação.** Cada regra tem teste; invariantes com **property-based** (Hypothesis); as portas de persistência dos três BCs com **suíte de contrato rodando nos dois adapters** (memória e DynamoDB/LocalStack), exceto `RegistroDeCompensacao.regravar`, que só tem teste em memória; integração com threads reais.
+4. **Revisão de tudo que foi delegado:** o orquestrador rodou os gates de novo e leu o código; nenhum "tudo verde" relatado foi aceito sem execução.
 
 ## Erros que a IA cometeu — e como foram pegos
 
@@ -47,7 +46,7 @@ O enunciado permite e encoraja IA, desde que eu saiba explicar cada decisão e c
 | `compilar` podia emitir `SET` e `REMOVE` do mesmo caminho (`ValidationException` → 500) em dois retries do mesmo id depois da janela | Painel de juízes 3 (PoC na LocalStack) | O id da operação nunca entra no `REMOVE` + teste |
 | ADR-0006 dizia que nada dependia de relógio entre máquinas; a compactação da guarda depende (folga real de 60 s) | Painel de juízes 3 (débito dobrado com 2 min de desvio) | Risco reescrito com a fonte (`ClockErrorBound` do Fargate) e teste acoplando as constantes dos dois BCs |
 | Marca de estorno assumida quando o dono não existe mais (fail-open) | Painel de juízes 3 | Dono desconhecido bloqueia (fail-closed) |
-| Órfã encaminhada saía de todos os índices: nenhuma fila listava o que precisava de gente; reserva sem hold sangrava uma chamada ao limite a cada 30 s | Painel de juízes 3 | Fila humana `RM#` no mesmo GSI; reserva sem hold há 1 h é encaminhada |
+| Órfã encaminhada saía de todos os índices: nenhuma fila listava o que precisava de gente; reserva sem hold sangrava uma chamada ao limite a cada 30 s | Painel de juízes 3 | Fila humana `RM#` no mesmo GSI; reserva vencida que segue sem hold 10 min depois do vencimento é encaminhada (`TOLERANCIA_DA_DISPUTA`) |
 | 409 `requisicao-em-andamento` com `Retry-After: 60` para um estado que só uma pessoa resolve | Painel de juízes 3 | 409 `conflito-de-estado` sem `Retry-After` |
 | Os testes usavam um limite falso que nunca esquecia: o motivo de existir de prazo, marca e fila nunca era exercitado | Painel de juízes 3 | `tests/integracao_bcs`: os dois BCs em processo com a guarda real, mostrando o débito dobrado sem as proteções |
 | 500 esporádico do API Gateway (`Connection is closed`): keep-alive de 5 s do uvicorn fechava conexão que o gateway reaproveitava | Carga na AWS (log de execução do gateway) | `--timeout-keep-alive 400` |
@@ -69,4 +68,4 @@ O enunciado permite e encoraja IA, desde que eu saiba explicar cada decisão e c
 - **Idempotência, lease e retomada:** `autorizacao/domain/idempotencia.py`, `application/autorizar.py` + ADR-0006.
 - **Reconciliador:** `autorizacao/application/reconciliar.py`.
 - **Eventos:** `autorizacao/adapters/outbound/{dynamodb,cloudevents}.py`, `relay/` + ADRs 0007–0009.
-- Cada serviço tem um `COMO-LER.md` com o caminho de uma requisição pelo código.
+- Cada serviço em `services/` tem um `COMO-LER.md` com o caminho de uma requisição pelo código (na `contabilizacao`, o de um evento).

@@ -2,11 +2,13 @@
 
 Desafio técnico — Arquiteto de Aplicação (POD99 · Nova Plataforma de Finanças).
 
-Autorização síncrona de transações com **reserva de limite por contrato consistente sob concorrência**, idempotência ponta a ponta, eventos de domínio em CloudEvents via EventBridge, contabilização em partidas dobradas e ACL com o core legado. Em Python 3.13, hexagonal, na AWS (Terraform), com demo local offline.
+Autorização síncrona de transações com **reserva de limite por contrato consistente sob concorrência**, idempotência ponta a ponta, eventos de domínio em CloudEvents via EventBridge, contabilização em partidas dobradas e ACL com o core legado. Em Python 3.13, hexagonal, na AWS (Terraform), com demo local sem AWS.
+
+**Repositório:** https://github.com/giovanedms/desafio-zup. O ZIP da entrega (`make zip`, um `git archive` do HEAD) não leva o histórico: os commits e as execuções da esteira ficam lá.
 
 ## Em 3 comandos
 
-Pré-requisitos: Docker, `uv`, `make`, `k6` (opcional). Nada de credencial AWS: o ambiente local é offline.
+Pré-requisitos: Docker, `uv`, `make`, `k6` (opcional). Sem conta nem credencial AWS: o ambiente local roda na LocalStack. Precisa de internet para baixar as imagens e as dependências.
 
 ```bash
 make setup     # instala dependências (uv)
@@ -26,10 +28,10 @@ make demo      # roteiro ponta a ponta (ver abaixo)
 1. aprovação (201), replay idempotente (200, corpo idêntico byte a byte) e chave reutilizada (422);
 2. **100 reservas paralelas de R$ 100 num limite de R$ 1.000 → exatamente 10 aprovadas e 90 recusadas (402), saldo final zero**;
 3. débito, estorno (o segundo estorno da mesma autorização → 409), crédito, contrato bloqueado (422) e contrato inexistente (404);
-4. **captura de reserva** (DEBITO que referencia a RESERVA, parcial) e disputa pelo hold: 10 capturas × 10 estornos em paralelo → exatamente 1 vence (`{201: 1, 409: 19}`);
+4. **captura de reserva** (DEBITO que referencia a RESERVA, parcial) e disputa pelo hold: 10 capturas × 10 estornos em paralelo → exatamente 1 vence e os outros 19 recebem 409 (`{201: 1, 409: 19}`), com reservado final zero;
 5. erros RFC 9457 e dinheiro exato (`12345678.91` preservado);
-6. o evento seguindo até a contabilização (partida dobrada);
-7. registro do core legado → ACL → limite atualizado (versão fora de ordem ignorada, reservas intactas) → `LimiteAlterado`.
+6. **fan-out do evento:** o mesmo `TransacaoAutorizada` sai do outbox pelo relay e o EventBridge o entrega nas filas `antifraude` e `notificacoes` e na contabilização, que o lança em partida dobrada;
+7. registro do core legado → ACL → limite atualizado: a versão mais antiga que chega depois da mais nova é ignorada e a reserva fica intacta; o `LimiteAlterado` chega na fila `notificacoes`.
 
 **Portas locais:**
 

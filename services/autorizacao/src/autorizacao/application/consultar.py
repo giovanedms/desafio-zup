@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from autorizacao.application.portas import RepositorioDeAutorizacoes
+from autorizacao.application.portas import LeituraDeAutorizacoes
 from autorizacao.domain.autorizacao import Autorizacao
 
 
@@ -14,7 +14,7 @@ class AutorizacaoNaoEncontrada(Exception):
 
 @dataclass(frozen=True, slots=True)
 class ConsultarAutorizacao:
-    repositorio: RepositorioDeAutorizacoes
+    repositorio: LeituraDeAutorizacoes
 
     def executar(self, id_contrato: str, id_autorizacao: str, client_id: str) -> Autorizacao:
         """Só o canal que criou a autorização a enxerga (o client_id vem do token, injetado pelo gateway)."""

@@ -1,5 +1,8 @@
 """Caso de uso AutorizarTransacao — o fluxo síncrono do POST /v1/contratos/{id}/autorizacoes.
 
+Responsabilidade única (SRP): este módulo muda quando muda o fluxo de decisão de uma autorização (a
+ordem abaixo, as regras da original), não quando muda o transporte HTTP, o banco ou o formato do evento.
+
 Ordem (ADR-0006):
   1. Idempotência primeiro: se o id determinístico já existe → replay / 409 / 422 / retomada. Sem original
      (o caso comum), o próprio PutItem condicional do passo 3 é a consulta: devolve a gravada se já existir,

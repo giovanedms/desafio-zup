@@ -115,9 +115,13 @@ class GatewayDeLimites(Protocol):
 # --- Persistência --------------------------------------------------------------------------------
 
 
-class RepositorioDeAutorizacoes(Protocol):
+class LeituraDeAutorizacoes(Protocol):
+    """Só leitura (ISP): quem consulta não depende de quem grava, como `ConsultaDeLimites` no BC Limites."""
+
     def obter(self, id_autorizacao: str) -> Autorizacao | None: ...
 
+
+class RepositorioDeAutorizacoes(LeituraDeAutorizacoes, Protocol):
     def registrar(self, autorizacao: Autorizacao) -> Autorizacao | None:
         """Grava se o id ainda não existe (condicional). Devolve None se gravou; a existente se não."""
         ...

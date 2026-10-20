@@ -1,6 +1,10 @@
 """Adapter de entrada HTTP (FastAPI) do BC Autorização.
 
-Contrato (fonte da verdade): contracts/openapi/autorizacao-v1.yaml.
+Responsabilidade única (SRP): este módulo muda quando muda o contrato HTTP (status, problem+json,
+headers, formato do corpo), não quando muda a regra de autorização, o banco ou o formato do evento.
+
+Contrato (fonte da verdade): contracts/openapi/autorizacao-v1.yaml. O FastAPI não publica spec gerada
+(`/openapi.json`, `/docs`, `/redoc` desligados): ela divergia do contrato.
 Problemas: RFC 9457, tipos em contracts/problem-types/catalogo.md.
 
 Dinheiro sem float: o corpo é lido cru e parseado com `parse_float=Decimal`; a saída usa
@@ -27,7 +31,7 @@ from uuid import UUID, uuid4
 import simplejson
 from fastapi import FastAPI, Path, Request
 from fastapi.exceptions import RequestValidationError
-from plataforma.observabilidade import definir_contexto, limpar_contexto
+from plataforma.observabilidade import contexto_de_log, definir_contexto, limpar_contexto
 from plataforma.problemas import MEDIA_TYPE, Problema
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
@@ -56,6 +60,9 @@ _DUAS_CASAS = Decimal("0.01")
 _TRACEPARENT = re.compile(r"^[0-9a-f]{2}-(?P<trace_id>[0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
 _ID_FORMA_LIVRE = r"^[A-Za-z0-9._:-]+$"
 _UUID_REGEX = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+# `$context.requestId` que o API Gateway injeta em X-Gateway-Request-Id (junção borda × serviço). Valor
+# fora deste formato é ignorado, como o X-Correlation-Id (proteção contra log injection).
+_GATEWAY_REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 IdContrato = Annotated[str, Path(pattern=r"^[A-Za-z0-9-]{1,20}$")]  # NUM-CONTRATO do legado (ACL)
 
@@ -213,6 +220,10 @@ def _uuid_canonico(valor: str | None) -> str | None:
 def _trace_id(traceparent: str | None) -> str | None:
     correspondencia = _TRACEPARENT.match(traceparent) if traceparent else None
     return correspondencia["trace_id"] if correspondencia else None
+
+
+def _gateway_request_id(valor: str | None) -> str | None:
+    return valor if valor and _GATEWAY_REQUEST_ID.match(valor) else None
 
 
 def _dinheiro_json(valor: Decimal) -> Decimal:
@@ -403,11 +414,7 @@ def _traduzir_excecao(request: Request, erro: Exception) -> Response:
             "Dependência indisponível; repita com a mesma Idempotency-Key.",
             headers={"Retry-After": "1"},
         )
-    _log.error(
-        "erro inesperado",
-        exc_info=erro,
-        extra={"correlation_id": request.state.correlation_id},
-    )
+    _log.error("erro inesperado", exc_info=erro, extra=contexto_de_log())
     return _problema(request, "ERRO_INTERNO", "Falha inesperada. Informe o correlation_id.")
 
 
@@ -417,7 +424,13 @@ def _traduzir_excecao(request: Request, erro: Exception) -> Response:
 def criar_app(  # noqa: PLR0915 - rotas registradas em closure, como no serviço limites
     autorizar: AutorizarTransacao, consultar: ConsultarAutorizacao, max_em_voo: int
 ) -> FastAPI:
-    app = FastAPI(title="API de Autorização de Transações", version="1.0.0")
+    app = FastAPI(
+        title="API de Autorização de Transações",
+        version="1.0.0",
+        openapi_url=None,  # o contrato é contracts/openapi/autorizacao-v1.yaml, não a spec gerada
+        docs_url=None,
+        redoc_url=None,
+    )
     em_voo = 0
     trava = threading.Lock()
 
@@ -429,12 +442,13 @@ def criar_app(  # noqa: PLR0915 - rotas registradas em closure, como no serviço
         nonlocal em_voo
         correlation_id = _uuid_canonico(request.headers.get("x-correlation-id")) or str(uuid4())
         traceparent = request.headers.get("traceparent")
+        gateway_request_id = _gateway_request_id(request.headers.get("x-gateway-request-id"))
         request.state.correlation_id = correlation_id
         request.state.trace_id = _trace_id(traceparent)
         with trava:
             em_voo += 1
             sobrecarregado = em_voo > max_em_voo and request.url.path != "/saude"
-        tokens = definir_contexto(correlation_id, traceparent)
+        tokens = definir_contexto(correlation_id, traceparent, gateway_request_id)
         try:
             if sobrecarregado:
                 resposta: Response = _problema(
@@ -447,7 +461,7 @@ def criar_app(  # noqa: PLR0915 - rotas registradas em closure, como no serviço
                 try:
                     resposta = await call_next(request)
                 except Exception:
-                    _log.exception("erro inesperado", extra={"correlation_id": correlation_id})
+                    _log.exception("erro inesperado", extra=contexto_de_log())
                     resposta = _problema(
                         request, "ERRO_INTERNO", "Falha inesperada. Informe o correlation_id."
                     )

@@ -6,8 +6,10 @@ import contextvars
 from concurrent.futures import ThreadPoolExecutor
 
 from plataforma.observabilidade import (
+    contexto_de_log,
     correlation_id_atual,
     definir_contexto,
+    gateway_request_id_atual,
     limpar_contexto,
     traceparent_atual,
 )
@@ -18,6 +20,8 @@ TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 def test_padrao_e_none() -> None:
     assert correlation_id_atual.get() is None
     assert traceparent_atual.get() is None
+    assert gateway_request_id_atual.get() is None
+    assert contexto_de_log() == {}
 
 
 def test_definir_e_limpar_restaura_o_estado_anterior() -> None:
@@ -48,5 +52,27 @@ def test_contexto_copiado_para_thread_e_isolado_de_outras() -> None:
             sem_copia = pool.submit(correlation_id_atual.get).result()
         assert copiado == "corr-thread"
         assert sem_copia is None
+    finally:
+        limpar_contexto(tokens)
+
+
+def test_gateway_request_id_entra_no_contexto_de_log_e_sai_ao_limpar() -> None:
+    tokens = definir_contexto("corr-1", TP, "c6af9ac6-7b61-11e6-9a41-93e8deadbeef")
+    try:
+        assert gateway_request_id_atual.get() == "c6af9ac6-7b61-11e6-9a41-93e8deadbeef"
+        assert contexto_de_log() == {
+            "correlation_id": "corr-1",
+            "gateway_request_id": "c6af9ac6-7b61-11e6-9a41-93e8deadbeef",
+        }
+    finally:
+        limpar_contexto(tokens)
+
+    assert gateway_request_id_atual.get() is None
+
+
+def test_sem_gateway_o_contexto_de_log_so_tem_a_correlacao() -> None:
+    tokens = definir_contexto("corr-local", None)
+    try:
+        assert contexto_de_log() == {"correlation_id": "corr-local"}
     finally:
         limpar_contexto(tokens)

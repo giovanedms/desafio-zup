@@ -13,7 +13,12 @@ info:
     estiver na retenção quente (30 dias), que é maior que a vida de uma reserva (7 dias).
 
     **Erros:** `application/problem+json` conforme RFC 9457 (sucessora da RFC 7807 citada no enunciado), inclusive os gerados
-    pelo gateway (401, 403, 429, 5xx). Extensões: `codigo`, `correlation_id`, `trace_id`.
+    pelo gateway (400 de parâmetro ausente, 401, 403, 429, 5xx). Extensões: `codigo`, `correlation_id`, `trace_id` e, conforme
+    o caso, `erros`, `id_autorizacao` e `limite_disponivel`. Desvio: o bloqueio por regra gerenciada do WAF sai como 403 com o
+    corpo padrão do WAF, fora do problem+json (ver o catálogo).
+
+    **Validação do corpo:** a autoridade é o serviço. O gateway não valida o corpo (só a presença dos parâmetros obrigatórios),
+    então o mesmo corpo recebe o mesmo status local e na AWS: fora deste schema ou da regra de domínio → 422.
 
     **Versionamento:** major no path (`/v1`). Dentro de um major só entram mudanças aditivas. Depreciação anunciada com os headers
     `Deprecation` (RFC 9745) e `Sunset` (RFC 8594) e `Link rel="deprecation"`; prazo mínimo de 6 meses entre Deprecation e Sunset.
@@ -233,7 +238,13 @@ components:
         id_contrato:
           type: string
           description: Opcional no corpo (o enunciado o lista como path param). Se presente e diferente do path → 422.
-        id_conta: { type: string, pattern: '^[A-Za-z0-9-]{1,16}$', description: Número da conta corrente. }
+        id_conta:
+          type: string
+          pattern: '^[A-Za-z0-9-]{1,16}$'
+          description: |
+            Número da conta corrente, DECLARADO pelo chamador: só o formato é validado, e ele NÃO é conferido contra a
+            conta do contrato. A autoridade da decisão é o par contrato (path) + réplica do core; o `id_conta` é gravado
+            e propagado nos eventos como informado.
         valor:
           allOf: [ { $ref: '#/components/schemas/ValorPositivo' } ]
           description: Valor da transação em BRL, maior que zero, no máximo 2 casas decimais.
@@ -307,6 +318,9 @@ components:
         correlation_id: { type: string, format: uuid }
         trace_id: { type: string, pattern: '^[0-9a-f]{32}$', nullable: true }
         id_autorizacao: { type: string, format: uuid, description: Presente em recusas (402) — a recusa também é registrada. }
+        limite_disponivel:
+          type: number
+          description: Presente na recusa por limite (402) quando o limite respondeu com saldos — o disponível do contrato no momento da recusa.
         erros:
           type: array
           description: Detalhe por campo em erros de validação (400/422).
@@ -319,13 +333,20 @@ components:
 
   responses:
     RequisicaoMalFormada:
-      description: Sintaxe inválida (JSON malformado, Idempotency-Key ausente/ inválida, tipo errado). Ver `/problemas/requisicao-mal-formada`.
+      description: |
+        Sintaxe inválida, antes de qualquer regra:
+        - `/problemas/requisicao-mal-formada`: corpo que não é JSON (serviço); na AWS, também header obrigatório ausente ou vazio,
+          como `Idempotency-Key` (gateway, `BAD_REQUEST_PARAMETERS`: ele só confere a presença dos parâmetros).
+        - `/problemas/idempotency-key-invalida`: `Idempotency-Key` ausente (local) ou fora do formato UUID (serviço).
+        Campo desconhecido, tipo errado ou campo obrigatório ausente no corpo NÃO são 400: são 422 (`RegraDeDominioViolada`).
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     NaoAutenticado:
       description: Token ausente/ inválido (emitido pelo gateway). Ver `/problemas/nao-autenticado`.
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     SemPermissao:
-      description: Escopo insuficiente (emitido pelo gateway). Ver `/problemas/sem-permissao`.
+      description: |
+        Escopo insuficiente (emitido pelo gateway). Ver `/problemas/sem-permissao`.
+        Desvio: bloqueio por regra gerenciada do WAF também é 403, mas com o corpo padrão do WAF, não este schema.
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     LimiteInsuficiente:
       description: Recusa por regra de negócio — limite disponível menor que o valor. A recusa é registrada e publicada (TransacaoRecusada).
@@ -339,6 +360,7 @@ components:
             detail: O limite disponível do contrato não cobre o valor solicitado.
             codigo: LIMITE_INSUFICIENTE
             id_autorizacao: 6f1c2b0e-3d4a-5b6c-8d7e-9f0a1b2c3d4e
+            limite_disponivel: 100.00
             correlation_id: 0b8a1f2e-9c7d-4e6f-8a5b-3c2d1e0f9a8b
             trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
     ContratoNaoEncontrado:
@@ -364,13 +386,23 @@ components:
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     RegraDeDominioViolada:
       description: |
-        Payload sintaticamente válido mas que viola regra de domínio (`erros` traz o detalhe). Inclui: valor ≤ 0 ou com mais de 2 casas;
-        moeda ≠ BRL; ESTORNO sem `id_autorizacao_original`; `id_autorizacao_original` em RESERVA/CREDITO; captura maior que
-        a reserva ou de algo que não é RESERVA; `id_contrato` do corpo ≠ path; mesma Idempotency-Key com corpo diferente;
-        contrato não ATIVO; CREDITO maior que o utilizado.
+        JSON bem formado que viola o schema `PedidoDeAutorizacao` ou uma regra de domínio. O serviço é a autoridade (o gateway
+        não valida o corpo). Por `codigo`:
+        - `VALIDACAO_DE_DOMINIO` (com `erros`): campo obrigatório ausente, tipo errado, campo desconhecido, `metadata` fora da
+          allowlist, corpo que não é objeto, enum/pattern violado; valor ≤ 0 ou com mais de 2 casas; moeda ≠ BRL; ESTORNO sem
+          `id_autorizacao_original`; `id_autorizacao_original` em RESERVA/CREDITO; `id_contrato` do corpo ≠ path; parâmetro
+          de path fora do pattern; recusa do limite sem código próprio.
+        - `IDEMPOTENCY_KEY_REUTILIZADA`: mesma Idempotency-Key com corpo diferente.
+        - `CONTRATO_INATIVO`: contrato BLOQUEADO ou ENCERRADO. `CREDITO_EXCEDE_UTILIZADO`: CREDITO maior que o utilizado.
+        - `AUTORIZACAO_ORIGINAL_INVALIDA` (ESTORNO ou captura): original inexistente, de outro contrato ou de outro canal;
+          tipo da original não estornável (só RESERVA e DEBITO) ou não capturável (só RESERVA); original não APROVADA;
+          estorno com valor diferente do original (estorno parcial não é suportado na v1); captura maior que o reservado.
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     LimiteDeRequisicoes:
-      description: Rate limit/quota do plano do consumidor (usage plan + WAF) ou proteção do serviço. Sempre com Retry-After.
+      description: |
+        Só a borda emite 429; o serviço nunca (a proteção dele é o 503 de load shedding). Sempre com Retry-After.
+        - Gateway: throttling (`THROTTLED`) ou quota diária (`QUOTA_EXCEEDED`) do usage plan do consumidor.
+        - WAF: regra rate-based. Resposta customizada com corpo fixo, sem `correlation_id` (o WAF não tem o id da requisição).
       headers:
         Retry-After: { $ref: '#/components/headers/RetryAfter' }
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }

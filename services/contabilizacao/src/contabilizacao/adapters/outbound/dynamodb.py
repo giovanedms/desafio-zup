@@ -2,7 +2,8 @@
 
 Tabelas:
   - `contabilizacao-inbox`: item `INBOX#<source>|<id>` por evento já contabilizado. TTL de 30 dias,
-    maior que a retenção de 14 dias do SQS: nenhuma reentrega possível sobrevive à inbox.
+    maior que a retenção de 14 dias do SQS: nenhuma reentrega possível sobrevive à inbox. O replay do
+    archive pode trazer evento mais velho que isso; aí quem barra é o `pk` determinístico do lançamento.
   - `contabilizacao-lancamentos`: item `LANC#<id_lancamento>` por lançamento (livro-razão; sem TTL,
     a retenção contábil é regulatória).
 
@@ -64,8 +65,11 @@ class RepositorioContabilDynamoDB:
             self._cliente.transact_write_items(TransactItems=itens, ClientRequestToken=token)
         except self._cliente.exceptions.TransactionCanceledException as erro:
             motivos = [m.get("Code") for m in erro.response.get("CancellationReasons", [])]
-            if motivos and motivos[0] == "ConditionalCheckFailed":
-                return False  # inbox já tinha a chave: reentrega
+            # Item 0 (inbox) falhou: reentrega. Item 1 (lançamento, `pk` determinístico por source+id) falhou:
+            # o evento já está no razão e a chave da inbox expirou (replay do archive além do TTL). Os dois
+            # são DUPLICADO; levantar faria a mensagem rodar até a DLQ sem nada a contabilizar.
+            if "ConditionalCheckFailed" in motivos:
+                return False
             raise
         return True
 

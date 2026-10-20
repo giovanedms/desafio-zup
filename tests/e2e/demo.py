@@ -2,17 +2,20 @@
 
 Cada execução cria contratos NOVOS (simulando a carga vinda do legado), então dá para repetir à vontade.
 Também é o teste ponta a ponta da esteira: cada seção confere o que mostra, e qualquer divergência sai com código 1.
-Fala só com as APIs HTTP públicas/internas — não importa nada dos serviços além do bootstrap de dados.
+Fala com as APIs HTTP públicas/internas — não importa nada dos serviços além do bootstrap de dados. O que não
+tem API (o lançamento contábil, as filas sem consumidor local) é lido direto na LocalStack.
 """
 
 from __future__ import annotations
 
+import json
 import statistics
 import subprocess
 import sys
 import time
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from typing import Any
@@ -195,16 +198,15 @@ def demo_captura(http: httpx.Client) -> None:
     ] * 10
     with ThreadPoolExecutor(max_workers=20) as pool:
         respostas = list(pool.map(lambda corpo: autorizar(http, id_contrato, corpo)[0], pedidos))
-    vencedoras = [r for r in respostas if r.status_code == 201]
+    status = Counter(r.status_code for r in respostas)
     final = limite(http, id_contrato)
     print(
-        f"10 capturas × 10 estornos do mesmo hold em paralelo → "
-        f"{dict(sorted(Counter(r.status_code for r in respostas).items()))}  "
-        f"reservado final={final['saldo_reservado']}"
+        f"10 capturas × 10 estornos do mesmo hold em paralelo → {dict(sorted(status.items()))}  "
+        f"(esperado: {{201: 1, 409: 19}})  reservado final={final['saldo_reservado']}"
     )
-    ok = len(vencedoras) == 1 and Decimal(str(final["saldo_reservado"])) == 0
-    print("✅ um vencedor, hold consumido uma vez" if ok else "")
-    confere(ok, "disputa pelo hold: esperado exatamente um 201 e reservado 0")
+    ok = status == {201: 1, 409: 19} and Decimal(str(final["saldo_reservado"])) == 0
+    print("✅ um vencedor, 19 conflitos, hold consumido uma vez" if ok else "")
+    confere(ok, "disputa pelo hold: esperado {201: 1, 409: 19} e reservado 0")
 
 
 def demo_validacao(http: httpx.Client) -> None:
@@ -263,6 +265,37 @@ def aguardar(condicao: Any, segundos: float = 15.0) -> Any:
     return None
 
 
+def receber_da_fila(
+    nome: str, achou: Callable[[dict[str, Any]], bool], segundos: float = 60.0
+) -> dict[str, Any] | None:
+    """Drena a fila até achar a mensagem que `achou` reconhece e devolve o envelope do EventBridge.
+
+    Só para filas SEM consumidor no ambiente local (antifraude, notificacoes): a demo apaga o que lê, então
+    o backlog de execuções anteriores sai no caminho. Não depende de a fila estar vazia nem da ordem
+    (SQS Standard); o prazo cobre drenar esse backlog na primeira execução.
+    """
+    sqs = cliente("sqs")
+    url = sqs.get_queue_url(QueueName=nome)["QueueUrl"]
+    fim = time.monotonic() + segundos
+    while time.monotonic() < fim:
+        mensagens = sqs.receive_message(
+            QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1, VisibilityTimeout=30
+        ).get("Messages", [])
+        if mensagens:
+            sqs.delete_message_batch(
+                QueueUrl=url,
+                Entries=[
+                    {"Id": str(i), "ReceiptHandle": m["ReceiptHandle"]}
+                    for i, m in enumerate(mensagens)
+                ],
+            )
+        for mensagem in mensagens:
+            envelope = json.loads(mensagem["Body"], parse_float=Decimal)
+            if achou(envelope):
+                return dict(envelope)
+    return None
+
+
 def demo_eventos(http: httpx.Client) -> None:
     titulo("6. Evento → outbox → relay → EventBridge → fila → contabilização (partida dobrada)")
     id_contrato = novo_contrato("1000.00")
@@ -288,6 +321,33 @@ def demo_eventos(http: httpx.Client) -> None:
         m = partida["M"]
         print(f"   {m['natureza']['S']}  {m['conta']['S']:<6} {m['valor']['N']}")
     print("✅ o fato atravessou o outbox, o bus e a fila e foi contabilizado uma vez (inbox)")
+
+    # Fan-out: a regra do bus entrega a MESMA TransacaoAutorizada em antifraude e notificacoes (sem
+    # consumidor local). A fila da contabilização não é lida aqui: ela tem consumidor (corrida); a prova
+    # dela é o lançamento acima, que guarda o id do evento de origem.
+    id_contabilizado = item["id_evento_origem"]["S"]
+
+    def desta_autorizacao(envelope: dict[str, Any]) -> bool:
+        detail = envelope.get("detail") or {}
+        return bool(
+            envelope.get("detail-type") == "TransacaoAutorizada"
+            and (detail.get("data") or {}).get("id_autorizacao") == id_aut
+        )
+
+    ids = {
+        fila: receber_da_fila(fila, desta_autorizacao) for fila in ("antifraude", "notificacoes")
+    }
+    for fila, envelope in ids.items():
+        print(f"   {fila:<14} → {envelope['detail']['id'] if envelope else 'NÃO CHEGOU'}")
+    print(f"   contabilizacao → {id_contabilizado} (id_evento_origem do lançamento)")
+    mesmos = {e["detail"]["id"] if e else None for e in ids.values()} == {id_contabilizado}
+    print(
+        "✅ fan-out: o mesmo CloudEvent (mesmo id) chegou nos três consumidores" if mesmos else ""
+    )
+    confere(
+        mesmos,
+        "fan-out: a TransacaoAutorizada não chegou com o mesmo id em antifraude e notificacoes",
+    )
 
 
 def demo_legado(http: httpx.Client) -> None:
@@ -315,31 +375,75 @@ def demo_legado(http: httpx.Client) -> None:
     )
     print(f"carga inicial (registro v1, R$ 1.500) → contrato criado pela ACL: {bool(criado)}")
     autorizar(http, id_contrato, {**reserva("400.00"), "tipo_operacao": "RESERVA"})
-    subprocess.run(
-        [*enviar, "--limite", "1000.00", "--versao", "3"], check=True, capture_output=True
-    )
-    subprocess.run(
-        [*enviar, "--limite", "9999.00", "--versao", "2"], check=True, capture_output=True
-    )
+    confere(bool(criado), "a ACL não criou o contrato a partir do registro do legado")
 
     def na_versao_3() -> dict[str, Any] | None:
         limite = http.get(f"{LIMITES}/interno/v1/contratos/{id_contrato}/limite").json()
         return dict(limite) if limite.get("versao_legado") == 3 else None
 
-    final = aguardar(na_versao_3)
-    confere(bool(criado), "a ACL não criou o contrato a partir do registro do legado")
-    confere(
-        bool(final)
-        and Decimal(str(final["limite_concedido"])) == Decimal("1000")
-        and Decimal(str(final["saldo_reservado"])) == Decimal("400"),
-        "legado: esperado concedido 1000 (v2 fora de ordem ignorada) e reserva de 400 intacta",
+    # A v2 só sai depois que a v3 foi APLICADA: a fila do legado é Standard (sem ordem), então mandar as
+    # duas juntas não provaria nada se a ACL pegasse a v2 primeiro.
+    subprocess.run(
+        [*enviar, "--limite", "1000.00", "--versao", "3"], check=True, capture_output=True
     )
-    if final:
-        print(
-            f"v3 (R$ 1.000) e depois v2 FORA DE ORDEM (R$ 9.999, ignorada) → concedido={final['limite_concedido']}  "
-            f"reservado={final['saldo_reservado']}  disponível={final['limite_disponivel']}"
+    v3 = aguardar(na_versao_3)
+    confere(bool(v3), "legado: a v3 não foi aplicada em 15 s")
+    if v3:
+        print(f"v3 (R$ 1.000) aplicada → concedido={v3['limite_concedido']}  versao_legado=3")
+
+    sqs = cliente("sqs")
+    fila_do_legado = sqs.get_queue_url(QueueName="legado-contratos")["QueueUrl"]
+
+    def legado_consumido() -> bool:
+        a = sqs.get_queue_attributes(
+            QueueUrl=fila_do_legado,
+            AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
+        )["Attributes"]
+        return bool(
+            a["ApproximateNumberOfMessages"] == a["ApproximateNumberOfMessagesNotVisible"] == "0"
         )
+
+    subprocess.run(
+        [*enviar, "--limite", "9999.00", "--versao", "2"], check=True, capture_output=True
+    )
+    consumida = aguardar(legado_consumido)  # a ACL só apaga a mensagem depois de processar
+    final = limite(http, id_contrato)
+    print(
+        f"v2 FORA DE ORDEM (R$ 9.999) consumida pela ACL: {bool(consumida)} → "
+        f"concedido={final.get('limite_concedido')}  versao_legado={final.get('versao_legado')}  "
+        f"reservado={final.get('saldo_reservado')}  disponível={final.get('limite_disponivel')}"
+    )
     print("   (a ACL só toca concedido/status; a reserva de R$ 400 continua lá)")
+    confere(
+        bool(consumida)
+        and final.get("versao_legado") == 3
+        and Decimal(str(final.get("limite_concedido"))) == Decimal("1000")
+        and Decimal(str(final.get("saldo_reservado"))) == Decimal("400"),
+        "legado: esperado v2 consumida e ignorada (versao_legado 3, concedido 1000) e reserva de 400 intacta",
+    )
+
+    # CDC: a mudança de concedido da v3 vira LimiteAlterado no bus, roteado para notificacoes.
+    alterado = receber_da_fila(
+        "notificacoes",
+        lambda e: bool(
+            e.get("detail-type") == "LimiteAlterado"
+            and ((e.get("detail") or {}).get("data") or {}).get("id_contrato") == id_contrato
+        ),
+    )
+    dados = alterado["detail"]["data"] if alterado else {}
+    if alterado:
+        print(
+            f"LimiteAlterado em notificacoes: concedido {dados['limite_concedido_anterior']} → "
+            f"{dados['limite_concedido']}  versao_legado={dados['versao_legado']}  "
+            f"id={alterado['detail']['id']}"
+        )
+    confere(
+        bool(alterado)
+        and dados.get("limite_concedido_anterior") == Decimal("1500")
+        and dados.get("limite_concedido") == Decimal("1000")
+        and dados.get("versao_legado") == 3,
+        "LimiteAlterado (1500 → 1000, versao_legado 3) não chegou em notificacoes",
+    )
 
 
 def main() -> None:

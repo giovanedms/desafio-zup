@@ -10,13 +10,16 @@ from typing import Any
 
 import jsonschema
 import pytest
-from autorizacao.adapters.outbound.cloudevents import para_cloudevent, serializar
+from autorizacao.adapters.outbound.cloudevents import _SLUGS, para_cloudevent, serializar
+from autorizacao.domain.autorizacao import MotivoDaReconciliacao
 from autorizacao.domain.eventos import (
     EventoDeDominio,
     ReservaCapturada,
     ReservaExpirada,
     SaldosDoLimite,
     TransacaoAutorizada,
+    TransacaoCompensada,
+    TransacaoEmReconciliacaoManual,
     TransacaoEstornada,
     TransacaoRecusada,
 )
@@ -75,6 +78,24 @@ EVENTOS: dict[str, EventoDeDominio] = {
         valor_capturado=Decimal("120.00"),
         saldos=SALDOS,
     ),
+    "transacao-compensada": TransacaoCompensada(
+        **BASE,
+        id_autorizacao=ID_AUT,
+        tipo_operacao="DEBITO",
+        valor=Decimal("150.00"),
+        id_conta="0001-1",
+        havia_efeito=True,
+    ),
+    "transacao-em-reconciliacao-manual": TransacaoEmReconciliacaoManual(
+        **BASE,
+        id_autorizacao=ID_AUT,
+        tipo_operacao="DEBITO",
+        valor=Decimal("150.00"),
+        id_conta="0001-1",
+        motivo=MotivoDaReconciliacao.DESFAZER_FORA_DO_PRAZO.value,
+        aplicacao_confirmada_em=datetime(2026, 10, 20, 13, 45, 13, tzinfo=UTC),
+        desfazer_desde=datetime(2026, 10, 20, 13, 46, tzinfo=UTC),
+    ),
 }
 
 
@@ -108,6 +129,33 @@ def test_evento_publicado_cumpre_o_schema(slug: str) -> None:
     publicado = json.loads(serializar(para_cloudevent(EVENTOS[slug])))
 
     erros = sorted(validador(slug).iter_errors(publicado), key=str)
+
+    assert not erros, [e.message for e in erros]
+
+
+def test_todo_tipo_publicado_tem_caso_de_contrato() -> None:
+    assert set(EVENTOS) == set(_SLUGS.values())
+
+
+@pytest.mark.parametrize("confirmada", [True, False])
+@pytest.mark.parametrize("motivo", list(MotivoDaReconciliacao))
+def test_reconciliacao_manual_cumpre_o_schema_em_todo_motivo(
+    motivo: MotivoDaReconciliacao, confirmada: bool
+) -> None:
+    instante = datetime(2026, 10, 20, 13, 45, 13, tzinfo=UTC) if confirmada else None
+    evento = TransacaoEmReconciliacaoManual(
+        **BASE,
+        id_autorizacao=ID_AUT,
+        tipo_operacao="RESERVA",
+        valor=Decimal("150.00"),
+        id_conta="0001-1",
+        motivo=motivo.value,
+        aplicacao_confirmada_em=instante,
+        desfazer_desde=instante,
+    )
+    publicado = json.loads(serializar(para_cloudevent(evento)))
+
+    erros = sorted(validador("transacao-em-reconciliacao-manual").iter_errors(publicado), key=str)
 
     assert not erros, [e.message for e in erros]
 

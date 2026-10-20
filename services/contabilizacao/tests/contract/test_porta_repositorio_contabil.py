@@ -63,6 +63,14 @@ def test_mesma_chave_devolve_false_e_so_um_lancamento(ambiente: Ambiente) -> Non
     assert ambiente.total_de_lancamentos() == 1
 
 
+def test_replay_depois_do_ttl_da_inbox_devolve_false_e_nao_duplica(ambiente: Ambiente) -> None:
+    # Replay do archive com mais de 30 dias: a chave da inbox já expirou (aqui, uma chave que a inbox não
+    # tem: para o adapter é o mesmo caso), mas o lançamento, de id determinístico, está no razão.
+    assert ambiente.repositorio.registrar(lancamento(), "src|evt-1") is True
+    assert ambiente.repositorio.registrar(lancamento(), "src|evt-1-inbox-expirada") is False
+    assert ambiente.total_de_lancamentos() == 1
+
+
 def test_chaves_diferentes_gravam_lancamentos_diferentes(ambiente: Ambiente) -> None:
     assert ambiente.repositorio.registrar(lancamento("evt-1"), "src|evt-1") is True
     assert ambiente.repositorio.registrar(lancamento("evt-2"), "src|evt-2") is True

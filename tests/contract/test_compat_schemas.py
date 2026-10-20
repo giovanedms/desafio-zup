@@ -27,10 +27,19 @@ BASE: dict[str, Any] = {
         "dataschema": {"type": "string", "enum": ["https://e/x/1.0.json"]},
         "data": {
             "type": "object",
+            "additionalProperties": True,
             "required": ["valor"],
             "properties": {
                 "valor": {"type": "string"},
                 "status": {"type": "string", "enum": ["A", "B"]},
+                "codigo": {
+                    "type": "string",
+                    "pattern": "^[A-Z]+$",
+                    "minLength": 2,
+                    "maxLength": 10,
+                },
+                "quantia": {"type": "number", "minimum": 0, "maximum": 1000, "multipleOf": 0.01},
+                "taxa": {"type": "number"},
             },
         },
     },
@@ -126,6 +135,96 @@ def test_adicionar_valor_a_atributo_fixo_tambem_quebra(tmp_path: Path) -> None:
 
     quebras, _ = _rodar(tmp_path, _mutar(mut))
     assert any(".type" in q and "fixo" in q for q in quebras)
+
+
+def _restringir(no: str, **restricoes: Any) -> dict[str, Any]:
+    """Cópia da BASE com restrições trocadas num nó: "$" (raiz), "data" ou um campo de `data`.
+    Valor None remove a restrição."""
+    schema = copy.deepcopy(BASE)
+    data = schema["properties"]["data"]
+    alvo = {"$": schema, "data": data}.get(no) or data["properties"][no]
+    for chave, valor in restricoes.items():
+        if valor is None:
+            alvo.pop(chave, None)
+        else:
+            alvo[chave] = valor
+    return schema
+
+
+# Uma classe de aperto por caso: o schema novo recusaria um evento que a base aceitava (BACKWARD).
+APERTOS = [
+    pytest.param(
+        "data", {"additionalProperties": False}, "$.data: additionalProperties", id="ap-true-false"
+    ),
+    pytest.param(
+        "$", {"additionalProperties": False}, "$: additionalProperties", id="ap-ausente-false"
+    ),
+    pytest.param(
+        "data",
+        {"additionalProperties": {"type": "string"}},
+        "$.data: additionalProperties",
+        id="ap-schema",
+    ),
+    pytest.param("valor", {"pattern": "^[0-9]+$"}, ".valor: pattern novo", id="pattern-novo"),
+    pytest.param(
+        "codigo",
+        {"pattern": "^[A-Z]{3,}$"},
+        ".codigo: pattern novo ou alterado",
+        id="pattern-alterado",
+    ),
+    pytest.param("valor", {"format": "date-time"}, ".valor: format novo", id="format-novo"),
+    pytest.param("quantia", {"minimum": 10}, ".quantia: minimum", id="minimum-subiu"),
+    pytest.param("taxa", {"minimum": 0}, ".taxa: minimum", id="minimum-novo"),
+    pytest.param(
+        "quantia", {"exclusiveMinimum": True}, ".quantia: minimum", id="exclusiveMinimum-draft04"
+    ),
+    pytest.param(
+        "quantia",
+        {"minimum": None, "exclusiveMinimum": 0},
+        ".quantia: minimum",
+        id="exclusiveMinimum-num",
+    ),
+    pytest.param("quantia", {"maximum": 100}, ".quantia: maximum", id="maximum-desceu"),
+    pytest.param("taxa", {"maximum": 5}, ".taxa: maximum", id="maximum-novo"),
+    pytest.param(
+        "quantia", {"exclusiveMaximum": True}, ".quantia: maximum", id="exclusiveMaximum-draft04"
+    ),
+    pytest.param(
+        "quantia",
+        {"maximum": None, "exclusiveMaximum": 500},
+        ".quantia: maximum",
+        id="exclusiveMaximum-num",
+    ),
+    pytest.param("taxa", {"multipleOf": 0.01}, ".taxa: multipleOf", id="multipleOf-novo"),
+    pytest.param("quantia", {"multipleOf": 0.1}, ".quantia: multipleOf", id="multipleOf-apertado"),
+    pytest.param("codigo", {"maxLength": 5}, ".codigo: maxLength", id="maxLength-desceu"),
+    pytest.param("valor", {"maxLength": 36}, ".valor: maxLength", id="maxLength-novo"),
+    pytest.param("codigo", {"minLength": 3}, ".codigo: minLength", id="minLength-subiu"),
+]
+
+AFROUXAMENTOS = [
+    pytest.param("quantia", {"minimum": -1, "maximum": 2000}, id="limites-afrouxados"),
+    pytest.param("quantia", {"minimum": None, "maximum": None}, id="limites-removidos"),
+    pytest.param("quantia", {"multipleOf": 0.001}, id="multipleOf-mais-fino"),
+    pytest.param("quantia", {"multipleOf": None}, id="multipleOf-removido"),
+    pytest.param(
+        "codigo", {"pattern": None, "minLength": 1, "maxLength": 20}, id="texto-afrouxado"
+    ),
+    pytest.param("data", {"additionalProperties": None}, id="ap-true-ausente"),
+]
+
+
+@pytest.mark.parametrize(("no", "restricoes", "esperado"), APERTOS)
+def test_aperto_de_restricao_quebra(
+    tmp_path: Path, no: str, restricoes: dict[str, Any], esperado: str
+) -> None:
+    quebras, _ = _rodar(tmp_path, _restringir(no, **restricoes))
+    assert any(esperado in q for q in quebras), quebras
+
+
+@pytest.mark.parametrize(("no", "restricoes"), AFROUXAMENTOS)
+def test_afrouxar_restricao_e_verde(tmp_path: Path, no: str, restricoes: dict[str, Any]) -> None:
+    assert _rodar(tmp_path, _restringir(no, **restricoes)) == ([], [])
 
 
 def test_arquivo_removido_quebra(tmp_path: Path) -> None:

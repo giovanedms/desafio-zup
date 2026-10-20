@@ -9,7 +9,7 @@
 
 O enunciado pede o evento `TransacaoAutorizada` (v1) "no formato CloudEvents", publicado no EventBridge, com `event_id` para dedup, evolução retrocompatível "validada por um schema registry" e consumidores tolerantes a reordenação.
 
-Fatos (`01-pesquisa/03` e `02`):
+Fatos (das especificações e da documentação oficial; os links principais estão em Referências):
 
 - **O envelope do EventBridge não é CloudEvents.** O `id` do envelope é gerado pelo EventBridge e muda a cada `PutEvents`.
 - **O Schema Registry do EventBridge não valida eventos nem checa compatibilidade.** Ele só documenta (OpenAPI 3 / JSON Schema draft-04). O Glue Schema Registry checa compatibilidade, mas não se integra ao bus Classic. O novo Custom Event Bus integra com o Glue só para Avro/Protobuf e não existe em sa-east-1.

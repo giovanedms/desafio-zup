@@ -89,7 +89,7 @@ sequenceDiagram
   participant DL as DDB limites
   Canal->>GW: POST /v1/contratos/{id}/autorizacoes (Idempotency-Key, Bearer, x-api-key)
   GW->>AUT: escopo ok, cota ok, X-Client-Id injetado
-  AUT->>DA: PutItem AUT#uuidv5(cliente, método, URI, chave) SE não existe (EM_PROCESSAMENTO, lease 10 s)
+  AUT->>DA: PutItem AUT#35;uuidv5(cliente, método, URI, chave) SE não existe (EM_PROCESSAMENTO, lease 10 s)
   alt já existe (ReturnValuesOnConditionCheckFailure devolve a gravada)
     AUT-->>Canal: replay (200/402 original) · 409 em andamento · 422 chave reutilizada
   end
@@ -97,7 +97,7 @@ sequenceDiagram
   AUT->>LIM: RESERVAR (id_operacao = id_autorizacao)
   LIM->>DL: UpdateItem SE disponivel ≥ v ∧ ATIVO ∧ ¬reservas.id ∧ ¬ops.id (ALL_NEW)
   LIM-->>AUT: APLICADA (saldos exatos) | RECUSADA (motivo) | JA_APLICADA
-  AUT->>DA: TransactWriteItems [AUT → APROVADA/RECUSADA (SE dono do lease)#59; OUTBOX#evento]
+  AUT->>DA: TransactWriteItems [AUT → APROVADA/RECUSADA (SE dono do lease)#59; OUTBOX#35;evento]
   AUT-->>Canal: 201 + saldo_reservado | 402 problem+json
 ```
 Diagrama: [03-sequencia-autorizacao.svg](diagramas/03-sequencia-autorizacao.svg).
@@ -143,7 +143,7 @@ Ver `docs/dominio/` (linguagem ubíqua e agregados) e o ADR-0002. Os agregados:
 - **Diagrama:** [05-implantacao-aws.svg](diagramas/05-implantacao-aws.svg).
 - **State:** S3 com KMS e lock nativo.
 - **Deploy:** pela esteira do GitHub Actions (OIDC, sem chave de longa duração) a cada push na `main`, ou `make deploy`, que exige `CONFIRMO:` e confere o ID da conta.
-- **Inventário completo** (162 recursos do sandbox, ambiente `esteira`, bootstrap da conta, custo e desvios): `docs/operacao/infraestrutura.md`.
+- **Inventário completo** (174 recursos do sandbox, ambiente `esteira`, bootstrap da conta, custo e desvios): `docs/operacao/infraestrutura.md`.
 
 ## 8. Qualidade
 

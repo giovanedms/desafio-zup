@@ -7,7 +7,7 @@
 
 ## Contexto
 
-O enunciado dá o endpoint, os campos, a tabela de status (201/200/402/409/422/429/503), "RFC 7807 Problem Details", "OpenAPI 3.x contract-first" e "versionamento explícito com política de depreciação". A pesquisa (`01-pesquisa/03` §12) encontrou nuances. A postura é **atender ao pedido e registrar a nuance**.
+O enunciado dá o endpoint, os campos, a tabela de status (201/200/402/409/422/429/503), "RFC 7807 Problem Details", "OpenAPI 3.x contract-first" e "versionamento explícito com política de depreciação". A pesquisa das RFCs (em Referências) encontrou nuances. A postura é **atender ao pedido e registrar a nuance**.
 
 ## Decisões
 

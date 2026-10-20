@@ -39,3 +39,4 @@ localstack-data/
 # Zips das Lambdas gerados por `make pacotes`
 infra/terraform/build/
 # O .terraform.lock.hcl NÃO é ignorado de propósito: o lock deve ser versionado (fixa as versões/hashes dos providers).
+

@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-Formato: MADR com uma seção obrigatória a mais, **"Quando esta decisão deixa de ser boa"** (o §4 do desafio pede discutir quando a solução não é ideal). Template em `0000-template.md`.
+Formato: MADR enxuto. Seções presentes nos 20 ADRs: **Contexto** (com os fatos e números que forçam a decisão), **Decisão**, **Consequências**, **"Quando esta decisão deixa de ser boa"** (o §4 do desafio pede discutir quando a solução não é ideal) e **Referências**. As alternativas são discutidas em todos; em 7 deles numa seção própria ("Alternativas descartadas"), nos demais dentro do Contexto ou da Decisão. O `0000-template.md` marca quais seções são opcionais.
 
 ## Onde começar
 

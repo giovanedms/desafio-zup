@@ -9,7 +9,7 @@
 
 O limite de um contrato é o recurso disputado por todas as autorizações daquele contrato. O enunciado pede "reserva de limite por contrato, com garantia de consistência sob concorrência", 5.000 TPS no pico e `saldo_reservado` no 201 e no evento.
 
-Fatos que restringem a escolha (fontes em `01-pesquisa/02-aws-servicos-e-quotas.md`):
+Fatos que restringem a escolha (da documentação oficial da AWS; os links principais estão em Referências):
 
 - `TransactWriteItems` concorrentes no mesmo item **cancelam** em vez de esperar (`TransactionConflict`), e o SDK não refaz.
 - `TransactWriteItems` não devolve os valores depois do update, só `ReturnValuesOnConditionCheckFailure`.

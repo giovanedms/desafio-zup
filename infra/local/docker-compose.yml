@@ -67,7 +67,7 @@ services:
       TABELA_AUTORIZACOES: autorizacoes
       TABELA_OUTBOX: autorizacoes-outbox
       URL_LIMITES: http://limites:8080
-      # Teto de requisições em voo = capacidade × latência. Na AWS (~10 ms por escrita) 32 basta; aqui cada
+      # Teto de requisições em voo = capacidade × latência. Na AWS o Terraform deriva da CPU da task (18 em 0,5 vCPU); aqui cada
       # requisição leva ~1–2 s no emulador e a demo dispara 50 em paralelo, então o teto local é maior.
       MAX_EM_VOO: "256"
     ports:

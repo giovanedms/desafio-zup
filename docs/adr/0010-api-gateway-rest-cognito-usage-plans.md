@@ -9,7 +9,7 @@
 
 O enunciado pede API Gateway (REST ou HTTP) com autorização (Cognito, Lambda Authorizer ou OAuth2) e rate limiting, throttling, usage plans e quotas por consumidor.
 
-Fatos (`01-pesquisa/02`):
+Fatos (da documentação oficial da AWS; os links principais estão em Referências):
 
 - **Usage plans, API keys, quotas, request validation, WAF e canary só existem na REST API.** A HTTP API não tem.
 - **Usage plan é *best-effort*:** a própria doc diz para não usá-lo como controle de acesso ou de custo.

@@ -9,7 +9,7 @@
 
 A defesa exige demonstrar a solução executando, "local com docker ou em conta AWS".
 
-Fatos (`01-pesquisa/02` §11):
+Fatos (da documentação oficial da AWS; os links principais estão em Referências):
 
 - **A imagem `localstack/latest` exige conta e token** desde 23/03/2026, e o repositório foi arquivado.
 - **A tag `4.14.0`** (último build Community, 26/02/2026) sobe **sem token e sem rede**, com DynamoDB, Streams, SQS, EventBridge e STS.

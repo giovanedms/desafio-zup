@@ -48,4 +48,4 @@ Se o negócio fixar SLO de 99,99% ou RPO zero, o desenho muda de classe:
 
 - API Gateway SLA: https://aws.amazon.com/api-gateway/sla/
 - Res. CMN 4.893/2021 (alterada pela CMN 5.274/2025) e Circular 3.978: busca de normativos do BCB, https://www.bcb.gov.br/estabilidadefinanceira/buscanormas
-- Pesquisa de suporte: `01-pesquisa/02-aws-servicos-e-quotas.md`, `01-pesquisa/03-padroes-normas-e-dominio.md`
+- Pesquisa de suporte: levantamento de quotas da AWS e de normas feito para este desafio (fora do ZIP); as fontes oficiais estão nesta seção

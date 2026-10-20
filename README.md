@@ -77,7 +77,7 @@ docs/
 
 **Local:** `make deploy EXPECTED_ACCOUNT_ID=<conta> CONFIRMO="CONFIRMO: deploy na conta desafio-zup" [TAG=1.0.4] [ARQ=amd64|arm64]` (pacotes das Lambdas, repositórios ECR, build e push das imagens e apply, nessa ordem; runbook R6).
 
-O que existe na conta (162 recursos do sandbox, ambiente `esteira`, bootstrap), configuração, custo e desvios: `docs/operacao/infraestrutura.md`.
+O que existe na conta (174 recursos do sandbox, ambiente `esteira`, bootstrap), configuração, custo e desvios: `docs/operacao/infraestrutura.md`.
 
 - O deploy exige a frase de confirmação e confere a conta.
 - O state fica em S3 com KMS.

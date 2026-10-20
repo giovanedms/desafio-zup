@@ -1,7 +1,7 @@
 # Compliance — o que o desenho suporta (sem exagero jurídico)
 
 > Mapeamento técnico de requisitos normativos para mecanismos da solução. Não é parecer jurídico. A aderência formal depende das políticas do banco (segurança cibernética, retenção, terceirização).
-> Fontes primárias consultadas em 19/10/2026: `01-pesquisa/03-padroes-normas-e-dominio.md` §11.
+> Fontes primárias: os textos das normas citadas, consultados em 19/10/2026 (o levantamento completo é material de pesquisa, fora do ZIP).
 
 | Norma | O que exige (resumo) | Mecanismo na solução | Onde |
 |---|---|---|---|

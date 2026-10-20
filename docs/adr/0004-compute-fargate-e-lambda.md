@@ -9,7 +9,7 @@
 
 O caminho síncrono (API Gateway → `autorizacao` → `limites` → DynamoDB) precisa de p99 ≤ 150 ms a 5.000 TPS (ADR-0001). O trabalho assíncrono (contabilização, relay do outbox, reconciliador) é orientado a evento e tem rajadas.
 
-Fatos (`01-pesquisa/02-aws-servicos-e-quotas.md`):
+Fatos (da documentação oficial da AWS; os links principais estão em Referências):
 
 - **Lambda:**
   - limita RPS a 10 × concorrência, então 5.000 TPS exigem ≥ 500 de concorrência por função;

@@ -7,7 +7,7 @@
 
 ## Contexto
 
-O enunciado dá quatro tipos de operação (`DEBITO`, `CREDITO`, `RESERVA`, `ESTORNO`) e diz que a reserva bloqueia limite. Ele não diz como o hold termina. O painel de juízes (`02-plano/juizes/painel2-codigo-limites.md`, ataques 3 e 4) reproduziu dois buracos na primeira versão:
+O enunciado dá quatro tipos de operação (`DEBITO`, `CREDITO`, `RESERVA`, `ESTORNO`) e diz que a reserva bloqueia limite. Ele não diz como o hold termina. Um painel de revisão adversarial do código do BC Limites (juízes independentes instruídos a reprovar; ver `docs/uso-de-ia.md`) reproduziu dois buracos na primeira versão:
 
 - **Não havia captura.** `RESERVAR 1000` e depois `DEBITAR 1000` dava `LIMITE_INSUFICIENTE`. O contorno "liberar e depois debitar" não é atômico e perde a corrida para outra reserva: o estabelecimento fica sem receber por uma compra aprovada.
 - **A expiração de 7 dias não tinha motor.** `Autorizacao.expirar` só era chamada em teste. Hold não estornado ficava preso no limite para sempre.
@@ -69,6 +69,6 @@ E um terceiro, achado ao desenhar os dois primeiros: **captura, estorno e expira
 
 ## Referências
 
-- Painel de juízes, código do BC Limites: `02-plano/juizes/painel2-codigo-limites.md` (ataques 3, 4 e ressalva 8)
+- Painel de revisão adversarial do código do BC Limites (registro fora do ZIP; os achados estão descritos no Contexto deste ADR)
 - DynamoDB TTL, prazo de exclusão: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/howitworks-ttl.html
 - Código: `services/limites/src/limites/domain/operacoes.py::CapturarReserva`, `limite.py::diagnosticar`, `services/autorizacao/src/autorizacao/application/expirar.py`

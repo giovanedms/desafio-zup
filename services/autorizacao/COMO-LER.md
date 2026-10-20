@@ -45,7 +45,7 @@
 |---|---|
 | "O replay de uma recusa devolve 200?" | Não: devolve o **mesmo** status. `Autorizacao.resultado` guarda o desfecho original (ADR-0006/0011) |
 | "Por que o id é determinístico?" | Para não precisar de tabela de idempotência e ter a janela igual à retenção (ADR-0006) |
-| "E sem fencing token, o lease é seguro?" | Limites de tempo de uma ordem de grandeza (ADR-0006) + idempotência a jusante como defesa em profundidade |
+| "E sem fencing token, o lease é seguro?" | Na escrita do estado, sim: `concluir` e `regravar` são compare-and-set no `lease_ate` gravado, então quem perdeu o lease falha sem efeito. O ponto frágil é outro: entre o prazo de reaplicação (4 min) e a guarda do limite (5 min) há só **60 s** para o desvio somado dos relógios. A AWS cita poucos milissegundos de desvio entre tasks (não é SLA); um teste acopla as constantes (`tests/integracao_bcs`); o alarme de `ClockErrorBound` é evolução (ADR-0006) |
 | "Onde o evento é publicado?" | Em lugar nenhum aqui: só gravado no outbox. Quem publica é o `relay/` (ADR-0007) |
 | "Como a reserva vira consumo?" | Captura: DEBITO com `id_autorizacao_original` apontando para a RESERVA. A reserva fica CAPTURADA e saem `TransacaoAutorizada` e `ReservaCapturada` (ADR-0020) |
 | "E a reserva que ninguém usa?" | O expirador a libera depois de 7 dias (ADR-0020) |

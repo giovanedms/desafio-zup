@@ -16,7 +16,7 @@ Os eventos de autorização vão para consumidores com necessidades diferentes:
 
 O enunciado pede EventBridge, SNS e SQS para fan-out e pede para avaliar SQS, Kinesis e MSK para alta volumetria e ordem por chave.
 
-Fatos em sa-east-1 (`01-pesquisa/02`):
+Fatos em sa-east-1 (da documentação oficial da AWS; os links principais estão em Referências):
 
 | Serviço | Fato relevante |
 |---|---|

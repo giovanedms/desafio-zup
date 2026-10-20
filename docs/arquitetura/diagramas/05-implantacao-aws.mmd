@@ -1,7 +1,7 @@
 flowchart TB
   subgraph ACC["Conta desafio-zup · sa-east-1"]
     WAF[WAF] --> GW["API Gateway REST<br/>stage v1 · Cognito · usage plans"]
-    subgraph VPC["VPC 10.40.0.0/16 · subnets sa-east-1a e sa-east-1c"]
+    subgraph VPC["VPC 10.40.0.0/16 · subnets públicas sa-east-1a e sa-east-1c · sem NAT · tasks sem ingress da internet"]
       VPCL[VPC Link] --> NLB[NLB interno]
       subgraph ECS["ECS cluster desafio · Service Connect"]
         AUT[autorizacao]

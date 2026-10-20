@@ -38,7 +38,7 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
   - tamanho do outbox;
   - IteratorAge do relay;
   - órfãs compensadas por hora.
-- **Alarmes:** 5XX > 1%, p99 > 150 ms, qualquer mensagem em DLQ, IteratorAge > 60 s e os do reconciliador (`reconciliador-encaminhadas`, `reconciliador-falhas`, `reconciliador-hold_perdido`). Órfãs compensadas por hora é consulta de log (runbook R4), sem alarme.
+- **Alarmes:** 5XX > 1%, p99 > 150 ms, qualquer mensagem em DLQ, IteratorAge > 60 s, guarda de idempotência acima de 2.000 entradas (`OperacoesNaGuarda`, ADR-0016) e os do reconciliador (`reconciliador-encaminhadas`, `reconciliador-falhas`, `reconciliador-hold_perdido`). Órfãs compensadas por hora é consulta de log (runbook R4), sem alarme. No sandbox, nenhum alarme tem ação (sem SNS); na produção, cada um notifica o plantão (`docs/operacao/infraestrutura.md`, seção 9).
 
 ### Segurança
 
@@ -46,7 +46,7 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
 - **Rede:**
   - tasks sem ingress da internet (só NLB e Service Connect, a partir da VPC);
   - na produção, subnets privadas + endpoints;
-  - no sandbox, subnets públicas **sem ingress** e sem NAT, por custo (desvio documentado).
+  - no sandbox, subnets públicas **sem ingress** e sem NAT, por custo, com VPC endpoints gateway só para DynamoDB e S3 (desvio documentado).
 - **Borda:** WAF (rate-based + regras gerenciadas), OAuth2 com escopo, cotas.
 - **Dados:**
   - DynamoDB com criptografia em repouso e PITR, SQS com SSE, TLS em trânsito;

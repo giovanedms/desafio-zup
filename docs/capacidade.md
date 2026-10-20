@@ -74,11 +74,15 @@ O RNF de p99 ≤ 150 ms **não foi atingido com folga** em nenhum degrau; o mais
 
 | Item | Observação |
 |---|---|
-| Fargate ARM64 | 2 tasks por serviço × 0,5 vCPU / 1 GB; é o maior custo ocioso |
-| NLB + VPC Link | Custo fixo por hora |
+| Fargate x86 (sandbox) | `autorizacao` e `limites`: 2 tasks × 0,5 vCPU / 1 GB cada; `limites-acl` e `reconciliador`: 1 task × 0,25 vCPU / 0,5 GB. ~US$ 5,1/dia, o maior custo ocioso |
+| IPv4 público | Um por task (6) × US$ 0,005/h, ~US$ 0,7/dia |
+| NLB + VPC Link | Custo fixo por hora (NLB: US$ 0,034/h) |
+| WAF | US$ 5/mês pelo web ACL + US$ 1/mês por regra (2) |
 | DynamoDB, SQS, EventBridge, Lambda | On-demand, centavos em volume de demo |
 | NAT Gateway | **Não usado** (~US$ 68/mês parado em sa-east-1, valor reportado pelo painel de revisão) |
 | Proteção | Budget de US$ 30/mês com alertas; janela curta com destroy |
+
+Fixo com o sandbox no ar: ~US$ 7/dia. Conta item a item e o que não foi quantificado: `docs/operacao/infraestrutura.md`, seção 7.
 
 Preços **oficiais de sa-east-1** consultados na AWS Pricing API em 20/10/2026: Fargate x86 US$ 0,0696 por vCPU-hora e US$ 0,0076 por GB-hora; Fargate ARM US$ 0,0557 e US$ 0,00612; DynamoDB on-demand US$ 0,9375 por milhão de WRU e US$ 0,1875 por milhão de RRU.
 

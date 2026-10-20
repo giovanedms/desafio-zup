@@ -44,10 +44,12 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 
 ## R6. Deploy e destroy da janela de medição
 
-- `make deploy EXPECTED_ACCOUNT_ID=<conta> CONFIRMO="CONFIRMO: deploy na conta desafio-zup" [TAG=1.0.4] [ARQ=amd64|arm64]`
-- O alvo faz, em ordem: pacotes das Lambdas → `apply -target=module.ecr` → `make imagens` (build + push; tag que já existe é pulada, porque as tags do ECR são imutáveis) → apply completo com a tag e a arquitetura das tasks (`ARQ=amd64` → X86_64; `arm64` → ARM64, que exige buildx com emulação ou máquina ARM).
-- Versão nova de código = `TAG` nova (ex.: 1.0.5).
-- **Encerrar:** `make destroy ... CONFIRMO="CONFIRMO: destroy na conta desafio-zup"`.
+- **Caminho padrão: a esteira.** Push na `main` → CI → deploy (tag `git-<sha12>`, imagens linux/amd64, tasks X86_64) → smoke. Destroy: `gh workflow run esteira.yml -f acao=destroy -f confirmacao="CONFIRMO: destroy na conta desafio-zup"` (só na `main`). Detalhes em `docs/operacao/infraestrutura.md`, seção 6.
+- **Caminho local** (mesmo state; o lock do S3 impede dois applies ao mesmo tempo, mas o próximo push na `main` volta as imagens para a tag do commit):
+  - `make deploy EXPECTED_ACCOUNT_ID=<conta> CONFIRMO="CONFIRMO: deploy na conta desafio-zup" [TAG=1.0.4] [ARQ=amd64|arm64]`
+  - O alvo faz, em ordem: pacotes das Lambdas → `apply -target=module.ecr` → `make imagens` (build + push; tag que já existe é pulada, porque as tags do ECR são imutáveis) → apply completo com a tag e a arquitetura das tasks (`ARQ=amd64` → X86_64; `arm64` → ARM64, que exige buildx com emulação ou máquina ARM).
+  - Versão nova de código = `TAG` nova (ex.: 1.0.5).
+  - **Encerrar:** `make destroy ... CONFIRMO="CONFIRMO: destroy na conta desafio-zup"`.
 
 ## R7. Reconciliação manual (fila humana `RM#`)
 

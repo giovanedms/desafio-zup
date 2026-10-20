@@ -51,13 +51,15 @@ relay/              outbox → EventBridge (Lambda na AWS, container local; mesm
 legado-mock/        simula o core legado (registros de tamanho fixo)
 libs/plataforma/    problem+json, contexto de observabilidade
 infra/local/        docker compose + bootstrap idempotente
-infra/terraform/    módulos + environment sandbox (sa-east-1)
-tests/              e2e (demo), load (k6), contract (compatibilidade de schemas)
+infra/terraform/    módulos + environments sandbox (a stack, sa-east-1) e esteira (OIDC, role de deploy, boundary)
+.github/workflows/  esteira: CI em todo push e PR; deploy, smoke e destroy do sandbox a partir da main
+tests/              e2e (demo, AWS), load (k6), contract (compatibilidade de schemas), integracao_bcs (os dois BCs reais juntos)
 docs/
   adr/              20 decisões (comece pelo README de lá)
   arquitetura/      documento com C4 L1/L2, sequência, eventos, implantação; Well-Architected
   dominio/          linguagem ubíqua
-  capacidade.md · compliance.md · operacao/runbooks.md · uso-de-ia.md · cobertura-requisitos.md
+  operacao/         runbooks; infraestrutura.md (inventário AWS, bootstrap, esteira, custo)
+  capacidade.md · compliance.md · uso-de-ia.md · cobertura-requisitos.md
 ```
 
 ## Para avaliar rapidamente
@@ -69,7 +71,11 @@ docs/
 
 ## AWS
 
-`make deploy EXPECTED_ACCOUNT_ID=<conta> CONFIRMO="CONFIRMO: deploy na conta desafio-zup" [TAG=1.0.4] [ARQ=amd64|arm64]` (pacotes das Lambdas, repositórios ECR, build e push das imagens e apply, nessa ordem; runbook R6).
+**Pela esteira** (`.github/workflows/esteira.yml`): todo push na `main` passa pelo CI e, verde, faz o deploy no sandbox por OIDC (sem chave de longa duração) e um smoke na AWS real. O destroy é manual (`workflow_dispatch`, `acao=destroy`, com a frase exata).
+
+**Local:** `make deploy EXPECTED_ACCOUNT_ID=<conta> CONFIRMO="CONFIRMO: deploy na conta desafio-zup" [TAG=1.0.4] [ARQ=amd64|arm64]` (pacotes das Lambdas, repositórios ECR, build e push das imagens e apply, nessa ordem; runbook R6).
+
+O que existe na conta (162 recursos do sandbox, ambiente `esteira`, bootstrap), configuração, custo e desvios: `docs/operacao/infraestrutura.md`.
 
 - O deploy exige a frase de confirmação e confere a conta.
 - O state fica em S3 com KMS.

@@ -51,7 +51,7 @@ flowchart TB
     WAF[AWS WAF] --> GW["API Gateway REST /v1<br/>Cognito · usage plans · validação · Gateway Responses RFC 9457"]
   end
   GW -->|VPC Link → NLB| AUT
-  subgraph ECS["ECS Fargate ARM64 (multi-AZ) · Service Connect"]
+  subgraph ECS["ECS Fargate (ARM64 na produção; X86_64 no sandbox) · multi-AZ · Service Connect"]
     AUT["autorizacao<br/>API pública, idempotência, decisão"]
     LIM["limites<br/>saldo por contrato (API interna)"]
     ACL["limites-acl<br/>consumidor do feed legado"]
@@ -128,15 +128,17 @@ Ver `docs/dominio/` (linguagem ubíqua e agregados) e o ADR-0002. Os agregados:
 ## 7. Implantação (sandbox AWS, `infra/terraform`)
 
 - **Região e conta:** sa-east-1, conta dedicada `desafio-zup` numa OU Sandbox com SCP de regiões.
-- **Rede:** VPC com 2 AZs. **Sandbox sem NAT**: subnets públicas sem ingress da internet, por custo; produção usa subnets privadas e endpoints.
+- **Rede:** VPC com 2 AZs. **Sandbox sem NAT**: subnets públicas sem ingress da internet, por custo, com VPC endpoints gateway para DynamoDB e S3; produção usa subnets privadas e endpoints de interface.
 - **Componentes:**
-  - ECS Fargate ARM64 com Service Connect;
+  - ECS Fargate com Service Connect: ARM64 é o alvo de produção (ADR-0004); o sandbox implantado pela esteira roda X86_64, porque o runner do GitHub é x86;
   - NLB interno + VPC Link;
   - DynamoDB on-demand com PITR;
   - EventBridge, SQS e Lambdas arm64;
   - Cognito, WAF;
   - CloudWatch: dashboard e alarmes.
-- **State:** S3 com KMS e lock nativo. **Deploy:** `make deploy` exige `CONFIRMO:` e confere o ID da conta.
+- **State:** S3 com KMS e lock nativo.
+- **Deploy:** pela esteira do GitHub Actions (OIDC, sem chave de longa duração) a cada push na `main`, ou `make deploy`, que exige `CONFIRMO:` e confere o ID da conta.
+- **Inventário completo** (162 recursos do sandbox, ambiente `esteira`, bootstrap da conta, custo e desvios): `docs/operacao/infraestrutura.md`.
 
 ## 8. Qualidade
 

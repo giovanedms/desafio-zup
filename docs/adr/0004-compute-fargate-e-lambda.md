@@ -23,6 +23,7 @@ Fatos (`01-pesquisa/02-aws-servicos-e-quotas.md`):
 ## Decisão
 
 - **`autorizacao` e `limites`: ECS Fargate, ARM64 (Graviton).**
+  - O sandbox implantado pela esteira roda X86_64 (`TF_VAR_arquitetura_cpu`): o runner do GitHub é x86, e o build ARM64 exigiria emulação. O ARM64 não foi medido (`docs/capacidade.md`).
   - Processo longo, sem cold start, pool de conexões HTTP/DynamoDB quente.
   - Custo previsível em carga sustentada.
   - Na frente: NLB interno com VPC Link (v1) a partir do API Gateway REST; east-west por ECS Service Connect (ADR-0012).

@@ -13,6 +13,7 @@ class RepositorioContabilEmMemoria:
         self._trava = Lock()  # o check-and-set da inbox precisa ser atômico (como a transação)
         self._inbox: set[str] = set()
         self._lancamentos: list[Lancamento] = []
+        self._ids: set[str] = set()  # o `pk` do lançamento no DynamoDB: também barra a duplicata
 
     @property
     def lancamentos(self) -> list[Lancamento]:
@@ -21,9 +22,10 @@ class RepositorioContabilEmMemoria:
 
     def registrar(self, lancamento: Lancamento, chave_da_inbox: str) -> bool:
         with self._trava:
-            if chave_da_inbox in self._inbox:
+            if chave_da_inbox in self._inbox or lancamento.id_lancamento in self._ids:
                 return False
             self._inbox.add(chave_da_inbox)
+            self._ids.add(lancamento.id_lancamento)
             self._lancamentos.append(lancamento)
             return True
 

@@ -4,6 +4,7 @@ root_packages =
     autorizacao
     limites
     contabilizacao
+    relay
 include_external_packages = True
 
 [importlinter:contract:autorizacao-layers]
@@ -74,3 +75,21 @@ forbidden_modules =
     botocore
     httpx
     uvicorn
+
+# Relay (Lambdas relay/sweeper/cdc-limites e o container local): entradas > adapters > núcleo.
+[importlinter:contract:relay-layers]
+name = relay: entradas > adapters > nucleo
+type = layers
+layers =
+    relay.local : relay.lambda_handler : relay.sweeper
+    relay.cdc_limites | relay.eventbridge | relay.outbox_dynamodb
+    relay.nucleo
+
+[importlinter:contract:relay-nucleo-puro]
+name = relay: nucleo sem AWS SDK
+type = forbidden
+source_modules =
+    relay.nucleo
+forbidden_modules =
+    boto3
+    botocore

@@ -17,7 +17,8 @@ from contabilizacao.domain.regras import EventoRecebido, LivroDeRegras
 
 class RepositorioContabil(Protocol):
     def registrar(self, lancamento: Lancamento, chave_da_inbox: str) -> bool:
-        """Grava inbox + lançamento atomicamente. False se a chave da inbox já existia (duplicata)."""
+        """Grava inbox + lançamento atomicamente. False se a chave da inbox ou o lançamento (id
+        determinístico) já existia: duplicata, inclusive replay do archive depois do TTL da inbox."""
         ...
 
 

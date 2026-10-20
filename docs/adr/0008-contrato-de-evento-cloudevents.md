@@ -32,7 +32,7 @@ Fatos (`01-pesquisa/03` e `02`):
 4. **Schemas como código** em `contracts/events/*.v1.schema.json` (JSON Schema draft-04, registrável no Schema Registry do EventBridge para descoberta), com exemplos.
 5. **Validação de verdade em três pontos:**
    - teste de contrato no produtor: todo evento gerado valida contra o schema (`autorizacao/tests/contract/test_cloudevents_contrato.py`);
-   - **gate de compatibilidade na CI**: dentro do major só entram campos opcionais novos (BACKWARD), comparando o schema do PR com o da `main`;
+   - **gate de compatibilidade na CI** (`scripts/compat_contratos.sh`, job `contratos`, do qual o deploy depende): roda em **PR** (contra a base do PR) **e em push** (contra o tip anterior do ref, `github.event.before`; branch nova compara com a `main`). Dentro do major só entram campos opcionais novos (BACKWARD). É quebra: campo novo em `required`, propriedade removida, `type` alterado, valor removido de `enum`, atributo CE fixo alterado e todo **aperto de restrição**, porque o schema novo passaria a recusar evento que a base aceitava: `additionalProperties` fechado, `pattern` ou `format` novo ou alterado, `minimum`/`exclusiveMinimum` subindo, `maximum`/`exclusiveMaximum` descendo, `multipleOf` novo ou mais grosso, `minLength` subindo, `maxLength` descendo. Os OpenAPI passam pelo `oasdiff breaking`. **Fail-closed:** na CI, base inexistente ou docker indisponível reprova (localmente, `make compat` só avisa);
    - consumidor tolerante: `additionalProperties: true`, ignora campo desconhecido.
 6. **Catálogo de eventos:**
 

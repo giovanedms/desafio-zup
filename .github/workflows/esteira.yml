@@ -83,7 +83,7 @@ jobs:
       - name: Testes de integração (LocalStack)
         run: make test-integracao
 
-  # Contract-first: lint e estrutura dos OpenAPI, exemplos de evento contra os schemas e, em PR, compatibilidade.
+  # Contract-first: lint e estrutura dos OpenAPI, exemplos de evento contra os schemas e compatibilidade com a base.
   contratos:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -116,9 +116,21 @@ jobs:
               erros += len(falhas)
           sys.exit(1 if erros else 0)
           PY
-      - name: Compatibilidade com a base do PR (ADR-0008)
-        if: github.event_name == 'pull_request'
-        run: scripts/compat_contratos.sh origin/${{ github.base_ref }}
+      # Roda em PR E em push: o deploy depende deste job, então quebra de contrato empurrada direto na main não
+      # chega ao sandbox. Base: PR → base do PR; push → `before` (o tip anterior do ref; SHA zero em branch nova,
+      # que o script troca por origin/main); dispatch → commit pai. Fail-closed: sem base ou sem docker, reprova.
+      - name: Compatibilidade com a base (ADR-0008)
+        env:
+          EVENTO: ${{ github.event_name }}
+          BASE_DO_PR: ${{ github.base_ref }}
+          ANTES: ${{ github.event.before }}
+        run: |
+          case "$EVENTO" in
+            pull_request) base="origin/$BASE_DO_PR" ;;
+            push) base="$ANTES" ;;
+            *) base="HEAD~1" ;;
+          esac
+          scripts/compat_contratos.sh "$base"
 
   # IaC: formato, validação dos dois ambientes e testes com mock_provider (nenhuma chamada à AWS).
   terraform:

@@ -1,0 +1,20 @@
+sequenceDiagram
+  autonumber
+  participant Canal
+  participant GW as API Gateway
+  participant AUT as autorizacao
+  participant DA as DDB autorizacoes
+  participant LIM as limites
+  participant DL as DDB limites
+  Canal->>GW: POST /v1/contratos/{id}/autorizacoes (Idempotency-Key, Bearer, x-api-key)
+  GW->>AUT: escopo ok, cota ok, X-Client-Id injetado
+  AUT->>DA: PutItem AUT#uuidv5(cliente, método, URI, chave) SE não existe (EM_PROCESSAMENTO, lease 10 s)
+  alt já existe (ReturnValuesOnConditionCheckFailure devolve a gravada)
+    AUT-->>Canal: replay (200/402 original) · 409 em andamento · 422 chave reutilizada
+  end
+  Note over AUT,DA: estorno/captura leem antes (GetItem) e validam a original
+  AUT->>LIM: RESERVAR (id_operacao = id_autorizacao)
+  LIM->>DL: UpdateItem SE disponivel ≥ v ∧ ATIVO ∧ ¬reservas.id ∧ ¬ops.id (ALL_NEW)
+  LIM-->>AUT: APLICADA (saldos exatos) | RECUSADA (motivo) | JA_APLICADA
+  AUT->>DA: TransactWriteItems [AUT → APROVADA/RECUSADA (SE dono do lease)#59; OUTBOX#evento]
+  AUT-->>Canal: 201 + saldo_reservado | 402 problem+json

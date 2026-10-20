@@ -1,0 +1,26 @@
+flowchart TB
+  subgraph Borda
+    WAF[AWS WAF] --> GW["API Gateway REST /v1<br/>Cognito · usage plans · validação · Gateway Responses RFC 9457"]
+  end
+  GW -->|VPC Link → NLB| AUT
+  subgraph ECS["ECS Fargate (ARM64 na produção; X86_64 no sandbox) · multi-AZ · Service Connect"]
+    AUT["autorizacao<br/>API pública, idempotência, decisão"]
+    LIM["limites<br/>saldo por contrato (API interna)"]
+    ACL["limites-acl<br/>consumidor do feed legado"]
+    REC["reconciliador<br/>órfãs (compensa / conclui) + expirador de reservas"]
+  end
+  AUT -->|"POST /interno/v1/.../operacoes<br/>timeout · retry com jitter · circuit breaker"| LIM
+  REC --> LIM
+  AUT --> DA[("DynamoDB autorizacoes<br/>+ autorizacoes-outbox")]
+  REC --> DA
+  LIM --> DL[("DynamoDB limites<br/>1 item por contrato")]
+  ACL --> DL
+  FILA_LEG[[SQS legado-contratos]] --> ACL
+  LEG[(Legado)] -.-> FILA_LEG
+  DA -- Stream do outbox --> RELAY["Lambda relay<br/>+ sweeper (agendado)"]
+  DL -- Stream (CDC LimiteAlterado) --> RELAYCDC["Lambda relay-cdc-limites"]
+  RELAY --> BUS{{"EventBridge bus financas<br/>regras por detail-type · archive"}}
+  RELAYCDC --> BUS
+  BUS --> Q1[[SQS contabilizacao + DLQ]] --> CTB["Lambda contabilizacao<br/>partidas dobradas + inbox"] --> DC[("DynamoDB lançamentos + inbox")]
+  BUS --> Q2[[SQS antifraude + DLQ]]
+  BUS --> Q3[[SQS notificacoes + DLQ]]

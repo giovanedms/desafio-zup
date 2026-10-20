@@ -42,6 +42,7 @@ flowchart LR
   LEG -.->|"feed de contratos e limites concedidos (ACL)"| PLAT
   PLAT -.->|"CloudEvents via EventBridge"| CONS
 ```
+Diagrama: [01-contexto.svg](diagramas/01-contexto.svg).
 
 ## 3. Containers (C4 nível 2)
 
@@ -73,6 +74,7 @@ flowchart TB
   BUS --> Q2[[SQS antifraude + DLQ]]
   BUS --> Q3[[SQS notificacoes + DLQ]]
 ```
+Diagrama: [02-containers.svg](diagramas/02-containers.svg).
 
 ## 4. Fluxo síncrono de uma autorização
 
@@ -95,9 +97,10 @@ sequenceDiagram
   AUT->>LIM: RESERVAR (id_operacao = id_autorizacao)
   LIM->>DL: UpdateItem SE disponivel ≥ v ∧ ATIVO ∧ ¬reservas.id ∧ ¬ops.id (ALL_NEW)
   LIM-->>AUT: APLICADA (saldos exatos) | RECUSADA (motivo) | JA_APLICADA
-  AUT->>DA: TransactWriteItems [AUT → APROVADA/RECUSADA (SE dono do lease); OUTBOX#evento]
+  AUT->>DA: TransactWriteItems [AUT → APROVADA/RECUSADA (SE dono do lease)#59; OUTBOX#evento]
   AUT-->>Canal: 201 + saldo_reservado | 402 problem+json
 ```
+Diagrama: [03-sequencia-autorizacao.svg](diagramas/03-sequencia-autorizacao.svg).
 
 **Pontos de falha e o que acontece:**
 
@@ -116,6 +119,7 @@ sequenceDiagram
 - **Formato:** CloudEvents 1.0 estruturado em `detail`, com o `id` estável para dedup e `versao_limite` para ordem por contrato.
 - **Contratos:** `contracts/events/` (JSON Schema + exemplos), verificados por teste no produtor e por gate de compatibilidade na CI.
 - **ADRs:** 0007, 0008, 0009.
+- **Diagrama:** [04-fluxo-de-eventos.svg](diagramas/04-fluxo-de-eventos.svg).
 
 ## 6. Domínio
 
@@ -136,6 +140,7 @@ Ver `docs/dominio/` (linguagem ubíqua e agregados) e o ADR-0002. Os agregados:
   - EventBridge, SQS e Lambdas arm64;
   - Cognito, WAF;
   - CloudWatch: dashboard e alarmes.
+- **Diagrama:** [05-implantacao-aws.svg](diagramas/05-implantacao-aws.svg).
 - **State:** S3 com KMS e lock nativo.
 - **Deploy:** pela esteira do GitHub Actions (OIDC, sem chave de longa duração) a cada push na `main`, ou `make deploy`, que exige `CONFIRMO:` e confere o ID da conta.
 - **Inventário completo** (162 recursos do sandbox, ambiente `esteira`, bootstrap da conta, custo e desvios): `docs/operacao/infraestrutura.md`.

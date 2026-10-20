@@ -1,0 +1,39 @@
+flowchart TB
+  subgraph ACC["Conta desafio-zup · sa-east-1"]
+    WAF[WAF] --> GW["API Gateway REST<br/>stage v1 · Cognito · usage plans"]
+    subgraph VPC["VPC 10.40.0.0/16 · subnets sa-east-1a e sa-east-1c"]
+      VPCL[VPC Link] --> NLB[NLB interno]
+      subgraph ECS["ECS cluster desafio · Service Connect"]
+        AUT[autorizacao]
+        LIMS["limites<br/>limites:8080"]
+        ACL[limites-acl]
+        REC[reconciliador]
+      end
+      EPD[/"VPC endpoint gateway<br/>DynamoDB"/]
+      EPS[/"VPC endpoint gateway<br/>S3"/]
+    end
+    GW --> VPCL
+    NLB --> AUT
+    AUT --> LIMS
+    REC --> LIMS
+    DDB[("DynamoDB<br/>5 tabelas")]
+    EB{{EventBridge}}
+    SQS[[SQS]]
+    LAM["Lambdas<br/>(fora da VPC)"]
+    ECR[ECR]
+    CW[CloudWatch]
+    AUT --> EPD
+    LIMS --> EPD
+    ACL --> EPD
+    REC --> EPD
+    EPD --> DDB
+    ECR -.->|camadas das imagens| EPS
+    DDB --> LAM
+    LAM --> EB
+    EB --> SQS
+    SQS --> LAM
+    SQS --> ACL
+    ECS -.-> CW
+    LAM -.-> CW
+    GW -.-> CW
+  end

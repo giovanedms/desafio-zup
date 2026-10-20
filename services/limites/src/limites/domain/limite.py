@@ -1,5 +1,8 @@
 """Agregado Limite: saldo de crédito de um contrato, com reservas ativas e guarda de idempotência.
 
+Responsabilidade única (SRP): este módulo muda quando muda a regra do saldo (invariantes, reservas,
+janela de deduplicação), não quando muda o banco, o protocolo HTTP ou o layout do legado.
+
 Invariantes (verificadas por `verificar_invariantes` e pelos testes property-based):
   I1  disponivel = concedido − utilizado − reservado
   I2  utilizado ≥ 0 e reservado ≥ 0

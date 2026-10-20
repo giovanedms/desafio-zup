@@ -2,8 +2,14 @@
 
 Uso (depois do `make deploy`):
     AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py contratos [N] [PREFIXO]   # legado → SQS → limites-acl
-    AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py borda       # 201, replay, 401, 429, problem+json
+    AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py borda       # 201, replay, 401, 422 (valor 0), 429 (rajada)
     AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py corrida     # 100 reservas paralelas no DynamoDB real
+
+`borda` sai com 1 se qualquer item divergir: 1ª autorização 201; replay 200 com corpo idêntico; sem token 401
+application/problem+json (gateway); `valor: 0` 422 application/problem+json com `codigo` VALIDACAO_DE_DOMINIO (o serviço
+é a autoridade do corpo, o gateway não o valida); rajada de 40 chamadas SIMULTÂNEAS pelo `canal-app` (plano-restrito:
+5 rps, burst 10) com ao menos um 429 application/problem+json com `Retry-After` (até 3 rajadas: o throttle do
+gateway é melhor-esforço).
 
 Segredos (client secrets do Cognito, API keys) vêm de `terraform output -json` e NUNCA são impressos.
 Local: o profile precisa ser explícito (o shell do operador exporta credenciais de OUTRA conta, que são removidas).
@@ -31,6 +37,8 @@ from limites.domain.legado import AtualizacaoDoLegado
 from limites.domain.limite import StatusContrato, TipoProduto
 
 AMBIENTE = "infra/terraform/environments/sandbox"
+PROBLEM_JSON = "application/problem+json"
+RAJADA = 40  # simultâneas no plano-restrito (5 rps, burst 10): bem acima do balde, o gateway estrangula com 429
 
 
 def ambiente_aws() -> dict[str, str]:
@@ -135,6 +143,38 @@ def autorizar(
     )
 
 
+def media_type(resposta: httpx.Response) -> str:
+    return str(resposta.headers.get("content-type", "")).split(";")[0].strip().lower()
+
+
+def eh_429_do_contrato(resposta: httpx.Response) -> bool:
+    """429 como o contrato declara (LimiteDeRequisicoes): problem+json e sempre com Retry-After."""
+    return (
+        resposta.status_code == 429
+        and media_type(resposta) == PROBLEM_JSON
+        and bool(resposta.headers.get("Retry-After", "").strip())
+    )
+
+
+def eh_422_do_servico(resposta: httpx.Response) -> bool:
+    """422 de validação vindo do SERVIÇO: o gateway, se validasse o corpo, responderia 400 REQUISICAO_MAL_FORMADA."""
+    if resposta.status_code != 422 or media_type(resposta) != PROBLEM_JSON:
+        return False
+    try:
+        corpo = resposta.json()
+    except ValueError:
+        return False
+    return isinstance(corpo, dict) and corpo.get("codigo") == "VALIDACAO_DE_DOMINIO"
+
+
+def rajada(
+    http: httpx.Client, s: dict[str, Any], hdr: dict[str, str], contrato: str, corpo: dict[str, Any]
+) -> list[httpx.Response]:
+    """RAJADA chamadas ao mesmo tempo, cada uma com chave nova (sequenciais ficariam abaixo do balde)."""
+    with ThreadPoolExecutor(max_workers=RAJADA) as pool:
+        return list(pool.map(lambda _: autorizar(http, s, hdr, contrato, corpo), range(RAJADA)))
+
+
 def esperar_contrato(contrato: str) -> None:
     tabela = sessao().client("dynamodb")
     for _ in range(60):
@@ -168,15 +208,28 @@ def borda() -> None:
         print(
             f"sem token: {sem_token.status_code}  {sem_token.headers.get('content-type')}  {sem_token.text[:120]}"
         )
-        restrito = cabecalhos(s, "canal-app", token(s, "canal-app"))
-        status = Counter(
-            autorizar(http, s, restrito, contrato, {**corpo, "valor": 0.01}).status_code
-            for _ in range(30)
-        )
-        ultimo = autorizar(http, s, restrito, contrato, {**corpo, "valor": 0.01})
+        valor_zero = autorizar(http, s, hdr, contrato, {**corpo, "valor": 0})
         print(
-            f"plano restrito (30 rápidas): {dict(status)}  último: {ultimo.status_code} "
-            f"{ultimo.headers.get('content-type')} Retry-After={ultimo.headers.get('Retry-After')}"
+            f"valor 0: {valor_zero.status_code}  {valor_zero.headers.get('content-type')}  "
+            f"{valor_zero.text[:120]}"
+        )
+        restrito = cabecalhos(s, "canal-app", token(s, "canal-app"))
+        # O throttle do gateway é melhor-esforço: até 3 rajadas antes de dar falha.
+        respostas: list[httpx.Response] = []
+        for _ in range(3):
+            respostas += rajada(http, s, restrito, contrato, {**corpo, "valor": 0.01})
+            if any(eh_429_do_contrato(r) for r in respostas):
+                break
+        estrangulada = next((r for r in respostas if eh_429_do_contrato(r)), None)
+        print(
+            f"plano restrito ({len(respostas)} em rajadas de {RAJADA}): "
+            f"{dict(Counter(r.status_code for r in respostas))}  "
+            f"429 conforme: {sum(eh_429_do_contrato(r) for r in respostas)}"
+            + (
+                f"  ex.: Retry-After={estrangulada.headers['Retry-After']} {estrangulada.text[:120]}"
+                if estrangulada
+                else ""
+            )
         )
     falhas = [
         o_que
@@ -190,6 +243,14 @@ def borda() -> None:
                 sem_token.status_code == 401
                 and sem_token.headers.get("content-type") == "application/problem+json",
                 "sem token deveria ser 401 application/problem+json (gateway response)",
+            ),
+            (
+                eh_422_do_servico(valor_zero),
+                "valor 0 deveria ser 422 application/problem+json VALIDACAO_DE_DOMINIO (do serviço)",
+            ),
+            (
+                estrangulada is not None,
+                f"rajada de {RAJADA} no plano-restrito deveria ter 429 application/problem+json com Retry-After",
             ),
         ]
         if not ok

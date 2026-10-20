@@ -16,6 +16,8 @@ O enunciado dá o endpoint, os campos, a tabela de status (201/200/402/409/422/4
 - O contrato (`contracts/openapi/`) é a fonte da verdade: o código e o gateway seguem o contrato, e não o contrário.
 - **Por que 3.0.3 e não 3.1/3.2:** o API Gateway REST importa 2.0/3.0, não 3.1.
 - **CI:** Spectral (lint) + `openapi-spec-validator` (estrutura) + **oasdiff** (breaking change contra a `main`).
+- **Código ≡ contrato:** `services/autorizacao/tests/contract/test_api_bate_com_o_contrato.py` sobe o app com dublês e confere cada desfecho (201, 200, 400, 401, 402, 404, 409, 415, 422, 500, 503 e o GET) contra a resposta declarada para aquele status: media type, corpo no schema (jsonschema, Draft 4), nenhum membro fora do contrato e `codigo`/`type`/`status` iguais ao catálogo. Os desfechos só da borda (403, 429, 504) não passam pelo serviço; na AWS, o smoke `tests/e2e/aws.py borda` confere o 401 e o 429 da borda e o 422 do serviço (`valor: 0`).
+- O serviço não publica a spec que o FastAPI gera (`/openapi.json`, `/docs`, `/redoc` desligados): ela divergia do contrato.
 
 ### 2. Status
 
@@ -28,11 +30,12 @@ O enunciado dá o endpoint, os campos, a tabela de status (201/200/402/409/422/4
 | Mesma chave em processamento | 409 `requisicao-em-andamento` |
 | Estado mudou (estorno de estornada/expirada) | 409 `conflito-de-estado` |
 | **Não existe 409 de contenção** | reservas no mesmo contrato são serializadas pelo banco (ADR-0005) |
-| Sintaxe inválida | 400 (JSON malformado, `Idempotency-Key` ausente/inválida) |
-| Regra de domínio | 422 |
+| Sintaxe inválida | 400 (corpo que não é JSON, `Idempotency-Key` ausente/inválida) |
+| Corpo fora do schema ou regra de domínio | 422 (inclui campo desconhecido, tipo errado, obrigatório ausente, valor ≤ 0, `metadata` fora da allowlist) |
 | Contrato inexistente | 404 |
 | Content-Type errado | 415 |
-| Gateway | 401/403/429/504 |
+| Gateway | 400 (header obrigatório ausente), 401/403/429/504 |
+| Rate limit | 429 só na borda (usage plan e WAF); o serviço não emite 429 |
 | Falha inesperada | 500 |
 | Fail-fast (circuit breaker / load shedding) | 503 + `Retry-After` |
 
@@ -45,7 +48,7 @@ O enunciado dá o endpoint, os campos, a tabela de status (201/200/402/409/422/4
 - `correlation_id`;
 - `trace_id`;
 - `erros[]` em validação;
-- `id_autorizacao` na recusa.
+- `id_autorizacao` e `limite_disponivel` na recusa por limite (402).
 
 Catálogo: `contracts/problem-types/catalogo.md`.
 
@@ -64,6 +67,7 @@ Catálogo: `contracts/problem-types/catalogo.md`.
 ### 5. Campos e regras do enunciado
 
 - `id_contrato` aceito no corpo, como diz a tabela; se for diferente do path → 422.
+- `id_conta` é **declarado pelo chamador**: o serviço valida o formato, grava e propaga nos eventos, mas **não o confere** contra a conta do contrato. A autoridade da decisão é o par contrato (path) + réplica do core. Conferir custaria uma leitura a mais no caminho quente, ou o contrato interno do `limites` passar a devolver a conta.
 - `moeda`: ISO 4217, e só BRL na v1.
 - `metadata` com **allowlist** (`canal`, `id_rastreio_canal`, `geo.uf`, `geo.municipio_ibge`), sem dado pessoal.
 - `id_autorizacao_original` obrigatório em ESTORNO. É campo **aditivo**: o enunciado não dá como referenciar a transação estornada.
@@ -81,7 +85,8 @@ Catálogo: `contracts/problem-types/catalogo.md`.
 
 - **Positivas:** o contrato é verificável por máquina, as nuances estão documentadas e os erros são uniformes.
 - **Negativas:**
-  - Três validadores com regras ligeiramente diferentes: gateway (draft-4 parcial), Schemathesis/jsonschema e o serviço. **A autoridade é o serviço.**
+  - **A autoridade do corpo é o serviço.** O gateway não valida o corpo (`validateRequestBody = false`; só a presença dos parâmetros obrigatórios): o validador draft-4 parcial dele respondia 400 onde o contrato promete 422, e o comportamento local divergia da AWS. O preço é o pedido inválido chegar ao serviço; ele é barrado ali antes de qualquer escrita.
+  - O 400 de `Idempotency-Key` ausente muda de `codigo` conforme a camada: `REQUISICAO_MAL_FORMADA` no gateway, `IDEMPOTENCY_KEY_INVALIDA` no serviço (local). O status é o mesmo.
   - O 402 é heterodoxo.
 
 ## Quando esta decisão deixa de ser boa

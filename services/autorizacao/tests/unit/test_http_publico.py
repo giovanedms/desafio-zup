@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -24,6 +25,7 @@ from autorizacao.application.portas import (
 )
 from autorizacao.domain.eventos import SaldosDoLimite
 from fastapi.testclient import TestClient
+from plataforma.observabilidade import gateway_request_id_atual
 
 CTR = "CTR-1"
 URL = f"/v1/contratos/{CTR}/autorizacoes"
@@ -485,3 +487,58 @@ def test_erro_inesperado_vira_500_sem_vazar_detalhe(limites: LimitesFalso) -> No
     assert resposta.status_code == 500
     assert resposta.json()["codigo"] == "ERRO_INTERNO"
     assert "segredo" not in resposta.text
+
+
+@pytest.mark.parametrize("caminho", ["/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect"])
+def test_spec_gerada_pelo_fastapi_nao_e_publicada(cliente: TestClient, caminho: str) -> None:
+    """O contrato é contracts/openapi/autorizacao-v1.yaml; a spec gerada divergia dele."""
+    assert cliente.get(caminho).status_code == 404
+
+
+GATEWAY_REQUEST_ID = "c6af9ac6-7b61-11e6-9a41-93e8deadbeef"
+
+
+def test_gateway_request_id_chega_ao_contexto_e_ao_log_da_requisicao(
+    limites: LimitesFalso, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Junção borda × serviço: o `$context.requestId` do gateway vai para o log e para os adapters."""
+    vistos: list[str | None] = []
+
+    def explode(*_: object) -> ResultadoNoLimite:
+        vistos.append(gateway_request_id_atual.get())  # adapter de saída enxerga o contexto
+        raise RuntimeError("falha no meio da requisição")
+
+    limites.aplicar = explode  # type: ignore[method-assign]
+    cliente = _cliente(limites)
+
+    with caplog.at_level(logging.ERROR, logger="autorizacao.adapters.inbound.http"):
+        resposta = cliente.post(
+            URL,
+            content=_corpo(),
+            headers=_cabecalhos(**{"X-Gateway-Request-Id": GATEWAY_REQUEST_ID}),
+        )
+
+    assert resposta.status_code == 500
+    assert vistos == [GATEWAY_REQUEST_ID]
+    (registro,) = [r for r in caplog.records if r.getMessage() == "erro inesperado"]
+    assert registro.__dict__["gateway_request_id"] == GATEWAY_REQUEST_ID
+    assert registro.__dict__["correlation_id"] == resposta.headers["x-correlation-id"]
+    assert gateway_request_id_atual.get() is None  # o contexto não vaza para fora da requisição
+
+
+@pytest.mark.parametrize("valor", ["lixo\r\nforjado", "x" * 65, ""])
+def test_gateway_request_id_fora_do_formato_e_ignorado(
+    limites: LimitesFalso, caplog: pytest.LogCaptureFixture, valor: str
+) -> None:
+    def explode(*_: object) -> ResultadoNoLimite:
+        raise RuntimeError("falha")
+
+    limites.aplicar = explode  # type: ignore[method-assign]
+    cliente = _cliente(limites)
+
+    with caplog.at_level(logging.ERROR, logger="autorizacao.adapters.inbound.http"):
+        cliente.post(URL, content=_corpo(), headers=_cabecalhos(**{"X-Gateway-Request-Id": valor}))
+
+    (registro,) = [r for r in caplog.records if r.getMessage() == "erro inesperado"]
+    assert "gateway_request_id" not in registro.__dict__
+    assert registro.__dict__["correlation_id"]

@@ -249,7 +249,13 @@ def _problema(
 
 
 def criar_app(aplicar: AplicarOperacaoNoLimite, consultar: ConsultarLimite) -> FastAPI:
-    app = FastAPI(title="API interna de Limites", version="1.0.0")
+    app = FastAPI(
+        title="API interna de Limites",
+        version="1.0.0",
+        openapi_url=None,  # o contrato é contracts/openapi/limites-interno-v1.yaml, não a spec gerada
+        docs_url=None,
+        redoc_url=None,
+    )
 
     @app.middleware("http")
     async def contexto_da_requisicao(

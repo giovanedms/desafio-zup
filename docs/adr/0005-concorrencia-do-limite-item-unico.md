@@ -82,7 +82,7 @@ Fatos que restringem a escolha (fontes em `01-pesquisa/02-aws-servicos-e-quotas.
 
 | Opção | Por que não agora |
 |---|---|
-| 1. Lock otimista com `TransactWriteItems` | Cancela sob contenção (409 em cascata). Não devolve o saldo. Comportamento diferente entre Local e AWS. A solução pública mais madura deste mesmo desafio mediu 2 aprovações em 20 onde cabiam 5 com essa abordagem |
+| 1. Lock otimista com `TransactWriteItems` | Cancela sob contenção (409 em cascata): numa rajada no mesmo contrato, quem perde o conflito é recusado mesmo havendo saldo, e o contrato aprova menos do que o limite comporta. Não devolve o saldo. Comportamento diferente entre Local e AWS |
 | 3. Aurora PostgreSQL | O lock de linha resolve, mas traz pool de conexões, failover mais lento que o DynamoDB e custo fixo. O ganho só existe se houver necessidade relacional, e o acesso aqui é por chave |
 | 4. Aurora DSQL | OCC também aborta no commit sob contenção (`40001`). Em sa-east-1 é só single-Region. Taxa de conexão de 100/s não ajustável |
 | 5. Fila por contrato | Garante ordem e elimina contenção, mas transforma a autorização síncrona em assíncrona, o que quebra o contrato da API |

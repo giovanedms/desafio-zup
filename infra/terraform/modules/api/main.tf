@@ -15,7 +15,7 @@ locals {
           cognito = [metodo == "get" ? local.escopo_read : local.escopo_write]
           api_key = []
         }]
-        "x-amazon-apigateway-request-validator" = "completo"
+        "x-amazon-apigateway-request-validator" = "parametros"
         "x-amazon-apigateway-integration" = {
           type                = "http_proxy"
           httpMethod          = upper(metodo)
@@ -25,8 +25,16 @@ locals {
           passthroughBehavior = "when_no_match"
           timeoutInMillis     = 29000
           # O serviço confia no client_id que o gateway extrai do token (sobrescreve qualquer X-Client-Id do cliente).
+          # X-Gateway-Request-Id = $context.requestId: a chave de junção entre a linha do access log da borda e a do
+          # serviço; é também o correlation_id das gateway responses. Sobrescreve qualquer valor vindo de fora. A AWS
+          # avisa que o cliente pode sobrescrever o requestId: o access log grava também o extendedRequestId (único,
+          # gerado pelo gateway) para desempatar.
+          # https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-mapping-template-reference.html
           requestParameters = merge(
-            { "integration.request.header.X-Client-Id" = "context.authorizer.claims.client_id" },
+            {
+              "integration.request.header.X-Client-Id"          = "context.authorizer.claims.client_id"
+              "integration.request.header.X-Gateway-Request-Id" = "context.requestId"
+            },
             { for p in [for g in regexall("\\{([^}]+)\\}", caminho) : g[0]] : "integration.request.path.${p}" => "method.request.path.${p}" },
           )
         }
@@ -56,8 +64,11 @@ locals {
         }
       }
     })
+    # Só parâmetros (o header obrigatório Idempotency-Key continua barrado na borda). O CORPO não é validado aqui:
+    # o importador usa JSON Schema draft-4 parcial e respondia 400 onde o contrato promete 422 (tipo errado, campo
+    # desconhecido, valor <= 0). A autoridade do corpo é o serviço (ADR-0011), igual no local e na AWS.
     "x-amazon-apigateway-request-validators" = {
-      completo = { validateRequestBody = true, validateRequestParameters = true }
+      parametros = { validateRequestBody = false, validateRequestParameters = true }
     }
     # Gateway Responses DENTRO do body importado. Como resources separados elas eram apagadas a cada
     # reimportação do contrato (PutRestApi em modo overwrite) e o state não percebia (achado no deploy 1.0.1).
@@ -65,17 +76,25 @@ locals {
   })
 
   # Gateway Responses em application/problem+json (RFC 9457); slugs e códigos iguais ao catálogo.
-  # DEFAULT_4XX/DEFAULT_5XX fixam o status (400/500) para o corpo não divergir do HTTP real.
+  # DEFAULT_4XX/DEFAULT_5XX fixam o status (400/500) para o corpo não divergir do HTTP real. EFEITO COLATERAL documentado
+  # pela AWS: mudar o status do DEFAULT_4XX muda o de TODO 4XX sem resposta própria. Por isso os 403 que chegam ao
+  # cliente têm entrada explícita: WAF_FILTERED (regra gerenciada do WAF bloqueou; sem isto saía 400 "mal formada"),
+  # INVALID_API_KEY e MISSING_AUTHENTICATION_TOKEN. O 429 das regras rate-based NÃO passa por aqui: o custom response
+  # do WAF tem precedência sobre as gateway responses.
+  # https://docs.aws.amazon.com/apigateway/latest/developerguide/supported-gateway-response-types.html
   respostas = {
-    UNAUTHORIZED           = { status = 401, slug = "nao-autenticado", codigo = "NAO_AUTENTICADO", titulo = "Não autenticado", retry_after = null }
-    ACCESS_DENIED          = { status = 403, slug = "sem-permissao", codigo = "SEM_PERMISSAO", titulo = "Sem permissão", retry_after = null }
-    THROTTLED              = { status = 429, slug = "limite-de-requisicoes", codigo = "LIMITE_DE_REQUISICOES", titulo = "Limite de requisições excedido", retry_after = "1" }
-    QUOTA_EXCEEDED         = { status = 429, slug = "limite-de-requisicoes", codigo = "LIMITE_DE_REQUISICOES", titulo = "Cota do plano excedida", retry_after = "3600" }
-    BAD_REQUEST_BODY       = { status = 400, slug = "requisicao-mal-formada", codigo = "REQUISICAO_MAL_FORMADA", titulo = "Requisição mal formada", retry_after = null }
-    BAD_REQUEST_PARAMETERS = { status = 400, slug = "requisicao-mal-formada", codigo = "REQUISICAO_MAL_FORMADA", titulo = "Requisição mal formada", retry_after = null }
-    INTEGRATION_TIMEOUT    = { status = 504, slug = "tempo-esgotado", codigo = "TEMPO_ESGOTADO", titulo = "Tempo esgotado", retry_after = null }
-    DEFAULT_4XX            = { status = 400, slug = "requisicao-mal-formada", codigo = "REQUISICAO_MAL_FORMADA", titulo = "Requisição mal formada", retry_after = null }
-    DEFAULT_5XX            = { status = 500, slug = "erro-interno", codigo = "ERRO_INTERNO", titulo = "Erro interno", retry_after = null }
+    UNAUTHORIZED                 = { status = 401, slug = "nao-autenticado", codigo = "NAO_AUTENTICADO", titulo = "Não autenticado", retry_after = null }
+    ACCESS_DENIED                = { status = 403, slug = "sem-permissao", codigo = "SEM_PERMISSAO", titulo = "Sem permissão", retry_after = null }
+    WAF_FILTERED                 = { status = 403, slug = "sem-permissao", codigo = "SEM_PERMISSAO", titulo = "Requisição bloqueada pela proteção da borda", retry_after = null }
+    INVALID_API_KEY              = { status = 403, slug = "sem-permissao", codigo = "SEM_PERMISSAO", titulo = "API key inválida", retry_after = null }
+    MISSING_AUTHENTICATION_TOKEN = { status = 403, slug = "sem-permissao", codigo = "SEM_PERMISSAO", titulo = "Sem permissão", retry_after = null }
+    THROTTLED                    = { status = 429, slug = "limite-de-requisicoes", codigo = "LIMITE_DE_REQUISICOES", titulo = "Limite de requisições excedido", retry_after = "1" }
+    QUOTA_EXCEEDED               = { status = 429, slug = "limite-de-requisicoes", codigo = "LIMITE_DE_REQUISICOES", titulo = "Cota do plano excedida", retry_after = "3600" }
+    BAD_REQUEST_BODY             = { status = 400, slug = "requisicao-mal-formada", codigo = "REQUISICAO_MAL_FORMADA", titulo = "Requisição mal formada", retry_after = null }
+    BAD_REQUEST_PARAMETERS       = { status = 400, slug = "requisicao-mal-formada", codigo = "REQUISICAO_MAL_FORMADA", titulo = "Requisição mal formada", retry_after = null }
+    INTEGRATION_TIMEOUT          = { status = 504, slug = "tempo-esgotado", codigo = "TEMPO_ESGOTADO", titulo = "Tempo esgotado", retry_after = null }
+    DEFAULT_4XX                  = { status = 400, slug = "requisicao-mal-formada", codigo = "REQUISICAO_MAL_FORMADA", titulo = "Requisição mal formada", retry_after = null }
+    DEFAULT_5XX                  = { status = 500, slug = "erro-interno", codigo = "ERRO_INTERNO", titulo = "Erro interno", retry_after = null }
   }
 
   # Verificado na AWS (20/10/2026): com a chave "application/json" o gateway respondia Content-Type
@@ -289,6 +308,7 @@ resource "aws_api_gateway_stage" "this" {
     destination_arn = aws_cloudwatch_log_group.acesso.arn
     format = jsonencode({
       requestId          = "$context.requestId"
+      extendedRequestId  = "$context.extendedRequestId"
       ip                 = "$context.identity.sourceIp"
       requestTime        = "$context.requestTime"
       httpMethod         = "$context.httpMethod"
@@ -366,7 +386,34 @@ resource "aws_api_gateway_usage_plan_key" "canal" {
 
 # ------------------------------------------------------------------ WAF
 
-# WAFv2 regional: rate limit por IP + regras comuns gerenciadas.
+locals {
+  # Corpo do 429 do WAF no formato do catálogo (contracts/problem-types/catalogo.md). Limitações do WAF, não escolha:
+  # o corpo é estático (sem $context.requestId, então sem correlation_id) e o Content-Type sai application/json
+  # (o WAF só aceita TEXT_PLAIN, TEXT_HTML e APPLICATION_JSON e proíbe sobrescrever content-type por header).
+  # Os membros são os da RFC 9457: um cliente de problem+json lê igual.
+  corpo_429_waf = jsonencode({
+    type   = "https://financas.example/problemas/limite-de-requisicoes"
+    title  = "Limite de requisições excedido"
+    status = 429
+    codigo = "LIMITE_DE_REQUISICOES"
+    detail = "Taxa acima do teto de proteção da borda. Repetir depois do Retry-After."
+  })
+
+  # As duas regras rate-based bloqueiam com o mesmo 429. Retry-After de 60 s: o WAF estima a taxa numa janela de
+  # 5 min com peso maior no recente e costuma levar até ~30 s para notar a queda e soltar o bloqueio.
+  regras_de_taxa = {
+    # Teto por consumidor (valor do x-api-key). O usage plan continua sendo o controle por plano (best-effort);
+    # esta regra é a barreira dura acima dele: requisição sem o header não conta aqui (custom key ausente).
+    "limite-por-consumidor" = { prioridade = 1, limite = var.waf_limite_por_consumidor, por_ip = false }
+    # Teto por IP, alto: pega o tráfego sem x-api-key e quem gira chaves falsas a partir de um IP.
+    "limite-por-ip" = { prioridade = 2, limite = var.waf_limite_por_ip, por_ip = true }
+  }
+}
+
+# WAFv2 regional: teto por consumidor e por IP (429 com corpo do catálogo e Retry-After, pelo custom response do WAF) +
+# regras comuns gerenciadas. O bloqueio de regra gerenciada não tem custom response: sai pela gateway response
+# WAF_FILTERED (403 problem+json, acima). O custom response do WAF tem precedência sobre as gateway responses:
+# https://docs.aws.amazon.com/waf/latest/developerguide/customizing-the-response-for-blocked-requests.html
 resource "aws_wafv2_web_acl" "this" {
   #checkov:skip=CKV2_AWS_31:Logging do WAF (Firehose/S3) fica fora do sandbox por custo; produção habilita.
   #checkov:skip=CKV_AWS_192:Conjunto de regras fixado em rate limit + CommonRuleSet pelo escopo do desafio; produção adiciona KnownBadInputs (Log4j).
@@ -377,32 +424,67 @@ resource "aws_wafv2_web_acl" "this" {
     allow {}
   }
 
-  rule {
-    name     = "limite-por-ip"
-    priority = 1
+  custom_response_body {
+    key          = "limite-de-requisicoes"
+    content      = local.corpo_429_waf
+    content_type = "APPLICATION_JSON"
+  }
 
-    action {
-      block {}
-    }
+  dynamic "rule" {
+    for_each = local.regras_de_taxa
 
-    statement {
-      rate_based_statement {
-        limit                 = var.waf_limite_por_ip
-        aggregate_key_type    = "IP"
-        evaluation_window_sec = 300
+    content {
+      name     = rule.key
+      priority = rule.value.prioridade
+
+      action {
+        block {
+          custom_response {
+            response_code            = 429
+            custom_response_body_key = "limite-de-requisicoes"
+
+            response_header {
+              name  = "Retry-After"
+              value = "60"
+            }
+          }
+        }
       }
-    }
 
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "limite-por-ip"
-      sampled_requests_enabled   = true
+      statement {
+        rate_based_statement {
+          limit                 = rule.value.limite
+          aggregate_key_type    = rule.value.por_ip ? "IP" : "CUSTOM_KEYS"
+          evaluation_window_sec = 300
+
+          dynamic "custom_key" {
+            for_each = rule.value.por_ip ? [] : ["x-api-key"]
+
+            content {
+              header {
+                name = custom_key.value
+
+                text_transformation {
+                  priority = 0
+                  type     = "NONE"
+                }
+              }
+            }
+          }
+        }
+      }
+
+      visibility_config {
+        cloudwatch_metrics_enabled = true
+        metric_name                = rule.key
+        sampled_requests_enabled   = true
+      }
     }
   }
 
   rule {
     name     = "aws-common"
-    priority = 2
+    priority = 3
 
     override_action {
       none {}

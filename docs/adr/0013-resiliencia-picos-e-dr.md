@@ -25,10 +25,10 @@ Os picos podem ser previsíveis (início de mês, datas de pagamento) ou imprevi
 
 ### Picos
 
-- **Previsíveis** (**desenhado, não implementado**: o Terraform só tem target tracking de CPU e nenhum `warm_throughput`; na medição, o target tracking pediu tasks ~6 min depois do início da sobrecarga, `docs/capacidade.md` seção 3):
-  - *scheduled scaling* das tasks antes da janela;
-  - predictive scaling (existe em sa-east-1);
-  - **warm throughput** do DynamoDB a 2× o pico esperado.
+- **Previsíveis** (na medição, o target tracking pediu tasks ~6 min depois do início da sobrecarga, `docs/capacidade.md` seção 3):
+  - ***scheduled scaling* das tasks antes da janela: implementado.** `var.janelas_de_pico` (módulo `ecs_servico`) sobe o mínimo no início e o devolve no fim, no fuso de Brasília. O sandbox aplica o exemplo do dia 1 de cada mês, 06:30–12:00, mínimo de 4 tasks em `autorizacao` e `limites` (base 2). Um apply dentro da janela devolve o mínimo de base (runbook R3);
+  - **warm throughput do DynamoDB a 2× o pico: implementado, desligado no sandbox.** `var.warm_throughput` (módulo `dados`) por tabela e por GSI. Fica desligado porque aumentar é cobrado e **não pode ser reduzido depois**. Valores de produção, das escritas medidas por autorização: `limites` 11.000 escritas/s, `autorizacoes` 31.000 e o `gsi_orfas` 20.000, `autorizacoes-outbox` 61.000. Este último passa da quota padrão de 40.000 WRU/s por tabela: pedir a quota antes, ou eliminar o outbox (alavanca 1 de `docs/capacidade.md`);
+  - predictive scaling (existe em sa-east-1): **só desenhado**, porque precisa de histórico de carga.
 - **Imprevisíveis:**
   - mínimo de tasks a 60% de utilização no pico esperado, ou seja, **1,6× de folga** para atravessar os ~109 s do reativo;
   - acima disso, load shedding e WAF;
@@ -67,4 +67,5 @@ Os picos podem ser previsíveis (início de mês, datas de pagamento) ou imprevi
 - AWS Builders' Library — Timeouts, retries and backoff with jitter: https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
 - AWS Builders' Library — Using load shedding to avoid overload: https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/
 - DynamoDB warm throughput: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/warm-throughput.html
+- Application Auto Scaling, scheduled scaling: https://docs.aws.amazon.com/autoscaling/application/userguide/application-auto-scaling-scheduled-scaling.html
 - Global tables (consistência): https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables_HowItWorks.html

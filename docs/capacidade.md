@@ -8,10 +8,58 @@
 | Requisições em voo no pico | Lei de Little: 5.000 TPS × ~50 ms | ~250 |
 | Escritas por autorização | **Medido na AWS** (seção 3): `limites` 1,09 + `autorizacoes` 3,06 + `autorizacoes-outbox` 6,12 + contabilização 2,14 + 2,14 | **~14,6 WRU** (a estimativa inicial, ~6–8, esquecia o outbox e a contabilização) |
 | WRU no pico | 5.000 × 14,6 | ~73 k WRU/s somando as 5 tabelas; a maior é o outbox, ~31 k/s (abaixo dos 40 k por tabela da quota padrão) |
-| Eventos no pico | ~5.000 autorizações + ~500 recusas | ~5,5 k PutEvents/s (quota aprovada: **6.000**) |
-| Invocations no pico | 5,5 k × 3 regras | ~16,5 k/s (quota aprovada: **20.000**) |
+| Eventos no pico | Depende do mix: captura publica **2** eventos (seção 1.1) | 5,5 k a **10,5 k** entradas de PutEvents/s (quota aprovada: **6.000**; estoura com mais de 10% de capturas) |
+| Invocations no pico | Regras casadas por evento (seção 1.1) | 16 k a **21 k**/s (quota aprovada: **20.000**; estoura com mais de 80% de capturas) |
 | Teto por contrato | 1.000 WCU/s por partição, com a guarda de 5 min no item (o custo por escrita cresce com a taxa) | ~8 op/s sustentadas (conta no ADR-0016) |
+| Teto por chave dos GSIs esparsos | 2 escritas no `gsi_orfas` por autorização, divididas por N shards; sort key monotônica (seção 1.2) | N = 10: **~1.000 WCU/s por chave, 100% do teto**. N = 64 (padrão agora): ~156 |
+| Item do limite com reservas | Holds de até 7 dias moram no item; ~45 bytes cada (seção 1.3) | ~9.000 reservas ativas = 400 KB (teto do item) |
 | API Gateway | 10.000 RPS / burst 5.000 por conta e região | O pico usa ~50% |
+
+### 1.1 Barramento: eventos e invocations por chamada
+
+O relay publica **um item de outbox = uma entrada de PutEvents**. Cada entrada vira uma invocation por regra que casa (`modules/eventos/variables.tf`):
+
+| Fluxo (uma chamada da API) | Eventos publicados | Regras casadas (invocations) |
+|---|---|---|
+| DEBITO, CREDITO ou RESERVA aprovados | 1 (`TransacaoAutorizada`) | 3 (contabilização, antifraude, notificações) |
+| Recusa (qualquer tipo) | 1 (`TransacaoRecusada`) | 2 (antifraude, notificações) |
+| **Captura** de reserva | **2** (`TransacaoAutorizada` + `ReservaCapturada`, na mesma transação) | **4** (3 + contabilização) |
+| Estorno | 1 (`TransacaoEstornada`) | 2 (contabilização, notificações) |
+| Expiração de reserva (assíncrona, sem chamada) | 1 (`ReservaExpirada`) | 1 (contabilização) |
+| Compensação, reconciliação manual | 1 | 0 (só archive) |
+
+No pico de 5.000 aprovações/s + ~500 recusas/s:
+
+| Mix | Entradas de PutEvents/s | Invocations/s |
+|---|---|---|
+| Só DEBITO (a conta antiga) | 5.500 | 16.000 |
+| Cartão: metade reserva, metade captura | 8.000 | 18.500 |
+| **Pior caso: toda aprovação é captura** (reservas feitas antes do pico) | **10.500** | **21.000** |
+
+**As quotas aprovadas não bastam.** Com uma fração *f* das aprovações sendo captura, são 5.500 + 5.000·*f* entradas/s e 16.000 + 5.000·*f* invocations/s: PutEvents 6.000 estoura a partir de *f* = 10%; Invocations 20.000 aguenta o mix de cartão usando 92% da quota e estoura a partir de *f* = 80%. **Pedir: PutEvents 12.000/s e Invocations 25.000/s** (pior caso + ~15–20%). A tabela de quotas da AWS fala em requisições de PutEvents por segundo e não diz se uma requisição de 10 entradas (o lote do relay) conta 1 ou 10: a conta acima usa a leitura conservadora (entradas). O fan-out por SNS cortaria as invocations (ADR-0009), com outros custos.
+
+### 1.2 GSIs esparsos: a conta por chave de partição
+
+Toda autorização entra no `gsi_orfas` ao ser registrada (`EM_PROCESSAMENTO`) e sai ao concluir: **2 escritas no índice**, de ~1 WCU cada (item de ~0,5–0,7 KB, projeção `ALL`). A 5.000 TPS são ~10.000 WCU/s no índice. A sort key (`orfa_lease_ms`, e `venc_ms` no `gsi_vencimentos`) cresce com o tempo, então o DynamoDB não divide uma chave quente por faixa de sort key, e cada valor de shard fica preso a **1.000 WCU/s**:
+
+| Shards (N) | WCU/s por chave a 5.000 TPS | Ocupação do teto |
+|---|---|---|
+| 10 (entregue até 20/10) | ~1.000 | **100%**: o índice estrangula e devolve a pressão à escrita da tabela |
+| 64 (padrão agora) | ~156 | ~16%; o dobro do pico ainda fica em ~31% |
+
+O `gsi_vencimentos` recebe até ~5.000 escritas/s no mix de cartão (entra na reserva, sai na captura): ~78 WCU/s por chave com N = 64. N vem de `SHARDS_DE_ORFAS`/`SHARDS_DE_VENCIMENTOS` (Terraform: `var.shards_dos_indices`). O reconciliador consulta os N shards dos dois índices a cada 30 s: 128 Querys por rodada, ~2 RRU/s com o índice vazio. **Subir N é retrocompatível** (o leitor consulta 0..N−1, que contém os shards antigos; o item muda de shard na próxima escrita), desde que o leitor suba junto ou antes. **Reduzir N esconde itens**: não fazer sem migrar.
+
+### 1.3 Item do limite: reservas de 7 dias
+
+Cada reserva aprovada e pendente é uma entrada no mapa `reservas` **dentro do item do contrato** (UUID de 36 caracteres + valor, ~45 bytes) e fica lá até a captura, o estorno ou a expiração, em até **7 dias**. A guarda vive 5 min; o hold vive 2.016 vezes mais. Pela Lei de Little, reservas ativas = taxa de reservas do contrato × tempo médio até a captura:
+
+| Contrato | Reservas ativas | Item |
+|---|---|---|
+| Pessoa física: 1 reserva/dia, capturada em 2 dias | ~2 | < 1 KB |
+| Hotel ou posto corporativo: 300 reservas/dia, capturadas em 3 dias | ~900 | ~40 KB, ~40 WCU por escrita |
+| Frota: 1.300 reservas/dia que esperam os 7 dias | ~9.100 | **~400 KB: a escrita falha** (`ValidationException`, contrato parado) |
+
+O tamanho do item também baixa o teto de operações do contrato: com 2.000 reservas (~90 KB) cada escrita custa ~90 WCU, e a partição aguenta ~11 op/s. Controles: o log `guarda_de_idempotencia` passa a sair quando guarda **ou** reservas passam de 200 entradas, e o alarme `reservas-ativas-no-item` dispara acima de 2.000 por contrato (~90 KB, 22% do teto). A saída para esse contrato é a fragmentação do ADR-0016, que divide também as reservas.
 
 ## 2. Medição local (LocalStack) — o que ela prova e o que não prova
 
@@ -31,6 +79,8 @@ Ele praticamente **não escala com concorrência**. Com ~5 operações de banco 
 ## 3. Medição na AWS (sandbox sa-east-1, 20/10/2026)
 
 **Como:** k6 `constant-arrival-rate` disparado da máquina do operador (Hortolândia/SP) contra o API Gateway em sa-east-1, carga de `DEBITO` R$ 1,00 espalhada em **5.000 contratos** criados pela ACL (`CTR-K-000001..005000`), como é a realidade de 80 M de contas. A latência do k6 inclui a internet até a região; a do gateway (`Latency`/`IntegrationLatency`) não. Tasks Fargate x86 de **1 vCPU / 2 GB**, 4 de cada serviço (o autoscaling subiu o `autorizacao` para 6 no último degrau). O WAF por IP foi elevado para a medição (`waf_limite_por_ip=20000000`; o default do sandbox é 2.000 por IP em 5 min), porque o k6 sai de um IP só. Métricas: Container Insights, API Gateway, DynamoDB.
+
+**Medição fora da tabela:** `tests/load/resultados/vazao-2026-10-20T13-07-54-882Z.json` (13:07 UTC, 10:07 em Brasília) é anterior a todos os degraus abaixo: ~200 rps por 60 s (11.558 requisições feitas + 443 descartadas pelo k6), 168 rps efetivos, **64,5%** fora de 201/402 e p99 de 10,8 s. Pelos registros do deploy daquela manhã (não versionados), a versão no ar era a **1.0.0**: o apply das 10:01 usou a tag 1.0.0 e o plano da 1.0.1 é das 10:38. Ou seja, antes do keep-alive e da redução de CPU da 1.0.3. O JSON não guarda o status das falhas nem o limite do WAF naquele momento, então **a causa das falhas não é afirmada aqui**. Fica no repositório como registro, não como medição de capacidade.
 
 **Corretude no DynamoDB real:** 100 reservas paralelas de R$ 100 num limite de R$ 1.000 → `{201: 10, 402: 90}`, disponível 0, versão 11 (`tests/e2e/aws.py corrida`; repetido 4 vezes ao longo do dia).
 
@@ -58,8 +108,8 @@ Ele praticamente **não escala com concorrência**. Com ~5 operações de banco 
 **Latência por salto** (minuto de 600 rps): `UpdateItem` no limite ~4 ms; `PutItem` ~3,6 ms; **`TransactWriteItems` (autorização + outbox) ~21 ms**, o maior custo fixo do caminho síncrono. O resto do p50 é Python, gateway e VPC Link.
 
 **Load shedding e autoscaling:**
-- `MAX_EM_VOO` alto (256) só troca 503 rápido por fila lenta: com 256 em voo e ~95 rps por task, a espera chegava a segundos. Dimensionado agora como capacidade × p99 alvo × 2 ≈ **32** por task (`var.max_em_voo`).
-- O target tracking de CPU (60%, 3 pontos de 1 min) pediu a 5ª e a 6ª task **~6 min depois do início** da sobrecarga. Reativo não segura pico súbito: para o pico previsível (início de mês, Black Friday), mínimo agendado ou predictive scaling (ADR-0004/0013). O shedding protege o que já está no ar enquanto isso.
+- `MAX_EM_VOO` alto (256) só troca 503 rápido por fila lenta: com 256 em voo e ~95 rps por task, a espera chegava a segundos. A regra é capacidade da task × p99 alvo × 2. Com ~8 ms de CPU por autorização (~125 rps por vCPU): **18** na task entregue, de 0,5 vCPU (62,5 × 0,15 × 2), e ~37 com 1 vCPU. O degrau de 600 rps acima usou 32 com tasks de 1 vCPU. O Terraform agora deriva o valor da CPU da task (`local.max_em_voo`); antes ele era fixo em 32 e deixava passar o dobro da fila na task de 0,5 vCPU.
+- O target tracking de CPU (60%, 3 pontos de 1 min) pediu a 5ª e a 6ª task **~6 min depois do início** da sobrecarga. Reativo não segura pico súbito. Para o pico previsível há janelas agendadas na IaC (`var.janelas_de_pico`; no sandbox, dia 1 de cada mês das 06:30 às 12:00 de Brasília com mínimo de 4 tasks) e warm throughput configurável no DynamoDB, desligado no sandbox (ADR-0013). O shedding protege o que já está no ar enquanto isso.
 
 **Extrapolação para 5.000 TPS** (pico sustentado; ARM64 não foi medido, a conta é x86):
 
@@ -67,6 +117,8 @@ Ele praticamente **não escala com concorrência**. Com ~5 operações de banco 
 |---|---|---|---|
 | CPU a 60% (vazão; p99 de centenas de ms) | ~68 vCPU | ~38 vCPU | ~106 vCPU |
 | CPU a ~33% (p99 de gateway ≤ ~165 ms, perto do RNF de 150 ms) | ~130 vCPU | ~72 vCPU | ~200 vCPU |
+
+**Teto da stack entregue e quota:** com `tasks_max = 20` tasks de 0,5 vCPU, o `autorizacao` satura em ~730 rps a 60% de CPU (20 × 0,5 × 73). A 60% de CPU o alvo cabe na quota de Fargate da conta (106 de **140 vCPU**, `docs/operacao/infraestrutura.md`, seção 2), mas exige subir `tasks_max` (~136 tasks de 0,5 vCPU ou ~68 de 1 vCPU no `autorizacao`). Perto do RNF de latência (~33%) são ~200 vCPU: pedir o aumento da quota antes.
 
 O RNF de p99 ≤ 150 ms **não foi atingido com folga** em nenhum degrau; o mais perto foi 164 ms no gateway a 33% de CPU. A distância é Python mais a transação de ~21 ms. Fechar isso pede a alavanca 1 da seção 5 (tira a transação do caminho comum) e, se ainda faltar, um runtime compilado nos dois serviços quentes (ADR-0003).
 

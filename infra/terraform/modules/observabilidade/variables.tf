@@ -56,10 +56,38 @@ variable "relay_funcao" {
   type        = string
 }
 
+variable "account_id" {
+  description = "ID da conta AWS (política da chave KMS e condição anti-confused-deputy do tópico de alarmes)."
+  type        = string
+}
+
 variable "acoes_alarme" {
-  description = "ARNs (SNS) notificados quando um alarme dispara. Vazio no sandbox."
+  description = "ARNs extras notificados pelos alarmes, além do tópico SNS de alarmes criado aqui (ex.: tópico do plantão central)."
   type        = list(string)
   default     = []
+}
+
+variable "email_alarmes" {
+  description = "E-mail assinado no tópico de alarmes. Vazio (padrão) = sem assinatura; o tópico existe e recebe os alarmes."
+  type        = string
+  default     = ""
+}
+
+variable "fila_legado" {
+  description = "Nome da fila do feed do core legado (alarme de defasagem, ADR-0014)."
+  type        = string
+}
+
+variable "defasagem_legado_limite_s" {
+  description = "Limiar do alarme de defasagem do legado: idade da mensagem mais antiga da fila, em segundos (ADR-0014: 5 min)."
+  type        = number
+  default     = 300
+}
+
+variable "limite_reservas_ativas" {
+  description = "Limiar do alarme de reservas ativas no item de um contrato (~2.000 x ~45 bytes = ~90 KB; o item vai até 400 KB)."
+  type        = number
+  default     = 2000
 }
 
 variable "p99_limite_ms" {

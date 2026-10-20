@@ -203,10 +203,10 @@ resource "aws_appautoscaling_target" "this" {
   max_capacity       = var.max_tasks
 }
 
-# Target tracking de CPU a 60%. O scale-out reativo leva ~2 min para servir (ADR-0004): para o pico
-# previsível de início de mês, complementar com aws_appautoscaling_scheduled_action (subir o mínimo
-# antes do dia 1) e/ou predictive scaling (aws_appautoscaling_policy PredictiveScaling, disponível em
-# sa-east-1) — não habilitados no sandbox para não manter capacidade ociosa.
+# Target tracking de CPU a 60%. O scale-out reativo leva ~2 min para servir e, na medição, pediu tasks ~6 min depois
+# do início da sobrecarga (ADR-0004, docs/capacidade.md): para o pico previsível há as janelas agendadas abaixo.
+# Predictive scaling (aws_appautoscaling_policy PredictiveScaling, disponível em sa-east-1) fica como evolução:
+# precisa de histórico de carga, que o sandbox não tem.
 resource "aws_appautoscaling_policy" "cpu" {
   name               = "${var.nome}-cpu-alvo"
   policy_type        = "TargetTrackingScaling"
@@ -223,4 +223,50 @@ resource "aws_appautoscaling_policy" "cpu" {
       predefined_metric_type = "ECSServiceAverageCPUUtilization"
     }
   }
+}
+
+locals {
+  janelas_de_pico = { for j in var.janelas_de_pico : j.nome => j }
+}
+
+# Pico previsível (RN-04): no início de cada janela o MÍNIMO sobe (capacidade quente antes do tráfego chegar, sem
+# esperar o target tracking); o target tracking continua agindo entre o mínimo e o máximo.
+# Depende da política de CPU: chamadas simultâneas no mesmo alvo de autoscaling podem ser recusadas pela API
+# (ConcurrentUpdateException) e o provider só repete ObjectNotFoundException.
+resource "aws_appautoscaling_scheduled_action" "inicio_do_pico" {
+  for_each = local.janelas_de_pico
+
+  name               = "${var.nome}-${each.key}-inicio"
+  service_namespace  = aws_appautoscaling_target.this.service_namespace
+  scalable_dimension = aws_appautoscaling_target.this.scalable_dimension
+  resource_id        = aws_appautoscaling_target.this.resource_id
+  schedule           = each.value.inicio
+  timezone           = var.fuso_horario
+
+  scalable_target_action {
+    min_capacity = each.value.min_tasks
+    max_capacity = coalesce(each.value.max_tasks, var.max_tasks)
+  }
+
+  depends_on = [aws_appautoscaling_policy.cpu]
+}
+
+# Fim da janela: volta ao mínimo e ao máximo de base. Criado depois do início (mesmo motivo acima). Atenção: um apply
+# DENTRO da janela também devolve o alvo ao mínimo de base (min_capacity do aws_appautoscaling_target); ver runbook R3.
+resource "aws_appautoscaling_scheduled_action" "fim_do_pico" {
+  for_each = local.janelas_de_pico
+
+  name               = "${var.nome}-${each.key}-fim"
+  service_namespace  = aws_appautoscaling_target.this.service_namespace
+  scalable_dimension = aws_appautoscaling_target.this.scalable_dimension
+  resource_id        = aws_appautoscaling_target.this.resource_id
+  schedule           = each.value.fim
+  timezone           = var.fuso_horario
+
+  scalable_target_action {
+    min_capacity = var.min_tasks
+    max_capacity = var.max_tasks
+  }
+
+  depends_on = [aws_appautoscaling_scheduled_action.inicio_do_pico]
 }

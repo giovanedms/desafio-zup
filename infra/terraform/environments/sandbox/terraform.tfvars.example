@@ -8,13 +8,28 @@ aws_profile = "desafio-zup"
 tag_imagem_autorizacao = "1.0.0"
 tag_imagem_limites     = "1.0.0"
 
-# Capacidade (ADR-0004): início de mês pede scheduled/predictive scaling além do target tracking.
+# Capacidade (ADR-0004). O pico previsível usa janelas agendadas (var.janelas_de_pico; o default sobe o mínimo
+# para 4 no dia 1 de cada mês, 06:30–12:00 de Brasília). Para desligar: janelas_de_pico = []
 tasks_desejadas = 2
 tasks_min       = 2
 tasks_max       = 20
 
+# Load shedding: null deriva de cpu (18 com 512). Shards dos GSIs esparsos: só subir.
+# max_em_voo         = 18
+# shards_dos_indices = 64
+
+# Warm throughput (pré-aquecimento) do DynamoDB: DESLIGADO no sandbox (cobrado e irreversível). Produção, 2x o pico:
+# warm_throughput = {
+#   limites      = { escrita = 11000 }
+#   autorizacoes = { escrita = 31000, indices = { gsi_orfas = { escrita = 20000 } } }
+# }
+
+# Alarmes: e-mail assinado no tópico SNS (vazio = sem assinatura; a AWS pede confirmação por e-mail).
+# email_alarmes = "plantao@exemplo.com"
+
 # Proteção contra exclusão: false no sandbox para o destroy funcionar; true em produção.
 deletion_protection = false
 
-# WAF: requisições por IP em 5 minutos.
-waf_limite_por_ip = 2000
+# WAF (429): requisições em 5 minutos por x-api-key e por IP. A medição com k6 (canal-carga, um IP) sobe os dois.
+waf_limite_por_consumidor = 120000
+waf_limite_por_ip         = 300000

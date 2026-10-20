@@ -1,6 +1,86 @@
 locals {
   api_dim = ["ApiName", var.api_nome, "Stage", var.api_stage]
   ops_ddb = ["GetItem", "PutItem", "UpdateItem"]
+  # Todo alarme notifica o tópico de alarmes (ALARM e de volta a OK), mais o que vier de fora em var.acoes_alarme.
+  acoes = concat([aws_sns_topic.alarmes.arn], var.acoes_alarme)
+}
+
+# ---------------------------------------------------------------- notificação dos alarmes (SNS)
+
+# Chave KMS do tópico de alarmes. NÃO é a gerenciada alias/aws/sns: a política dela não deixa o CloudWatch usar a
+# chave, e o alarme falharia ao publicar num tópico criptografado com ela. Para serviços AWS publicarem num tópico
+# criptografado a AWS exige chave gerenciada pelo cliente com kms:GenerateDataKey* e kms:Decrypt para o serviço:
+# https://docs.aws.amazon.com/sns/latest/dg/sns-key-management.html#compatibility-with-aws-services
+# Custo: ~US$ 1/mês pela chave, mais requisições (só quando um alarme muda de estado).
+resource "aws_kms_key" "alarmes" {
+  description             = "SNS ${var.nome}-alarmes: notificacoes dos alarmes do CloudWatch"
+  enable_key_rotation     = true
+  deletion_window_in_days = 7
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Administração pela própria conta via IAM (padrão da AWS; sem isto a chave fica inadministrável).
+        Sid       = "AdministracaoPelaConta"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${var.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        # O CloudWatch cifra a notificação ao publicar. Sem aws:SourceAccount/SourceArn aqui: a documentação do SNS
+        # manda consultar a do serviço, e a do CloudWatch só documenta essas condições na política do TÓPICO (abaixo).
+        Sid       = "CloudWatchPublicaNoTopico"
+        Effect    = "Allow"
+        Principal = { Service = "cloudwatch.amazonaws.com" }
+        Action    = ["kms:GenerateDataKey*", "kms:Decrypt"]
+        Resource  = "*"
+      },
+    ]
+  })
+}
+
+# Alias legível da chave dos alarmes.
+resource "aws_kms_alias" "alarmes" {
+  name          = "alias/${var.nome}-alarmes"
+  target_key_id = aws_kms_key.alarmes.key_id
+}
+
+# Tópico de notificação de todos os alarmes da stack (plantão). Criptografado com a chave acima.
+resource "aws_sns_topic" "alarmes" {
+  name              = "${var.nome}-alarmes"
+  kms_master_key_id = aws_kms_key.alarmes.arn
+}
+
+# Só o CloudWatch, a partir de alarmes desta conta e região, publica no tópico (anti-confused-deputy):
+# https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Notify_Users_Alarm_Changes.html#SNS_Confused_Deputy
+# Pessoas e roles da conta continuam administrando o tópico pelas políticas IAM delas (mesma conta).
+resource "aws_sns_topic_policy" "alarmes" {
+  arn = aws_sns_topic.alarmes.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AlarmesDaContaPublicam"
+      Effect    = "Allow"
+      Principal = { Service = "cloudwatch.amazonaws.com" }
+      Action    = "sns:Publish"
+      Resource  = aws_sns_topic.alarmes.arn
+      Condition = {
+        ArnLike      = { "aws:SourceArn" = "arn:aws:cloudwatch:${var.regiao}:${var.account_id}:alarm:*" }
+        StringEquals = { "aws:SourceAccount" = var.account_id }
+      }
+    }]
+  })
+}
+
+# Assinatura de e-mail opcional (vazio = sem assinatura). A AWS manda um e-mail de confirmação; até confirmar, nada chega.
+resource "aws_sns_topic_subscription" "email" {
+  count = var.email_alarmes == "" ? 0 : 1
+
+  topic_arn = aws_sns_topic.alarmes.arn
+  protocol  = "email"
+  endpoint  = var.email_alarmes
 }
 
 # Dashboard único: API, DynamoDB, ECS, SQS/DLQ e relay.
@@ -126,6 +206,15 @@ resource "aws_cloudwatch_dashboard" "this" {
           annotations = { horizontal = [{ label = "alarme", value = var.limite_guarda_operacoes }] }
         }
       },
+      {
+        type = "metric", x = 12, y = 30, width = 12, height = 6
+        properties = {
+          title       = "Limites: reservas ativas no item (máx. por contrato)"
+          region      = var.regiao, view = "timeSeries", stat = "Maximum", period = 300
+          metrics     = [["desafio-zup/limites", "ReservasAtivas"]]
+          annotations = { horizontal = [{ label = "alarme", value = var.limite_reservas_ativas }] }
+        }
+      },
     ]
   })
 }
@@ -138,8 +227,8 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   threshold           = 1
   evaluation_periods  = 1
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.acoes_alarme
-  ok_actions          = var.acoes_alarme
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
 
   metric_query {
     id          = "taxa"
@@ -185,8 +274,8 @@ resource "aws_cloudwatch_metric_alarm" "api_p99" {
   comparison_operator = "GreaterThanThreshold"
   threshold           = var.p99_limite_ms
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.acoes_alarme
-  ok_actions          = var.acoes_alarme
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
 }
 
 # Alarme por DLQ: qualquer mensagem visível significa falha de processamento que exige olhar humano.
@@ -204,8 +293,8 @@ resource "aws_cloudwatch_metric_alarm" "dlq" {
   comparison_operator = "GreaterThanThreshold"
   threshold           = 0
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.acoes_alarme
-  ok_actions          = var.acoes_alarme
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
 }
 
 # Alarme: relay atrasado (IteratorAge > 60 s) = eventos do outbox demorando a sair.
@@ -221,11 +310,11 @@ resource "aws_cloudwatch_metric_alarm" "relay_iterator_age" {
   comparison_operator = "GreaterThanThreshold"
   threshold           = var.iterator_age_limite_ms
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.acoes_alarme
-  ok_actions          = var.acoes_alarme
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
 }
 
-# Métrica a partir do log JSON do limites: uma linha por contrato cuja guarda passou de 200 entradas.
+# Métrica a partir do log JSON do limites: uma linha por escrita de contrato com guarda OU reservas >= 200 entradas.
 resource "aws_cloudwatch_log_metric_filter" "guarda" {
   name           = "${var.nome}-operacoes-na-guarda"
   log_group_name = var.log_group_limites
@@ -252,10 +341,63 @@ resource "aws_cloudwatch_metric_alarm" "guarda" {
   comparison_operator = "GreaterThanThreshold"
   threshold           = var.limite_guarda_operacoes
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.acoes_alarme
-  ok_actions          = var.acoes_alarme
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
 
   depends_on = [aws_cloudwatch_log_metric_filter.guarda]
+}
+
+# Mesma linha JSON, outro campo: reservas ativas no item. Holds vivem até 7 dias DENTRO do item do limite (a guarda vive
+# 5 min), então um contrato com muitas pré-autorizações pendentes cresce sem a guarda acusar (ADR-0016).
+resource "aws_cloudwatch_log_metric_filter" "reservas" {
+  name           = "${var.nome}-reservas-ativas"
+  log_group_name = var.log_group_limites
+  pattern        = "{ $.evento = \"guarda_de_idempotencia\" }"
+
+  metric_transformation {
+    name      = "ReservasAtivas"
+    namespace = "desafio-zup/limites"
+    value     = "$.reservas_ativas"
+    unit      = "Count"
+  }
+}
+
+# Alarme: reservas ativas de algum contrato acima do limiar. ~2.000 reservas x ~45 bytes = ~90 KB no item: cada escrita
+# já custa ~90 WCU, e ~9.000 reservas encostam nos 400 KB (aí a escrita falha com ValidationException e o contrato para).
+resource "aws_cloudwatch_metric_alarm" "reservas" {
+  alarm_name          = "${var.nome}-reservas-ativas-no-item"
+  alarm_description   = "Um contrato passou de ${var.limite_reservas_ativas} reservas ativas no item do limite (holds de até 7 dias; teto do item 400 KB, ADR-0016)."
+  namespace           = "desafio-zup/limites"
+  metric_name         = "ReservasAtivas"
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.limite_reservas_ativas
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
+
+  depends_on = [aws_cloudwatch_log_metric_filter.reservas]
+}
+
+# Alarme: defasagem do feed do core legado (ADR-0014). A mensagem mais antiga da fila legado-contratos esperando mais
+# que o limiar (5 min) = o limite concedido na réplica está velho por isso. É o controle que limita o risco aceito no
+# ADR-0014 (autorizar com o concedido antigo).
+resource "aws_cloudwatch_metric_alarm" "defasagem_legado" {
+  alarm_name          = "${var.nome}-defasagem-do-legado"
+  alarm_description   = "A mensagem mais antiga da fila ${var.fila_legado} espera há mais de ${var.defasagem_legado_limite_s} s: a réplica do limite concedido está defasada (ADR-0014)."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateAgeOfOldestMessage"
+  dimensions          = { QueueName = var.fila_legado }
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.defasagem_legado_limite_s
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
 }
 
 # Contributor Insights sobre o mesmo log: top contratos por tamanho de guarda (quem está perto de precisar fragmentar).
@@ -334,8 +476,8 @@ resource "aws_cloudwatch_metric_alarm" "reconciliador" {
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = each.value.limiar
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.acoes_alarme
-  ok_actions          = var.acoes_alarme
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
 
   depends_on = [aws_cloudwatch_log_metric_filter.reconciliador]
 }

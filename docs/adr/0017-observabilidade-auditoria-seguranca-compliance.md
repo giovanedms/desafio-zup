@@ -19,7 +19,8 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
   - `id_autorizacao`: entidade.
 - **Os três atravessam:** HTTP → serviço → chamada ao `limites` → item gravado → CloudEvent (extensões `traceparent` e `correlationid`) → fila → consumidor → lançamento.
 - O `X-Correlation-Id` recebido só é aceito se for UUID canônico; senão é gerado, o que protege contra log injection.
-- **Na AWS:** X-Ray no API Gateway, access log JSON com `requestId` e latências, logs estruturados nos serviços. A instrumentação OpenTelemetry (ADOT) fica como evolução.
+- **Na AWS:** X-Ray no API Gateway, access log JSON com `requestId`, `extendedRequestId` e latências, logs estruturados nos serviços. A instrumentação OpenTelemetry (ADOT) fica como evolução.
+- **Junção borda × serviço:** a integração do gateway injeta `X-Gateway-Request-Id` = `$context.requestId`, o mesmo valor da linha do access log e do `correlation_id` das gateway responses, sobrescrevendo qualquer valor do cliente. A AWS avisa que o cliente pode influenciar o `requestId`; por isso o access log grava também o `extendedRequestId`, único e gerado pelo gateway, para desempatar.
 
 ### Trilha de auditoria
 
@@ -38,11 +39,12 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
   - tamanho do outbox;
   - IteratorAge do relay;
   - órfãs compensadas por hora.
-- **Alarmes:** 5XX > 1%, p99 > 150 ms, qualquer mensagem em DLQ, IteratorAge > 60 s, guarda de idempotência acima de 2.000 entradas (`OperacoesNaGuarda`, ADR-0016) e os do reconciliador (`reconciliador-encaminhadas`, `reconciliador-falhas`, `reconciliador-hold_perdido`). Órfãs compensadas por hora é consulta de log (runbook R4), sem alarme. No sandbox, nenhum alarme tem ação (sem SNS); na produção, cada um notifica o plantão (`docs/operacao/infraestrutura.md`, seção 9).
+- **Alarmes:** 5XX > 1%, p99 > 150 ms, qualquer mensagem em DLQ (inclusive a DLQ de entrega dos targets do EventBridge), IteratorAge > 60 s, guarda de idempotência acima de 2.000 entradas (`OperacoesNaGuarda`) e reservas ativas no item acima de 2.000 (`ReservasAtivas`, ADR-0016), defasagem do feed do legado acima de 5 min (ADR-0014) e os do reconciliador (`reconciliador-encaminhadas`, `reconciliador-falhas`, `reconciliador-hold_perdido`). Órfãs compensadas por hora é consulta de log (runbook R4), sem alarme.
+- **Ação dos alarmes:** todos notificam (ALARM e OK) o tópico SNS `desafio-autorizacao-alarmes`, criptografado com chave KMS gerenciada pelo cliente e rotação ligada. Não é a `alias/aws/sns`: com ela o CloudWatch não consegue publicar. A policy do tópico só aceita o CloudWatch vindo de alarmes da conta (`aws:SourceAccount`, `aws:SourceArn`). No sandbox não há assinatura por padrão (`var.email_alarmes`); na produção o plantão assina.
 
 ### Segurança
 
-- **IAM:** uma task role por serviço, ações mínimas e recursos por ARN, verificado por `terraform test` e Checkov na CI.
+- **IAM:** uma task role por serviço, ações mínimas e recursos por ARN, verificado por `terraform test` e Checkov na CI. As trust policies das task roles e da role do EventBridge Scheduler têm `aws:SourceAccount` e `aws:SourceArn` (anti-confused-deputy), só onde a AWS documenta o suporte (detalhe em `docs/operacao/infraestrutura.md`, seção 4.9).
 - **Rede:**
   - tasks sem ingress da internet (só NLB e Service Connect, a partir da VPC);
   - na produção, subnets privadas + endpoints;

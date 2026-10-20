@@ -1,7 +1,7 @@
 variable "repositorios" {
-  description = "Nomes dos repositórios ECR."
+  description = "Nomes dos repositórios ECR. Só as imagens que rodam na AWS: o relay é Lambda zip, e a imagem dele só existe no ambiente local."
   type        = set(string)
-  default     = ["autorizacao", "limites", "relay"]
+  default     = ["autorizacao", "limites"]
 }
 
 variable "prefixo" {

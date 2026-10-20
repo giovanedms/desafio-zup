@@ -57,3 +57,13 @@ output "fila_legado_dlq_nome" {
   description = "Nome da DLQ do feed do legado."
   value       = aws_sqs_queue.legado_dlq.name
 }
+
+output "entrega_dlq_nome" {
+  description = "Nome da DLQ de entrega dos targets do EventBridge (alarme junto das demais DLQs)."
+  value       = aws_sqs_queue.entrega_dlq.name
+}
+
+output "entrega_dlq_arn" {
+  description = "ARN da DLQ de entrega dos targets do EventBridge."
+  value       = aws_sqs_queue.entrega_dlq.arn
+}

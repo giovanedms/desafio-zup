@@ -31,7 +31,7 @@ O core banking legado (mainframe) é a fonte da verdade de contratos e limites c
    - carga em lote do arquivo do legado pelo mesmo tradutor;
    - conciliação diária concedido × legado, com divergência → alarme.
 9. **Defasagem:**
-   - hoje há o widget de idade da mensagem mais antiga no dashboard e o alarme de DLQ; o **alarme de idade acima de 5 min é evolução**, ainda não existe no Terraform;
+   - alarme `defasagem-do-legado`: `ApproximateAgeOfOldestMessage` da fila `legado-contratos` acima de **300 s** (`modules/observabilidade`, `var.defasagem_legado_limite_s`), com ação no tópico SNS de alarmes. Também há o widget de idade da mensagem mais antiga no dashboard (agora com a fila do legado) e o alarme da DLQ do feed;
    - contrato ausente na réplica → **fail-closed** (404, nada autorizado).
 10. **Simulação:** `legado-mock` gera registros pelo layout **sem** importar o código da ACL (ele é "o legado"). Um teste de contrato prova que todo registro do mock é traduzido corretamente.
 
@@ -43,7 +43,7 @@ O core banking legado (mainframe) é a fonte da verdade de contratos e limites c
   - A migração é incremental (strangler), com dono claro por dado.
 - **Negativas:**
   - O limite concedido é **eventualmente consistente** com o legado (segundos).
-  - Uma redução de limite pode chegar depois de uma autorização feita com o limite antigo. Esse risco é aceito e limitado pela defasagem monitorada.
+  - Uma redução de limite pode chegar depois de uma autorização feita com o limite antigo. Esse risco é aceito e limitado pela defasagem monitorada: o alarme dispara quando a réplica fica mais de 5 min atrás do feed.
 
 ## Quando esta decisão deixa de ser boa
 

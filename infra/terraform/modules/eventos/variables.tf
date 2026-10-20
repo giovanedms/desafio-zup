@@ -55,3 +55,25 @@ variable "consumidor_limite_alterado" {
   type        = string
   default     = "notificacoes"
 }
+
+variable "idade_maxima_entrega_segundos" {
+  description = "Retry dos targets: idade máxima do evento antes de ir para a DLQ de entrega (60 a 86.400). 1 h cobre falha transitória do SQS; depois disso o evento vai para a DLQ, com alarme, em vez de 24 h de tentativas silenciosas."
+  type        = number
+  default     = 3600
+
+  validation {
+    condition     = var.idade_maxima_entrega_segundos >= 60 && var.idade_maxima_entrega_segundos <= 86400
+    error_message = "idade_maxima_entrega_segundos deve estar entre 60 e 86400."
+  }
+}
+
+variable "tentativas_maximas_entrega" {
+  description = "Retry dos targets: tentativas antes da DLQ de entrega (0 a 185). Com 185, quem limita é a idade máxima."
+  type        = number
+  default     = 185
+
+  validation {
+    condition     = var.tentativas_maximas_entrega >= 0 && var.tentativas_maximas_entrega <= 185
+    error_message = "tentativas_maximas_entrega deve estar entre 0 e 185."
+  }
+}

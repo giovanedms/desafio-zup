@@ -25,13 +25,15 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
 ### Trilha de auditoria
 
 - **Todo fato de negócio vira evento imutável**, inclusive a **recusa** (`TransacaoRecusada`).
-- **Produção:** archive do EventBridge e Firehose → **S3 com Object Lock (compliance mode) por 10 anos** (Circular 3.978, arts. 28/67).
-- **Sandbox:** archive de 30 dias e CloudTrail da conta num bucket com Object Lock, que **demonstra** o mecanismo WORM. O trail (`desafio-zup-trail`) e o bucket (`desafio-zup-cloudtrail-<conta>`, Object Lock GOVERNANCE de 1 dia, expiração em 30 d) foram criados no bootstrap da conta, **fora do Terraform deste repositório**.
+- **Produção (desenho; não está na IaC):** archive do EventBridge e Firehose → **S3 com Object Lock (compliance mode) por 10 anos** (Circular 3.978, arts. 28/67). Não há Firehose nem bucket de trilha em `infra/terraform`.
+- **Sandbox: o único armazenamento durável dos eventos é o archive de 30 dias do bus** (`modules/eventos`, `retencao_archive_dias`). `TransacaoCompensada` e `TransacaoEmReconciliacaoManual` não casam com nenhuma regra (`assinaturas` em `modules/eventos/variables.tf`): ficam só no archive e somem depois de 30 dias.
+- **CloudTrail do sandbox:** o trail (`desafio-zup-trail`) grava num bucket (`desafio-zup-cloudtrail-<conta>`) com Object Lock **GOVERNANCE de 1 dia** e expiração em 30 d, criados no bootstrap da conta, **fora do Terraform deste repositório**. Demonstra o mecanismo, mas não é WORM de verdade: GOVERNANCE é contornável por quem tem `s3:BypassGovernanceRetention`, e a `PowerUserAccess` da role da esteira tem (o boundary vale para as roles que a esteira cria, e a SCP só trava região e saída da Organization). E o trail registra eventos de gerenciamento, sem eventos de dados: operação financeira não aparece nele. A trilha do negócio são os eventos.
 - **Imutabilidade contábil:** correção é estorno (outro lançamento), nunca edição.
 
 ### Métricas e SLOs
 
 - **RED por rota** (taxa, erros, duração). **Recusa (402) não conta como erro de SLO.**
+- **SLI, SLO e error budget:** `docs/operacao/slo.md`. O 503 de load shedding conta como falha. A política de burn-rate em duas janelas está desenhada; os alarmes de API de hoje são os dois abaixo (5XX e p99).
 - **Métricas de negócio:**
   - taxa de aprovação;
   - recusas por motivo;
@@ -64,6 +66,7 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
   - A observabilidade separa erro técnico de recusa de negócio.
 - **Negativas:**
   - **Custo de armazenamento** da trilha de 10 anos (mitigado por classes frias do S3).
+  - **No sandbox, a trilha durável é de 30 dias** e não é imutável: os 10 anos em compliance mode existem só como desenho.
   - **Sem OpenTelemetry completo no prazo:** o trace técnico depende do X-Ray na borda e dos IDs propagados.
 
 ## Quando esta decisão deixa de ser boa

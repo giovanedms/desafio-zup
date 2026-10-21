@@ -21,7 +21,7 @@ O enunciado pede para "discutir uso (ou não) de CQRS, Repository, Domain Events
 
 ### Domain Events: **sim**
 
-- Transições do agregado Autorização registram eventos (`TransacaoAutorizada`, `TransacaoRecusada`, `TransacaoEstornada`, `ReservaExpirada`).
+- Transições do agregado Autorização registram 7 eventos: `TransacaoAutorizada`, `TransacaoRecusada`, `TransacaoEstornada`, `ReservaCapturada`, `ReservaExpirada`, `TransacaoCompensada` e `TransacaoEmReconciliacaoManual` (`autorizacao/domain/eventos.py`).
 - O repositório os grava no **outbox na mesma escrita** do estado (ADR-0007).
 - O agregado não publica nada; ele declara fatos.
 - `LimiteAlterado` sai por CDC (ADR-0014).
@@ -34,7 +34,7 @@ O enunciado pede para "discutir uso (ou não) de CQRS, Repository, Domain Events
 
 ### Event Sourcing: **não**
 
-- **A trilha de auditoria pedida já sai dos eventos imutáveis**, publicados e arquivados (10 anos em S3 Object Lock na produção).
+- **A trilha de auditoria pedida já sai dos eventos imutáveis**, publicados e arquivados: 10 anos em S3 Object Lock na produção, que é desenho; no sandbox, o archive de 30 dias do bus (ADR-0017).
 - Event sourcing no item quente agravaria a contenção: cada reserva viraria um append sequenciado por contrato.
 - E traria snapshot, upcasting de eventos e reconstrução, sem requisito que o pague.
 

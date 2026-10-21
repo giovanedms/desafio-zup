@@ -33,6 +33,7 @@ Fatos (da documentação oficial da AWS; os links principais estão em Referênc
   | `plano-padrao` | 200 rps | 400 | 1 M/dia |
   | `plano-restrito` | 5 rps | 10 | 1.000/dia, para demonstrar o **429** |
 
+- **Os números são de demonstração; a regra é a de produção.** A 5.000 TPS em 3 canais iguais (~1.667 rps cada), o plano de cada canal fica em 1,6 × o pico dele (~2.667 rps, a folga do ADR-0004), o WAF por consumidor em 2× isso (1,6 M em 5 min) e o WAF por IP acima da soma dos canais que dividem um egress; a quota diária sai do maior dia do canal (2×), que o enunciado não dá. A soma dos planos, 8.000 rps, é 80% do throttle de 10.000 da conta. Conta completa: `docs/capacidade.md`, seção 1.4.
 - **Proteção dura:**
   - **WAF por consumidor:** regra rate-based agregada pelo header `x-api-key` (custom key), teto de **120.000 requisições em 5 min (400 rps)**, o dobro do maior plano de canal (`plano-padrao`, 200 rps). O usage plan governa o plano (best-effort, nas palavras da AWS); o WAF é a barreira dura acima dele e corta antes do gateway quem passar do dobro. Requisição sem `x-api-key` não conta nessa regra;
   - **WAF por IP, alto:** **300.000 em 5 min (1.000 rps)**, 10% do throttle de 10.000 rps da conta. Pega o tráfego sem chave e quem gira chaves falsas a partir de um IP, sem barrar um egress (NAT) que carregue vários canais. Antes era 2.000 por IP (6,7 rps), 30× abaixo do plano que deveria complementar;
@@ -55,7 +56,7 @@ Fatos (da documentação oficial da AWS; os links principais estão em Referênc
   - **O importador da REST API é limitado** (JSON Schema draft-4, sem `nullable`/`format`): por isso o gateway não valida o corpo e o serviço valida tudo (`fail_on_warnings = false`, documentado). O custo é o corpo inválido chegar ao serviço e gastar CPU dele.
   - **O 429 do WAF não é `application/problem+json`** no `Content-Type` nem traz `correlation_id`: limitação do WAF, declarada no catálogo de erros.
   - **Cognito M2M é cobrado por token emitido:** os canais devem fazer cache do token até expirar.
-  - **Throttle de conta compartilhado:** conta dedicada por domínio.
+  - **Throttle de conta compartilhado:** o pico usa ~50% dos 10.000 RPS (55% com as recusas) e os planos com folga, 80%. Não sobra para uma segunda API de porte parecido: conta dedicada por domínio.
 
 ## Quando esta decisão deixa de ser boa
 

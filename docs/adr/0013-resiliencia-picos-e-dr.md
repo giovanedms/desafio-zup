@@ -32,8 +32,8 @@ Os picos podem ser previsíveis (início de mês, datas de pagamento) ou imprevi
 - **Imprevisíveis:**
   - mínimo de tasks a 60% de utilização no pico esperado, ou seja, **1,6× de folga** para atravessar os ~109 s do reativo;
   - acima disso, load shedding e WAF;
-  - **429 e 503 com `Retry-After` são o comportamento projetado, não falha.**
-- **Teto de borda:** API Gateway com 10.000 RPS por conta e região. O pico de 5.000 usa metade. Conta dedicada por domínio.
+  - **429 e 503 com `Retry-After` são o comportamento projetado:** o sistema não quebra nem corrompe nada. Para o SLO, o 503 conta como falha e consome error budget, porque é capacidade que faltou; o 429 de cota do consumidor não conta (`docs/operacao/slo.md`).
+- **Teto de borda:** API Gateway com 10.000 RPS por conta e região. O pico de 5.000 usa metade. Conta dedicada por domínio. Tetos por consumidor em produção: `docs/capacidade.md`, seção 1.4.
 
 ### DR (desenhado, não implementado — Won't no MoSCoW)
 

@@ -60,7 +60,7 @@ docs/
   adr/              20 decisões (comece pelo README de lá)
   arquitetura/      documento com C4 L1/L2, sequência, eventos, implantação; Well-Architected
   dominio/          linguagem ubíqua
-  operacao/         runbooks; infraestrutura.md (inventário AWS, bootstrap, esteira, custo)
+  operacao/         runbooks; SLO e error budget; infraestrutura.md (inventário AWS, bootstrap, esteira, custo)
   capacidade.md · compliance.md · uso-de-ia.md · cobertura-requisitos.md
 ```
 
@@ -70,6 +70,15 @@ docs/
 2. `docs/adr/0005` (concorrência) e `0006` (idempotência): onde está o problema difícil.
 3. `services/limites/tests/contract/test_porta_repositorio.py`: a mesma suíte rodando em memória e no DynamoDB, com a corrida de 100 threads.
 4. `docs/cobertura-requisitos.md`: cada requisito do enunciado → onde está → nível de evidência.
+
+## Limitações que pesam
+
+A lista completa está em `docs/cobertura-requisitos.md` (Limitações declaradas). Estas quatro mudam a leitura do resto:
+
+- **p99 ≤ 150 ms não atingido:** o melhor degrau medido na AWS deu 164 ms no gateway, a 150 rps e 33% de CPU; os 5.000 TPS são extrapolados de 600 rps medidos (`docs/capacidade.md`, seção 3).
+- **Trilha de 10 anos só desenhada** (Firehose → S3 Object Lock, ADR-0017): no sandbox, o único armazenamento durável dos eventos é o archive de 30 dias do bus.
+- **2 de 8 tipos de evento sem assinante:** `TransacaoCompensada` e `TransacaoEmReconciliacaoManual` ficam só no archive.
+- **Sem saldo credor:** o limite não guarda crédito a favor do cliente. CREDITO ou estorno de débito maior que o utilizado é recusado.
 
 ## AWS
 

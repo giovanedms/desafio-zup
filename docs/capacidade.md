@@ -13,7 +13,7 @@
 | Teto por contrato | 1.000 WCU/s por partição, com a guarda de 5 min no item (o custo por escrita cresce com a taxa) | ~8 op/s sustentadas (conta no ADR-0016) |
 | Teto por chave dos GSIs esparsos | 2 escritas no `gsi_orfas` por autorização, divididas por N shards; sort key monotônica (seção 1.2) | N = 10: **~1.000 WCU/s por chave, 100% do teto**. N = 64 (padrão agora): ~156 |
 | Item do limite com reservas | Holds de até 7 dias moram no item; ~45 bytes cada (seção 1.3) | ~9.000 reservas ativas = 400 KB (teto do item) |
-| API Gateway | 10.000 RPS / burst 5.000 por conta e região | O pico usa ~50% |
+| API Gateway | 10.000 RPS / burst 5.000 por conta e região, somando todas as APIs da conta | O pico usa ~50% (55% com as recusas). Por consumidor: seção 1.4 |
 
 ### 1.1 Barramento: eventos e invocations por chamada
 
@@ -61,6 +61,30 @@ Cada reserva aprovada e pendente é uma entrada no mapa `reservas` **dentro do i
 
 O tamanho do item também baixa o teto de operações do contrato: com 2.000 reservas (~90 KB) cada escrita custa ~90 WCU, e a partição aguenta ~11 op/s. Controles: o log `guarda_de_idempotencia` passa a sair quando guarda **ou** reservas passam de 200 entradas, e o alarme `reservas-ativas-no-item` dispara acima de 2.000 por contrato (~90 KB, 22% do teto). A saída para esse contrato é a fragmentação do ADR-0016, que divide também as reservas.
 
+### 1.4 Borda: governança por consumidor a 5.000 TPS
+
+Os tetos por consumidor da IaC são de demonstração: o `plano-padrao` dá 200 rps e 1 M/dia, e o WAF corta em 120.000 requisições por `x-api-key` em 5 min (400 rps). Nenhum chega perto de 5.000 TPS. A regra do ADR-0010 escala; os números, não. Em produção, para N canais com pico *p* cada (somando 5.000):
+
+| Grandeza | Regra | 3 canais iguais (os do C4 nível 1: cartões, Pix/crédito direto, digitais), *p* ≈ 1.667 |
+|---|---|---|
+| Taxa do usage plan | 1,6 × *p*: a mesma folga do compute (ADR-0004). Quem passa da própria fatia leva 429 do plano, em vez de levar todos ao 503 do shedding | **~2.667 rps** por canal |
+| WAF por `x-api-key` | 2 × a taxa do plano, em 5 min | 5.333 rps = **1,6 M em 5 min** |
+| WAF por IP | Acima da soma dos tetos dos canais que saem pelo mesmo egress | ≥ 1,6 M em 5 min com um canal por IP. O valor de hoje (300.000, 1.000 rps) barraria um canal desses saindo por um IP só |
+| Quota diária | 2 × o maior dia do canal no histórico | O enunciado não dá volume diário, só o pico. Teto físico do plano: 2.667 × 86.400 ≈ 230 M/dia; uma quota nesse valor não governa nada |
+| Soma dos planos | ≤ throttle da conta | 8.000 rps, 80% dos 10.000 |
+
+Com canais desiguais a conta é a mesma: o autorizador de cartões leva a maior fatia, e o plano dele sobe pela mesma regra. A soma dos tetos do WAF (16.000 rps) passa do throttle da conta de propósito: o WAF corta um canal descontrolado, e o total é limitado pelo throttle da conta e, atrás dele, pelo load shedding.
+
+**O throttle da conta não tem folga para uma segunda API.** Os 10.000 RPS por conta e região somam todas as APIs da conta. O pico usa ~50% (55% com as ~500 recusas/s da seção 1.1); com a folga de 1,6×, 80–88%. Outra API de porte parecido na mesma conta não cabe, e por isso a conta é dedicada por domínio (ADR-0010). Passar disso pede aumento do throttle de conta, que é quota ajustável e entra no runbook R3 com as outras.
+
+### 1.5 Réplica do legado: carga inicial e acesso por conta
+
+**A carga inicial não cabe no feed.** O `limites-acl` é 1 task de 0,25 vCPU (`environments/sandbox/main.tf`, `max_tasks = 1`) que processa a fila em série: por registro, um `GetItem` consistente, a escrita condicional e o `DeleteMessage`. Com os ~4,6 ms de CPU por operação medidos no `limites` (seção 3; o consumidor em si não foi medido), 0,25 vCPU dá ~54 registros/s: **240–400 M contratos levariam ~51 a ~85 dias**. Mais CPU não resolve sozinha, porque são 3 chamadas de rede em série por registro. E o alarme `defasagem-do-legado` (300 s) ficaria disparado a carga inteira.
+
+**Recomendação: carga inicial por DynamoDB import from S3; o feed só com os deltas.** O arquivo do legado passa em lote pelo mesmo tradutor da ACL (`traducao.py`) e vira DynamoDB JSON num bucket. O import cria a tabela `limites` já carregada (ele só cria tabela nova) e não consome capacidade de escrita. O que chegar pelo feed durante o import espera na fila (retenção de 14 dias) e entra depois: registro com versão menor ou igual à do arquivo vira OBSOLETA (ADR-0014), então a sobreposição é segura. Para os deltas, a task de hoje aguenta ~54 registros/s (~4,7 M/dia); acima disso, mais tasks, o que é seguro porque o compare-and-set é por versão.
+
+**Sem acesso por conta.** A tabela `limites` tem só `id_contrato` como chave e nenhum GSI por `id_conta` (`modules/dados/main.tf`): listar os 3–5 contratos de uma conta hoje é Scan. O enunciado não pede essa consulta, mas uma plataforma de 80 M de contas vai precisar dela. O caminho é um GSI por `id_conta` com projeção `KEYS_ONLY`: reserva e débito não mudam `id_conta`, então o índice não é escrito no caminho quente.
+
 ## 2. Medição local (LocalStack) — o que ela prova e o que não prova
 
 **Prova (corretude):** a corrida de 100 reservas paralelas termina com 10 × 201 e 90 × 402, saldo final 0 e invariantes preservadas, pela API HTTP ponta a ponta (`make demo`).
@@ -80,18 +104,18 @@ Ele praticamente **não escala com concorrência**. Com ~5 operações de banco 
 
 **Como:** k6 `constant-arrival-rate` disparado da máquina do operador (Hortolândia/SP) contra o API Gateway em sa-east-1, carga de `DEBITO` R$ 1,00 espalhada em **5.000 contratos** criados pela ACL (`CTR-K-000001..005000`), como é a realidade de 80 M de contas. A latência do k6 inclui a internet até a região; a do gateway (`Latency`/`IntegrationLatency`) não. Tasks Fargate x86 de **1 vCPU / 2 GB**, 4 de cada serviço (o autoscaling subiu o `autorizacao` para 6 no último degrau). O WAF por IP foi elevado para a medição (`waf_limite_por_ip=20000000`; o default do sandbox é 2.000 por IP em 5 min), porque o k6 sai de um IP só. Métricas: Container Insights, API Gateway, DynamoDB.
 
-**Medição fora da tabela:** `tests/load/resultados/vazao-2026-10-20T13-07-54-882Z.json` (13:07 UTC, 10:07 em Brasília) é anterior a todos os degraus abaixo: ~200 rps por 60 s (11.558 requisições feitas + 443 descartadas pelo k6), 168 rps efetivos, **64,5%** fora de 201/402 e p99 de 10,8 s. Pelos registros do deploy daquela manhã (não versionados), a versão no ar era a **1.0.0**: o apply das 10:01 usou a tag 1.0.0 e o plano da 1.0.1 é das 10:38. Ou seja, antes do keep-alive e da redução de CPU da 1.0.3. O JSON não guarda o status das falhas nem o limite do WAF naquele momento, então **a causa das falhas não é afirmada aqui**. Fica no repositório como registro, não como medição de capacidade.
+**Medição fora da tabela:** `tests/load/resultados/vazao-2026-10-20T13-07-54-882Z.json` (13:07 UTC, 10:07 em Brasília) é anterior a todos os degraus abaixo: ~200 rps por 60 s (11.558 requisições feitas + 443 descartadas pelo k6), 168 rps efetivos, **64,5%** fora de 201/402 e p99 de 10,8 s. Pelos registros do deploy daquela manhã (não versionados), a versão no ar era a **1.0.0**: o apply das 10:01 usou a tag 1.0.0 e o plano da 1.0.1 é das 10:38. Ou seja, antes do keep-alive e da redução de CPU da 1.0.3. **O JSON guarda o status de cada resposta** (os contadores `st_*` de `tests/load/autorizacao.js`): 4.108 × 201, **7.435 × 503** e 15 × 500, que somam as 11.558. Não sobra espaço para 403 nem 429: o WAF e o throttle do gateway não barraram nada, e as falhas vieram do serviço. O 503 é a resposta de sobrecarga da `autorizacao` (load shedding, disjuntor aberto, timeout ou 5xx do salto para o `limites`; o contador não separa os motivos), e as aceitas esperaram 8,5 s no p50, fila de segundos. Os 15 × 500 são consistentes com o erro de keep-alive descrito abaixo, que a 1.0.0 ainda tinha. Fica no repositório como registro de uma versão anterior, não como medição de capacidade.
 
 **Corretude no DynamoDB real:** 100 reservas paralelas de R$ 100 num limite de R$ 1.000 → `{201: 10, 402: 90}`, disponível 0, versão 11 (`tests/e2e/aws.py corrida`; repetido 4 vezes ao longo do dia).
 
 | Degrau | Versão | Resultado (k6) | Gateway p50 / p95 / p99 | CPU média |
 |---|---|---|---|---|
-| 300 rps, 60 s | 1.0.2 | **243 rps**, 15.315 × 201, 481 × 503; p50 2,8 s | 805 / — / 5.763 ms | autorizacao **97%** (saturado), limites 40% |
+| 300 rps, 60 s | 1.0.2 | **243 rps**, 15.315 × 201, 481 × 503, e 2.205 iterações descartadas pelo k6 (12% das 18.000 pretendidas); p50 2,8 s | 805 / — / 5.763 ms | autorizacao **97%** (saturado), limites 40% |
 | 150 rps, 90 s | 1.0.2 | 148,9 rps, 13.500 × 201/402 e **1 × 500** (o do keep-alive, ver abaixo); p50 85, p95 251, **p99 628 ms** | — | — |
 | 150 rps, 90 s | 1.0.3 | 148,7 rps, **100% 201**; p50 71, p95 120, p99 **199 ms** | 54 / 90 / 164 ms | autorizacao 33%, limites 21% |
 | 300 rps, 90 s | 1.0.3 | 299 rps, **100% 201**; p50 79, p95 284, p99 537 ms | 58 / 231 / 526 ms | autorizacao 60% |
-| 600 rps, 180 s | 1.0.3, `MAX_EM_VOO=256` | 374 rps de 201 + 37.476 × 503 (shedding); p50 das aceitas **1,8 s** | — | autorizacao 100% |
-| 600 rps, 120 s | 1.0.3, `MAX_EM_VOO=32`, 6 tasks | 573 rps de 201 + 3.188 × 503 (4,4%); p50 81 ms, p99 972 ms | 59 / 519 / 874 ms | autorizacao 78%, limites 66% |
+| 600 rps, 180 s | 1.0.3, `MAX_EM_VOO=256` | 377 rps de 201 + 37.476 × 503 (shedding), e 1.399 iterações descartadas pelo k6; p50 das aceitas **2,7 s** (o de todas, 1,8 s, mistura os 503, recusados na chegada sem entrar na fila) | — | autorizacao 100% |
+| 600 rps, 120 s | 1.0.3, `MAX_EM_VOO=32`, 6 tasks | 568 rps de 201 + 3.188 × 503 (4,4%); p50 81 ms, p99 972 ms | 59 / 519 / 874 ms | autorizacao 78%, limites 66% |
 
 **O que mudou entre 1.0.2 e 1.0.3** (a CPU por autorização caiu de ~16 ms para ~8 ms):
 - `--no-access-log` (o gateway já registra cada requisição);
@@ -108,7 +132,7 @@ Ele praticamente **não escala com concorrência**. Com ~5 operações de banco 
 **Latência por salto** (minuto de 600 rps): `UpdateItem` no limite ~4 ms; `PutItem` ~3,6 ms; **`TransactWriteItems` (autorização + outbox) ~21 ms**, o maior custo fixo do caminho síncrono. O resto do p50 é Python, gateway e VPC Link.
 
 **Load shedding e autoscaling:**
-- `MAX_EM_VOO` alto (256) só troca 503 rápido por fila lenta: com 256 em voo e ~95 rps por task, a espera chegava a segundos. A regra é capacidade da task × p99 alvo × 2. Com ~8 ms de CPU por autorização (1 / 8 ms = 125 rps por vCPU a 100% de CPU; o medido, acima, foi ~122): **18** na task entregue, de 0,5 vCPU (62,5 × 0,15 × 2), e ~37 com 1 vCPU. O degrau de 600 rps acima usou 32 com tasks de 1 vCPU. O Terraform agora deriva o valor da CPU da task (`local.max_em_voo`); antes ele era fixo em 32 e deixava passar o dobro da fila na task de 0,5 vCPU.
+- `MAX_EM_VOO` alto (256) só troca 503 rápido por fila lenta: com 256 em voo e ~95 rps por task, a espera chegava a segundos. A Lei de Little fecha com o JSON do degrau (`vazao-2026-10-20T14-19-42-809Z.json`): 376,6 rps de 201 × 2,64 s de latência média das aceitas ≈ **994 em voo** (visto do k6, que soma a ida e volta pela internet), encostado no portão de 4 tasks × 256 = 1.024. Se as aceitas levassem 1,8 s (o p50 de todas), seriam ~680 em voo, longe do portão, e os 35% de 503 ficariam sem explicação. As iterações descartadas (`dropped_iterations`) neste degrau e no de 300 rps da 1.0.2 (1.399 e 2.205) são o k6 sem VU livre para disparar no ritmo, porque as respostas demoravam segundos: nos dois, o rótulo de rps é o pretendido, não o disparado. A regra é capacidade da task × p99 alvo × 2. Com ~8 ms de CPU por autorização (1 / 8 ms = 125 rps por vCPU a 100% de CPU; o medido, acima, foi ~122): **18** na task entregue, de 0,5 vCPU (62,5 × 0,15 × 2), e ~37 com 1 vCPU. O degrau de 600 rps acima usou 32 com tasks de 1 vCPU. O Terraform agora deriva o valor da CPU da task (`local.max_em_voo`); antes ele era fixo em 32 e deixava passar o dobro da fila na task de 0,5 vCPU.
 - O target tracking de CPU (60%, 3 pontos de 1 min) pediu a 5ª e a 6ª task **~6 min depois do início** da sobrecarga. Reativo não segura pico súbito. Para o pico previsível há janelas agendadas na IaC (`var.janelas_de_pico`; no sandbox, dia 1 de cada mês das 06:30 às 12:00 de Brasília com mínimo de 4 tasks) e warm throughput configurável no DynamoDB, desligado no sandbox (ADR-0013). O shedding protege o que já está no ar enquanto isso.
 
 **Extrapolação para 5.000 TPS** (pico sustentado; ARM64 não foi medido, a conta é x86):

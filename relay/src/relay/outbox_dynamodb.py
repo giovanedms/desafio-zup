@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 from boto3.dynamodb.types import TypeDeserializer
@@ -18,6 +18,8 @@ log = logging.getLogger(__name__)
 PREFIXO = "OUTBOX#"
 LOTE_DE_DELETE = 25  # limite do BatchWriteItem
 TENTATIVAS_DE_NAO_PROCESSADOS = 3
+# Limit do Scan: itens AVALIADOS por página (antes do filtro); limita a memória do sweeper.
+ITENS_POR_PAGINA = 500
 _deserializador = TypeDeserializer()
 
 
@@ -42,22 +44,25 @@ class OutboxDynamoDB:
                 # o evento já saiu; o item que sobrar será republicado pelo sweeper (at-least-once)
                 log.warning("%d deletes não processados em %s", len(pedidos), self._tabela)
 
-    def listar_antigos(self, antes_de_ms: int) -> list[EventoPendente]:
-        pendentes: list[EventoPendente] = []
+    def paginas_antigas(
+        self, antes_de_ms: int, itens_por_pagina: int = ITENS_POR_PAGINA
+    ) -> Iterator[list[EventoPendente]]:
+        """Scan com `Limit`, uma página por vez: nada se acumula aqui, e quem consome publica a página e
+        decide se pede a próxima. Página vazia (o filtro descartou tudo) também sai, para o consumidor
+        conferir o orçamento de tempo mesmo numa tabela grande sem item antigo."""
         argumentos: dict[str, Any] = {
             "TableName": self._tabela,
+            "Limit": itens_por_pagina,
+            "ProjectionExpression": "pk, id_evento, detail_type, cloudevent, criado_em_ms",
             "FilterExpression": "criado_em_ms < :t",
             "ExpressionAttributeValues": {":t": {"N": str(antes_de_ms)}},
         }
         while True:
             pagina = self._cliente.scan(**argumentos)
-            for item in pagina.get("Items", []):
-                pendente = _de_imagem(item)
-                if pendente is not None:
-                    pendentes.append(pendente)
+            yield [p for item in pagina.get("Items", []) if (p := _de_imagem(item)) is not None]
             chave = pagina.get("LastEvaluatedKey")
             if not chave:
-                return pendentes
+                return
             argumentos["ExclusiveStartKey"] = chave
 
 

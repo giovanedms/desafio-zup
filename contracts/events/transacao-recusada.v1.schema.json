@@ -151,8 +151,16 @@
           "enum": [
             "LIMITE_INSUFICIENTE",
             "CONTRATO_INATIVO",
-            "CREDITO_EXCEDE_UTILIZADO"
-          ]
+            "CREDITO_EXCEDE_UTILIZADO",
+            "CONTA_DIVERGENTE",
+            "CONTRATO_NAO_ENCONTRADO",
+            "RESERVA_NAO_ENCONTRADA",
+            "RESERVA_DIVERGENTE",
+            "ORIGINAL_JA_ENCERRADA",
+            "ESTORNO_EM_ANDAMENTO",
+            "RECUSA_DO_LIMITE"
+          ],
+          "description": "Mesmo valor de `motivo_recusa` da API pública. Valor novo entra só por adição (BACKWARD): consumidor deve tratar motivo desconhecido como recusa genérica."
         },
         "moeda": {
           "type": "string",
@@ -163,6 +171,17 @@
         },
         "id_estabelecimento": {
           "type": "string"
+        },
+        "canal": {
+          "type": "string",
+          "enum": [
+            "APP",
+            "WEB",
+            "POS",
+            "PIX",
+            "BACKOFFICE"
+          ],
+          "description": "Canal de origem da operação (opcional, aditivo). Registro do canal exigido para PLD/FT (Circular BCB 3.978/2020). Consumidor que não usa ignora."
         },
         "limite_disponivel": {
           "type": "number",

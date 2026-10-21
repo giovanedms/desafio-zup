@@ -19,7 +19,12 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from relay.cdc_limites import SOURCE_NO_BUS, OutboxNoop, de_registro_do_stream_de_limites
+from relay.cdc_limites import (
+    SOURCE_NO_BUS,
+    OutboxNoop,
+    RegistroMalformado,
+    de_registro_do_stream_de_limites,
+)
 from relay.eventbridge import PublicadorEventBridge
 from relay.nucleo import EventoPendente, Outbox, Publicador, ResultadoDoLote, processar
 from relay.outbox_dynamodb import OutboxDynamoDB, de_registro_do_stream
@@ -53,7 +58,13 @@ def cliente_local(servico: str, endpoint: str, regiao: str = REGIAO_PADRAO) -> A
 
 
 class LeitorDeStream:
-    """Lê todos os shards do Stream; tolera shards novos e fechados."""
+    """Lê todos os shards do Stream; tolera shards novos e fechados.
+
+    Iterador expirado (15 min sem uso) retoma DEPOIS da última sequência lida no shard
+    (AFTER_SEQUENCE_NUMBER), não do começo; só volta ao TRIM_HORIZON se nada foi lido ainda ou se os dados
+    já foram aparados (TrimmedDataAccessException). Registro malformado do CDC é logado e pulado: aqui não
+    há DLQ (na Lambda ele volta como falha do lote e vai para a DLQ do ESM).
+    """
 
     def __init__(
         self,
@@ -65,6 +76,7 @@ class LeitorDeStream:
         self._arn = stream_arn
         self._conversor = conversor
         self._iteradores: dict[str, str] = {}
+        self._ultima_sequencia: dict[str, str] = {}
         self._encerrados: set[str] = set()
         self._ultima_descoberta = float("-inf")
 
@@ -86,6 +98,40 @@ class LeitorDeStream:
             StreamArn=self._arn, ShardId=id_shard, ShardIteratorType="TRIM_HORIZON"
         )["ShardIterator"]
 
+    def _iterador_de_retomada(self, id_shard: str) -> str:
+        ultima = self._ultima_sequencia.get(id_shard)
+        if ultima is None:
+            return self._iterador_inicial(id_shard)
+        try:
+            return self._streams.get_shard_iterator(
+                StreamArn=self._arn,
+                ShardId=id_shard,
+                ShardIteratorType="AFTER_SEQUENCE_NUMBER",
+                SequenceNumber=ultima,
+            )["ShardIterator"]
+        except ClientError as erro:
+            if erro.response.get("Error", {}).get("Code") != "TrimmedDataAccessException":
+                raise
+            # a posição já saiu da retenção: o mais antigo que há
+            return self._iterador_inicial(id_shard)
+
+    def _converter(self, id_shard: str, registro: Mapping[str, Any]) -> EventoPendente | None:
+        try:
+            return self._conversor(registro)
+        except RegistroMalformado as erro:
+            sequencia = registro.get("dynamodb", {}).get("SequenceNumber")
+            log.error(
+                json.dumps(
+                    {
+                        "evento": "cdc_registro_malformado",
+                        "shard": id_shard,
+                        "sequencia": sequencia,
+                        "erro": str(erro),
+                    }
+                )
+            )
+            return None
+
     def ler(self) -> list[EventoPendente]:
         agora = time.monotonic()
         if agora - self._ultima_descoberta >= REDESCOBERTA_DE_SHARDS_S:
@@ -97,15 +143,22 @@ class LeitorDeStream:
                 resposta = self._streams.get_records(ShardIterator=iterador)
             except ClientError as erro:
                 codigo = erro.response.get("Error", {}).get("Code")
-                if codigo in {"ExpiredIteratorException", "TrimmedDataAccessException"}:
-                    log.warning("iterador do shard %s expirou; recomeçando", id_shard)
+                if codigo == "ExpiredIteratorException":
+                    log.warning("iterador do shard %s expirou; retomando da última lida", id_shard)
+                    self._iteradores[id_shard] = self._iterador_de_retomada(id_shard)
+                    continue
+                if codigo == "TrimmedDataAccessException":
+                    log.warning("dados do shard %s aparados; recomeçando do mais antigo", id_shard)
                     self._iteradores[id_shard] = self._iterador_inicial(id_shard)
                     continue
                 raise
             for registro in resposta.get("Records", []):
-                pendente = self._conversor(registro)
+                pendente = self._converter(id_shard, registro)
                 if pendente is not None:
                     pendentes.append(pendente)
+                sequencia = registro.get("dynamodb", {}).get("SequenceNumber")
+                if sequencia:
+                    self._ultima_sequencia[id_shard] = str(sequencia)
             proximo = resposta.get("NextShardIterator")
             if proximo:
                 self._iteradores[id_shard] = proximo

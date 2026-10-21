@@ -23,6 +23,7 @@
     "tipo_operacao": "DEBITO",
     "motivo": "LIMITE_INSUFICIENTE",
     "moeda": "BRL",
+    "canal": "POS",
     "limite_disponivel": 850.0,
     "versao_limite": 42
   }

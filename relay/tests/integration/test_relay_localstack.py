@@ -14,6 +14,7 @@ import pytest
 from relay.eventbridge import PublicadorEventBridge
 from relay.local import LeitorDeStream, cliente_local, uma_iteracao
 from relay.outbox_dynamodb import OutboxDynamoDB
+from relay.sweeper import varrer
 
 pytestmark = pytest.mark.integracao
 
@@ -127,3 +128,41 @@ def test_outbox_chega_na_fila_e_sai_do_outbox(ambiente: dict[str, Any]) -> None:
 
     restante = ddb.get_item(TableName=ambiente["tabela"], Key={"pk": {"S": f"OUTBOX#{id_evento}"}})
     assert "Item" not in restante
+
+
+def test_sweeper_republica_so_o_antigo_em_paginas(ambiente: dict[str, Any]) -> None:
+    """Scan com Limit + ProjectionExpression no DynamoDB da LocalStack: o antigo sai e é apagado."""
+    ddb = ambiente["dynamodb"]
+    agora_ms = int(time.time() * 1000)
+    base = json.loads(EXEMPLO.read_text())
+    ids = {"antigo": str(uuid.uuid4()), "novo": str(uuid.uuid4())}
+    for nome, criado_em_ms in (("antigo", agora_ms - 20 * 60 * 1000), ("novo", agora_ms)):
+        ddb.put_item(
+            TableName=ambiente["tabela"],
+            Item={
+                "pk": {"S": f"OUTBOX#{ids[nome]}"},
+                "id_evento": {"S": ids[nome]},
+                "detail_type": {"S": "TransacaoAutorizada"},
+                "cloudevent": {"S": json.dumps({**base, "id": ids[nome]})},
+                "id_contrato": {"S": "CTR-000123456"},
+                "criado_em_ms": {"N": str(criado_em_ms)},
+            },
+        )
+    publicador = PublicadorEventBridge(ambiente["events"], ambiente["bus"])
+    outbox = OutboxDynamoDB(ddb, ambiente["tabela"])
+
+    resultado = varrer(outbox, publicador, agora_ms)  # idade mínima padrão: 15 min
+
+    assert (resultado.publicados, resultado.falhos, resultado.interrompida) == (
+        {ids["antigo"]},
+        set(),
+        False,
+    )
+    restantes = {i["pk"]["S"] for i in ddb.scan(TableName=ambiente["tabela"])["Items"]}
+    assert restantes == {f"OUTBOX#{ids['novo']}"}
+    mensagens = (
+        ambiente["sqs"]
+        .receive_message(QueueUrl=ambiente["url"], MaxNumberOfMessages=10, WaitTimeSeconds=5)
+        .get("Messages", [])
+    )
+    assert [json.loads(m["Body"])["detail"]["id"] for m in mensagens] == [ids["antigo"]]

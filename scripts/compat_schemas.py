@@ -5,6 +5,10 @@ Dentro do mesmo major (mesmo nome de arquivo `*.vN.schema.json`) só entram camp
 Sai com 1 se houver quebra.
 Também é quebra todo APERTO de restrição: o schema novo passaria a recusar um evento que o da base
 aceitava (reentrega, replay do archive, produtor ainda na versão anterior). Afrouxar não quebra.
+
+Quebra aceita (`--aceitas`, ex.: contracts/events/quebras-aceitas.json): lista explícita e auditável de
+quebras que o gate deixa passar, cada uma com schema, caminho, regra, motivo e data. Só casa a quebra
+EXATA (`<schema>:<caminho>: <regra>`); qualquer outra continua reprovando. Arquivo inválido reprova.
 Só stdlib.
 """
 
@@ -13,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -22,6 +27,22 @@ ATRIBUTOS_FIXOS = ("type", "source", "dataschema")
 
 # Restrições textuais: nova ou alterada é quebra (não dá para decidir se uma regex contém a outra).
 RESTRICOES_TEXTUAIS = ("pattern", "format")
+
+# Combinadores e chaves estruturais: novo ou alterado é quebra. Em geral não dá para decidir se o novo aceita
+# tudo o que a base aceitava (um `allOf` com `required`, um `not`, um `$ref` que troca o nó); remover só afrouxa.
+ESTRUTURAIS = ("allOf", "anyOf", "oneOf", "not", "dependencies", "patternProperties", "$ref")
+
+# Contagens: piso subindo ou teto descendo é aperto (mesma regra de minLength/maxLength).
+CONTAGENS = (
+    ("minLength", True),
+    ("maxLength", False),
+    ("minItems", True),
+    ("maxItems", False),
+    ("minProperties", True),
+    ("maxProperties", False),
+)
+
+CAMPOS_DA_QUEBRA_ACEITA = ("schema", "caminho", "regra", "motivo", "data")
 
 
 def _tipos(no: dict[str, Any]) -> set[str]:
@@ -103,10 +124,17 @@ def _comparar_restricoes(
                 f"{caminho}: {chave}/{exclusiva} apertado {_texto(lb, piso)} -> {_texto(ln, piso)}"
             )
 
-    for chave, piso in (("minLength", True), ("maxLength", False)):
+    for chave, piso in CONTAGENS:
         cb, cn = base.get(chave), novo.get(chave)
         if cn is not None and (cb is None or (cn > cb if piso else cn < cb)):
             quebras.append(f"{caminho}: {chave} apertado {cb} -> {cn}")
+
+    if novo.get("uniqueItems") is True and base.get("uniqueItems") is not True:
+        quebras.append(f"{caminho}: uniqueItems novo")
+
+    for chave in ESTRUTURAIS:
+        if chave in novo and novo[chave] != base.get(chave):
+            quebras.append(f"{caminho}: {chave} novo ou alterado")
 
     # multipleOf novo, ou um que a base não satisfaz (0.01 -> 0.1 aperta; 0.01 -> 0.001 afrouxa).
     mb, mn = _numero(base.get("multipleOf")), _numero(novo.get("multipleOf"))
@@ -133,7 +161,10 @@ def comparar_no(
         quebras.append(f"{caminho}: type alterado {sorted(_tipos(base))} -> {sorted(_tipos(novo))}")
 
     vb, vn = _valores_fixos(base), _valores_fixos(novo)
-    if vb is not None:
+    # enum/const criado: o nó aceitava qualquer valor do tipo e agora só uma lista fechada.
+    if vb is None and vn is not None:
+        quebras.append(f"{caminho}: enum/const novo {sorted(vn)}")
+    elif vb is not None:
         if vn is None:
             quebras.append(f"{caminho}: enum/const removido")
         elif fixo and vb != vn:
@@ -165,8 +196,9 @@ def comparar_no(
             fixo=caminho.endswith("$") and nome in ATRIBUTOS_FIXOS,
         )
 
-    if isinstance(base.get("items"), dict) and isinstance(novo.get("items"), dict):
-        comparar_no(base["items"], novo["items"], f"{caminho}[]", quebras, avisos)
+    # `items` novo compara contra o schema vazio (que aceita tudo): qualquer restrição nele é aperto.
+    if isinstance(novo.get("items"), dict) and isinstance(base.get("items", {}), dict):
+        comparar_no(base.get("items", {}), novo["items"], f"{caminho}[]", quebras, avisos)
 
 
 def comparar_diretorios(base: Path, novo: Path) -> tuple[list[str], list[str]]:
@@ -187,21 +219,76 @@ def comparar_diretorios(base: Path, novo: Path) -> tuple[list[str], list[str]]:
     return quebras, avisos
 
 
+def carregar_aceitas(arquivo: Path) -> list[dict[str, str]]:
+    """Lê e valida o registro de quebras aceitas. Qualquer defeito levanta ValueError (o gate reprova)."""
+    try:
+        conteudo = json.loads(arquivo.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as erro:
+        raise ValueError(f"{arquivo}: ilegível ({erro})") from erro
+    entradas = conteudo.get("quebras") if isinstance(conteudo, dict) else None
+    if not isinstance(entradas, list):
+        raise ValueError(f"{arquivo}: esperado objeto com a lista `quebras`")
+    for n, entrada in enumerate(entradas):
+        onde = f"{arquivo}: quebras[{n}]"
+        if not isinstance(entrada, dict) or set(entrada) != set(CAMPOS_DA_QUEBRA_ACEITA):
+            raise ValueError(f"{onde}: campos devem ser exatamente {list(CAMPOS_DA_QUEBRA_ACEITA)}")
+        if not all(isinstance(v, str) and v.strip() for v in entrada.values()):
+            raise ValueError(f"{onde}: todo campo é texto não vazio")
+        if not entrada["schema"].endswith(".schema.json") or not entrada["caminho"].startswith("$"):
+            raise ValueError(f"{onde}: `schema` é um *.schema.json e `caminho` começa em `$`")
+        try:
+            date.fromisoformat(entrada["data"])
+        except ValueError as erro:
+            raise ValueError(f"{onde}: `data` não é AAAA-MM-DD") from erro
+    return entradas
+
+
+def separar_aceitas(
+    quebras: list[str], aceitas: list[dict[str, str]]
+) -> tuple[list[str], list[str], list[str]]:
+    """(quebras que reprovam, quebras aceitas com o motivo, entradas sem efeito). Casamento EXATO."""
+    por_texto = {f"{a['schema']}:{a['caminho']}: {a['regra']}": a for a in aceitas}
+    restantes = [q for q in quebras if q not in por_texto]
+    usadas = [
+        f"{q} (motivo: {por_texto[q]['motivo']}; {por_texto[q]['data']})"
+        for q in quebras
+        if q in por_texto
+    ]
+    sem_efeito = [texto for texto in por_texto if texto not in quebras]
+    return restantes, usadas, sem_efeito
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", type=Path, required=True, help="schemas da base")
     parser.add_argument("--novo", type=Path, required=True, help="schemas da mudança")
+    parser.add_argument("--aceitas", type=Path, help="registro de quebras aceitas (JSON)")
     args = parser.parse_args(argv)
 
+    try:
+        aceitas = carregar_aceitas(args.aceitas) if args.aceitas else []
+    except ValueError as erro:
+        print(f"ERRO   {erro}")
+        return 2
     quebras, avisos = comparar_diretorios(args.base, args.novo)
+    quebras, usadas, sem_efeito = separar_aceitas(quebras, aceitas)
     for aviso in avisos:
         print(f"AVISO  {aviso}")
+    for texto in sem_efeito:
+        print(
+            f"AVISO  quebra aceita sem efeito (a base já a contém?), pode sair do registro: {texto}"
+        )
+    for texto in usadas:
+        print(f"ACEITA {texto}")
     for quebra in quebras:
         print(f"QUEBRA {quebra}")
     if quebras:
         print(f"\n{len(quebras)} quebra(s) BACKWARD. Mudança incompatível exige novo major (v2).")
         return 1
-    print("schemas compatíveis (BACKWARD)")
+    if usadas:
+        print(f"schemas compatíveis (BACKWARD), com {len(usadas)} quebra(s) aceita(s) no registro")
+    else:
+        print("schemas compatíveis (BACKWARD)")
     return 0
 
 

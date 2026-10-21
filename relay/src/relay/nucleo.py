@@ -7,7 +7,7 @@ concorrentes, retry do Lambda, falha ao apagar). Duplicata é normal; o consumid
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -39,7 +39,9 @@ class Publicador(Protocol):
 class Outbox(Protocol):
     def apagar(self, ids: Iterable[str]) -> None: ...
 
-    def listar_antigos(self, antes_de_ms: int) -> list[EventoPendente]: ...
+    def paginas_antigas(self, antes_de_ms: int) -> Iterator[list[EventoPendente]]:
+        """Itens criados antes de `antes_de_ms`, em páginas de tamanho limitado (sem acumular a tabela)."""
+        ...
 
 
 def processar(

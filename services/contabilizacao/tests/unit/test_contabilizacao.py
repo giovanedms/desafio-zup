@@ -117,6 +117,24 @@ def test_campo_desconhecido_nao_quebra_leitor_tolerante(caso_de_uso: Contabiliza
     assert caso_de_uso.executar(evento) is Desfecho.CONTABILIZADO
 
 
+def test_canal_no_evento_e_ignorado_e_o_lancamento_nao_muda() -> None:
+    """G8: `canal` (opcional, aditivo) não entra no lançamento; recusa com motivo novo segue sem regra."""
+    sem, com = RepositorioContabilEmMemoria(), RepositorioContabilEmMemoria()
+    evento = cloudevent("TransacaoAutorizada", tipo_operacao="DEBITO", id_autorizacao="a-1")
+
+    ContabilizarEvento(sem, LivroDeRegras()).executar(evento)
+    desfecho = ContabilizarEvento(com, LivroDeRegras()).executar(
+        {**evento, "data": {**evento["data"], "canal": "PIX"}}
+    )
+
+    assert desfecho is Desfecho.CONTABILIZADO
+    assert com.lancamentos == sem.lancamentos
+    recusa = cloudevent(
+        "TransacaoRecusada", tipo_operacao="DEBITO", motivo="CONTA_DIVERGENTE", canal="APP"
+    )
+    assert ContabilizarEvento(com, LivroDeRegras()).executar(recusa) is Desfecho.IGNORADO
+
+
 def test_id_do_lancamento_e_deterministico() -> None:
     evento = EventoRecebido.de_cloudevent(cloudevent("TransacaoAutorizada", tipo_operacao="DEBITO"))
     assert Lancamento.id_para(evento.source, evento.id) == Lancamento.id_para(

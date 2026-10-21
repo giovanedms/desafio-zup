@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ import pytest
 from relay.cdc_limites import (
     NOME_CURTO,
     OutboxNoop,
+    RegistroMalformado,
     de_registro_do_stream_de_limites,
 )
 from relay.lambda_handler import handler_cdc_limites
@@ -130,22 +132,38 @@ def test_outros_tipos_de_registro_sao_ignorados(nome: str) -> None:
     assert de_registro_do_stream_de_limites(registro(imagem(), imagem("9.00"), nome)) is None
 
 
-def test_registro_sem_old_image_e_ignorado() -> None:
+def test_modify_sem_old_image_e_malformado_nao_some() -> None:
     r = alteracao()
     del r["dynamodb"]["OldImage"]
 
-    assert de_registro_do_stream_de_limites(r) is None
+    with pytest.raises(RegistroMalformado, match="OldImage"):
+        de_registro_do_stream_de_limites(r)
 
 
-def test_imagem_malformada_e_ignorada() -> None:
+def _sem_versao() -> dict[str, Any]:
     depois = imagem("1500.00", versao=2)
     del depois["versao"]
+    return registro(imagem(), depois)
 
-    assert de_registro_do_stream_de_limites(registro(imagem(), depois)) is None
+
+@pytest.mark.parametrize(
+    "estragar",
+    [
+        pytest.param(lambda d: d.pop("versao"), id="sem-versao"),
+        pytest.param(lambda d: d.pop("concedido"), id="sem-concedido"),
+        pytest.param(lambda d: d.update(versao={"S": "x"}), id="versao-nao-numerica"),
+    ],
+)
+def test_imagem_malformada_levanta_em_vez_de_descartar(estragar: Any) -> None:
+    depois = imagem("1500.00", versao=2)
+    estragar(depois)
+
+    with pytest.raises(RegistroMalformado):
+        de_registro_do_stream_de_limites(registro(imagem(), depois))
 
 
 def test_outbox_noop() -> None:
-    assert OutboxNoop().listar_antigos(10**18) == []
+    assert list(OutboxNoop().paginas_antigas(10**18)) == []
     assert OutboxNoop().apagar(["a"]) is None
 
 
@@ -173,3 +191,26 @@ def test_handler_reporta_falha_por_sequencia(
     resposta = handler_cdc_limites({"Records": [alteracao(), reserva]}, None)
 
     assert resposta == {"batchItemFailures": falhas}
+
+
+def test_handler_devolve_o_malformado_como_falha_e_publica_o_resto(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F-6: o malformado volta ao ESM (retry e, esgotado, DLQ on-failure com alarme); o válido sai."""
+    from relay import lambda_handler  # noqa: PLC0415
+
+    publicador = PublicadorFalso(True)
+    monkeypatch.setattr(
+        lambda_handler,
+        "_cdc_limites",
+        lambda_handler.ComponentesCdcLimites(publicador, OutboxNoop()),  # type: ignore[arg-type]
+    )
+    ruim = _sem_versao()
+    ruim["dynamodb"]["SequenceNumber"] = "200"
+
+    with caplog.at_level(logging.ERROR, logger="relay.lambda_handler"):
+        resposta = handler_cdc_limites({"Records": [alteracao(), ruim]}, None)
+
+    assert resposta == {"batchItemFailures": [{"itemIdentifier": "200"}]}
+    linhas = [json.loads(r.getMessage()) for r in caplog.records if r.levelno == logging.ERROR]
+    assert [(x["evento"], x["sequencia"]) for x in linhas] == [("cdc_registro_malformado", "200")]

@@ -83,13 +83,21 @@ def test_apagar_em_lotes_de_25_e_reprocessa_nao_processados() -> None:
         stub.assert_no_pending_responses()
 
 
-def test_listar_antigos_pagina_e_filtra() -> None:
+def test_paginas_antigas_usa_limit_e_entrega_uma_pagina_por_vez() -> None:
     cliente = _cliente_dynamodb()
+    base = {
+        "TableName": "t",
+        "Limit": 2,
+        "ProjectionExpression": "pk, id_evento, detail_type, cloudevent, criado_em_ms",
+        "FilterExpression": "criado_em_ms < :t",
+        "ExpressionAttributeValues": {":t": {"N": "5"}},
+    }
+    chave = {"pk": {"S": "OUTBOX#ev-1"}}
     with Stubber(cliente) as stub:
-        stub.add_response(
-            "scan", {"Items": [IMAGEM], "LastEvaluatedKey": {"pk": {"S": "OUTBOX#ev-1"}}}
-        )
-        stub.add_response("scan", {"Items": []})
-        antigos = OutboxDynamoDB(cliente, "t").listar_antigos(5)
+        stub.add_response("scan", {"Items": [IMAGEM], "LastEvaluatedKey": chave}, base)
+        stub.add_response("scan", {"Items": []}, {**base, "ExclusiveStartKey": chave})
+        paginas = OutboxDynamoDB(cliente, "t").paginas_antigas(5, itens_por_pagina=2)
+        assert [e.id_evento for e in next(paginas)] == ["ev-1"]
+        assert next(paginas) == []  # página sem item antigo também sai (o sweeper confere o prazo)
+        assert next(paginas, None) is None
         stub.assert_no_pending_responses()
-    assert [e.id_evento for e in antigos] == ["ev-1"]

@@ -34,7 +34,7 @@ services/<svc>/src/<svc>/
 | Princípio | Onde | Como verificar |
 |---|---|---|
 | **SRP** | `limites/domain/limite.py` decide se cabe; `adapters/outbound/dynamodb.py::compilar` traduz para expressão do DynamoDB; `adapters/inbound/http.py` traduz HTTP; `autorizacao/adapters/outbound/cloudevents.py` só formata eventos. `AutorizarTransacao` orquestra e não sabe de HTTP nem de DynamoDB | Cada módulo tem um motivo de mudança. Mudar o formato do evento não toca o domínio |
-| **OCP** | `limites/domain/operacoes.py`: cada operação é uma subclasse de `OperacaoDeLimite` que produz um `Plano`. O adapter compila **o plano**, não o tipo da operação, então uma operação nova não altera nenhum adapter | Os testes do repositório rodam qualquer operação pelo mesmo `compilar` |
+| **OCP** | `limites/domain/operacoes.py`: cada operação é uma subclasse de `OperacaoDeLimite` que produz um `Plano`. O adapter de persistência compila **o plano**, não o tipo da operação, então uma operação nova não altera nenhum adapter de persistência. O inbound HTTP muda: a operação entra no `Literal` de `OperacaoRequest.tipo` e ganha um `case` em `_para_operacao` (`limites/adapters/inbound/http.py`). Do mesmo jeito, um evento novo no BC Autorização ganha um `case` em `_dados_do_negocio` (`autorizacao/adapters/outbound/cloudevents.py`) | Os testes do repositório rodam qualquer operação pelo mesmo `compilar` |
 | **LSP** | `RepositorioDeLimites` tem duas implementações (memória e DynamoDB) e **a mesma suíte de contrato** roda nas duas (`limites/tests/contract/test_porta_repositorio.py`), inclusive a corrida com 100 threads. Idem `RepositorioDeAutorizacoes` (`autorizacao/tests/contract/`) | `make test` (memória) + `make test-integracao` (DynamoDB na LocalStack) |
 | **ISP** | `limites/application/portas.py`: `ConsultaDeLimites`, `AplicacaoDeOperacoes` e `CadastroDeLimites` são portas separadas. `ConsultarLimite` depende só da consulta; `AplicarOperacaoNoLimite`, só da aplicação | mypy strict garante que o caso de uso não chama o que não declarou |
 | **DIP** | Casos de uso recebem `Protocol`s (repositório, relógio, gerador de ids, gateway do outro BC). As classes concretas só se encontram em `main.py` | import-linter (`forbidden`) na CI |
@@ -46,7 +46,7 @@ services/<svc>/src/<svc>/
 - **Funções curtas com guard clauses** (`Limite.atende`, `Limite.diagnosticar`). A regra de máximo de `return`s subiu para 8 de propósito.
 - **Dinheiro sem float em nenhum ponto:** `parse_float=Decimal` na entrada, `Decimal` no domínio, `simplejson(use_decimal=True)` na saída.
 - **Testes como especificação:** nomes descrevem o comportamento (`test_reservar_repetido_depois_da_compactacao_continua_idempotente`), um cenário por teste, property-based para invariantes.
-- **Gates:** `make check` = ruff (lint + format) + mypy strict + import-linter + pytest.
+- **Gates:** `make check` = ruff (lint + format) + mypy strict + import-linter + pytest. O mypy roda só em `src/` (`Makefile`): os testes ficam fora da checagem de tipos.
 
 ## Consequências
 
@@ -57,6 +57,7 @@ services/<svc>/src/<svc>/
 - **Negativas:**
   - Mais arquivos e indireção que um CRUD.
   - Para um serviço desse tamanho, alguém pode chamar de cerimônia. A resposta é a suíte de contrato: ela só existe porque há porta.
+  - **Dívida registrada: o plumbing HTTP está duplicado.** `_problema`, `RespostaJsonExata`, `_uuid_canonico`, `_trace_id`, `_erro_de_campo`, `_dinheiro_json`, `parametro_invalido` e `saude` são idênticos nos adapters HTTP do `autorizacao` e do `limites`; `_Rejeicao`, `_PROBLEMAS` e a parte de correlação do middleware são quase cópia. Não é autonomia de BC, como a cópia de `dinheiro` (ADR-0015): é infraestrutura HTTP. O destino é `libs/plataforma`, que já é dependência dos dois serviços e hoje só tem `Problema` e o contexto de observabilidade. Ficou para depois do prazo para não mexer nos dois serviços na reta final.
 
 ## Quando esta decisão deixa de ser boa
 

@@ -22,13 +22,13 @@ O core banking legado (mainframe) é a fonte da verdade de contratos e limites c
 2. **ACL de entrada, assíncrona.** O legado publica registros de tamanho fixo numa fila (`legado-contratos`). A ACL (`limites/adapters/inbound/legado/traducao.py`) traduz o layout de 84 posições (decimal implícito, códigos, fuso local) para o comando de domínio `AtualizacaoDoLegado`. **Nada do formato legado passa da ACL.**
 3. **Ordem e idempotência pela versão do registro.**
    - Versão menor ou igual à já aplicada → **OBSOLETA**, ignorada. O feed pode reordenar e repetir: um property test prova que qualquer ordem converge para a maior versão.
-   - Contrato desconhecido → **CRIADO**, que também é o caminho da carga inicial.
+   - Contrato desconhecido → **CRIADO**, o caminho de contrato novo. A carga inicial de 240–400 M contratos não passa por aqui (item 8).
 4. **Sem interferência no item quente.** A sincronização é um compare-and-set **só** nos atributos do legado (`concedido`, `status`, `versao_legado`). As reservas mexem em `utilizado`, `reservado` e `disponivel` com expressões comutativas, então as duas coisas convivem sem transação nem lock (teste de corrida com reservas + atualizações do legado em paralelo).
 5. **Redução de limite abaixo do comprometido é aceita.** A decisão de crédito do legado prevalece: o disponível fica negativo e **nenhuma reserva nova passa** até regularizar.
 6. **`LimiteAlterado` por CDC.** O relay lê o Stream da tabela `limites` e publica só quando concedido ou status mudam (não a cada reserva). Assim nenhuma transação toca o item quente para gravar outbox.
 7. **ACL de saída** (contabilização → legado contábil): os lançamentos ficam disponíveis por evento e tabela. A exportação no formato do legado (arquivo posicional) é um adapter de saída do BC Contabilização, desenhado e não implementado no prazo.
 8. **Carga inicial e reconciliação noturna** (desenhadas):
-   - carga em lote do arquivo do legado pelo mesmo tradutor;
+   - carga inicial por **DynamoDB import from S3**: o arquivo do legado passa em lote pelo mesmo tradutor e o import cria a tabela já carregada. O feed fica só com os deltas: na task de hoje (0,25 vCPU, em série), 240–400 M registros levariam ~51 a ~85 dias (`docs/capacidade.md`, seção 1.5);
    - conciliação diária concedido × legado, com divergência → alarme.
 9. **Defasagem:**
    - alarme `defasagem-do-legado`: `ApproximateAgeOfOldestMessage` da fila `legado-contratos` acima de **300 s** (`modules/observabilidade`, `var.defasagem_legado_limite_s`), com ação no tópico SNS de alarmes. Também há o widget de idade da mensagem mais antiga no dashboard (agora com a fila do legado) e o alarme da DLQ do feed;
@@ -44,12 +44,14 @@ O core banking legado (mainframe) é a fonte da verdade de contratos e limites c
 - **Negativas:**
   - O limite concedido é **eventualmente consistente** com o legado (segundos).
   - Uma redução de limite pode chegar depois de uma autorização feita com o limite antigo. Esse risco é aceito e limitado pela defasagem monitorada: o alarme dispara quando a réplica fica mais de 5 min atrás do feed.
+  - **O `LimiteAlterado` é montado fora do BC Limites**, no `relay/` (`relay/src/relay/cdc_limites.py`), a partir do diff do item no Stream. O preço: o contrato publicado do BC mora no relay, que conhece os nomes dos atributos do item (`concedido`, `status`, `disponivel`, `versao`, `versao_legado`); evoluir o evento ou renomear um atributo exige mexer lá também. É a derivação por diff de estado que o ADR-0007 recusa para a Autorização, aceita aqui porque nenhuma transação toca o item quente.
 
 ## Quando esta decisão deixa de ser boa
 
 | Gatilho | Mudança |
 |---|---|
 | O negócio exige que a redução de limite tenha efeito **imediato** (bloqueio por fraude) | Canal prioritário de bloqueio: comando síncrono do legado para a API interna, ou status de bloqueio publicado pelo antifraude, com SLA próprio |
+| O `LimiteAlterado` precisa de dado que não está no item, ou de evoluir no ritmo do BC Limites | Outbox próprio do `limites`: o resultado ATUALIZADO da sincronização grava o evento na mesma transação do item (só quando o legado muda concedido ou status, nunca nas reservas) e o CDC do relay sai |
 | Fim da migração (o legado deixa de ser dono do concedido) | O BC Limites vira dono; a ACL de entrada é desligada e a de saída passa a alimentar o legado residual |
 
 ## Referências

@@ -16,7 +16,7 @@ Fatos (da documentação oficial da AWS; os links principais estão em Referênc
   - escala 1.000 ambientes a cada 10 s;
   - cold start em < 1% das invocações;
   - SnapStart e provisioned concurrency são mutuamente exclusivos.
-  - **A conta tem 1.000 de concorrência em vigor** (`docs/operacao/infraestrutura.md`, seção 2). Pela regra dos 10×, 1.000 de concorrência sustentam até 10.000 RPS (a quota é da conta, dividida entre as funções), o dobro do pico: **a quota não impede Lambda no síncrono**.
+  - **A conta tem 1.000 de concorrência em vigor** (`docs/operacao/infraestrutura.md`, seção 2). Pela regra dos 10×, 1.000 de concorrência sustentam até 10.000 RPS, divididos entre as funções da conta: um serviço quente no pico (≥ 500) cabe com folga, mas os dois (`autorizacao` e `limites`, 5.000 RPS cada) pediriam ≥ 1.000, a quota inteira, sem nada para relay e consumidores. A quota é ajustável: **ela não impede Lambda no síncrono, mas pede aumento antes**.
 - **ECS Fargate:** o scale-out reativo leva ~86 s para disparar e ~109 s até servir no melhor caso documentado. Predictive scaling existe em sa-east-1. A conta tem 140 vCPU de quota.
 - **EKS:** plano de controle pago, mais operação (upgrades, add-ons). O App Mesh foi descontinuado em 30/09/2026.
 
@@ -45,6 +45,7 @@ Fatos (da documentação oficial da AWS; os links principais estão em Referênc
   - Headroom mínimo pago o tempo todo.
   - Dois modelos de deploy (ECS e Lambda).
   - O escalonamento do Fargate não reage em segundos.
+  - **O p99 de 150 ms não foi atingido nesta stack:** 164 ms no gateway a 33% de CPU (`docs/capacidade.md`, seção 3). A distância é Python mais a transação de ~21 ms (`TransactWriteItems` da autorização com o outbox), que pesariam igual em Lambda: não é a escolha entre Fargate e Lambda. O caminho está na alavanca 1 de `docs/capacidade.md`, seção 5, e no runtime compilado do ADR-0003.
 
 ## Quando esta decisão deixa de ser boa
 
@@ -58,7 +59,7 @@ Fatos (da documentação oficial da AWS; os links principais estão em Referênc
 
 | Opção | Por que não |
 |---|---|
-| Lambda no síncrono | Não é a quota: a conta tem 1.000 em vigor, que cobre o pico. É **o p99**: cold start em < 1% das invocações cai exatamente na cauda que o RNF de 150 ms mede, e evitá-lo pede provisioned concurrency de ≥ 500 por função, paga o tempo todo. É **o custo em carga sustentada**: com tráfego alto e contínuo, cobrança por invocação e duração perde para tasks com CPU ocupada. E é **o Service Connect**: `autorizacao` chama `limites` (e o reconciliador também) pelo Service Connect, do qual Lambda não participa; trocar exigiria pôr o `limites` atrás de um ALB ou do VPC Lattice |
+| Lambda no síncrono | **Custo em carga sustentada:** com tráfego alto e contínuo, cobrança por invocação e duração perde para tasks com CPU ocupada, e tirar o cold start da cauda pede provisioned concurrency de ≥ 500 por função, paga o tempo todo. **Quota:** os dois serviços quentes pediriam a quota de concorrência inteira da conta (Contexto). **East-west:** `autorizacao` e reconciliador chamam o `limites` pelo Service Connect, do qual Lambda não participa; seria preciso expor o `limites` num listener do NLB interno que já existe, ou invocá-lo direto (`lambda:InvokeFunction`, se ele também virasse Lambda). Funciona, mas sai do padrão east-west do resto da plataforma (ADR-0012). **p99, argumento secundário:** o cold start (< 1% das invocações) cai na cauda que o RNF mede, mas não é o que separa esta stack dos 150 ms (Consequências). A favor da alternativa, e por isso ela continua no radar: escala mais rápido que o Fargate (1.000 ambientes a cada 10 s contra ~109 s) e poderia deixar a plataforma com um modelo de deploy só, em vez de dois |
 | EKS | Mais operação sem ganho para 3 serviços; vira a escolha certa se for o padrão de plataforma |
 
 ## Referências

@@ -44,6 +44,8 @@ flowchart LR
 ```
 Diagrama: [01-contexto.svg](diagramas/01-contexto.svg).
 
+**Quem é o canal:** cada canal é um app client do Cognito, com API key própria ligada a um usage plan (ADR-0010). A autoridade sobre o canal é o `client_id` do token, que o gateway injeta em `X-Client-Id` e que isola as autorizações de um canal das de outro. O `metadata.canal` do pedido é declarativo: fica gravado na autorização, e nenhuma regra decide por ele.
+
 ## 3. Containers (C4 nível 2)
 
 ```mermaid

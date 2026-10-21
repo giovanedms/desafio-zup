@@ -3,7 +3,7 @@ flowchart TB
     WAF[WAF] --> GW["API Gateway REST<br/>stage v1 · Cognito · usage plans"]
     subgraph VPC["VPC 10.40.0.0/16 · subnets públicas sa-east-1a e sa-east-1c · sem NAT · tasks sem ingress da internet"]
       VPCL[VPC Link] --> NLB[NLB interno]
-      subgraph ECS["ECS cluster desafio · Service Connect"]
+      subgraph ECS["ECS cluster desafio · Service Connect · um security group por serviço"]
         AUT[autorizacao]
         LIMS["limites<br/>limites:8080"]
         ACL[limites-acl]
@@ -14,8 +14,8 @@ flowchart TB
     end
     GW --> VPCL
     NLB --> AUT
-    AUT --> LIMS
-    REC --> LIMS
+    AUT -- "8080 (SG por referência)" --> LIMS
+    REC -- "8080 (SG por referência)" --> LIMS
     DDB[("DynamoDB<br/>5 tabelas")]
     EB{{EventBridge}}
     SQS[["SQS<br/>filas dos consumidores"]]

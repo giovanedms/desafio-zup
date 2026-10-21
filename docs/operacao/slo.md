@@ -26,7 +26,7 @@ As premissas estão no ADR-0001 (99,9%/mês; p99 ≤ 150 ms no gateway). Aqui fi
 - **Latência: 99% das requisições sem erro em até 150 ms** no gateway, o p99 do ADR-0001. **Alvo não atingido:** o melhor degrau medido teve p99 de 164 ms no gateway (150 rps, 33% de CPU); 526 ms a 300 rps; 874 ms a 600 rps (`docs/capacidade.md`, seção 3). O caminho está na seção 5 do mesmo documento.
 - **Ordem de grandeza:** o degrau de 600 rps com 6 tasks teve 4,4% de 503, 44× a taxa do budget. Sustentado, gastaria o mês em ~16 h.
 
-## Política de burn-rate (desenhada, não implementada)
+## Política de burn-rate (implementada na IaC)
 
 Taxa de queima = taxa de 5xx ÷ 0,1%. São dois alertas, cada um com janela longa e janela curta, e as duas precisam estar acima do limiar: a longa dá significância, a curta faz o alerta parar logo depois da recuperação (Google SRE Workbook, "Alerting on SLOs").
 
@@ -35,17 +35,16 @@ Taxa de queima = taxa de 5xx ÷ 0,1%. São dois alertas, cada um com janela long
 | Rápido | 14,4× | 1 h | 5 min | > 1,44% | 2% do mês | Página ao plantão |
 | Lento | 6× | 6 h | 30 min | > 0,6% | 5% do mês | Página ao plantão |
 
-- **Implementação prevista:** um alarme de metric math (`5XXError` ÷ `Count`) por janela, os dois de cada alerta combinados num alarme composto (AND), com ação no tópico SNS de alarmes (ADR-0017).
+- **Implementação:** `infra/terraform/modules/observabilidade/main.tf` tem um alarme de metric math (`5XXError` ÷ `Count`) por janela (`api-5xx-burn-rapido-1h`, `-rapido-5min`, `-lento-6h`, `-lento-30min`, sem ação própria) e um alarme composto por par (`api-5xx-burn-rapido` e `api-5xx-burn-lento`, AND das duas janelas), com ação no tópico SNS de alarmes. Janela com média abaixo de `burn_rate_rps_minimo` não avalia: no sandbox ocioso, 1 erro em 20 requisições do smoke não pode queimar um orçamento que nem tem amostra.
 - **Budget esgotado no mês:** só entram mudanças de confiabilidade e capacidade até a janela de 30 dias voltar ao positivo.
 
 ## Alarmes de API que a IaC tem hoje
 
-`infra/terraform/modules/observabilidade/main.tf` tem dois, e nenhum é de burn-rate:
-
-| Alarme | Regra | O que ele não cobre deste SLO |
+| Alarme | Regra | Observação |
 |---|---|---|
-| `api_5xx` | 5xx ÷ `Count` > 1% num período de 5 min | Janela única; 1% é 10× a taxa do budget: 0,9% sustentado não alarma e gasta o mês em ~3 dias. Conta o 503 de shedding, o que está certo por este SLI |
-| `api_p99` | p99 do `Latency` > 150 ms em 3 de 5 min | O p99 medido passou de 150 ms em todos os degraus: sob carga sustentada ele dispara e mostra o alvo não atingido, não um incidente. Não tem runbook |
+| `api-5xx-burn-rapido` (composto) | 1 h e 5 min acima de 14,4× o orçamento (> 1,44% de 5xx) | Conta o 503 de shedding, como este SLI manda |
+| `api-5xx-burn-lento` (composto) | 6 h e 30 min acima de 6× o orçamento (> 0,6% de 5xx) | Idem |
+| `api_p99` | p99 do `Latency` > **400 ms** (`p99_alarme_ms`) em 3 de 5 min | Não alarma no SLO de 150 ms porque o entregue não o atinge (164 ms no melhor degrau): alarmar em 150 dispararia sempre. 400 ms fica acima do medido com folga de CPU e abaixo da saturação (874 ms). O SLO de latência segue anotado no dashboard |
 
 O SLO cobre a API síncrona. O caminho assíncrono não tem SLO definido; os sinais dele são os alarmes de DLQ, IteratorAge e defasagem do legado (ADR-0017).
 

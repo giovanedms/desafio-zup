@@ -26,12 +26,13 @@ Fatos (da documentação oficial da AWS; os links principais estão em Referênc
   - Authorizer `COGNITO_USER_POOLS` exigindo o escopo.
   - O `client_id` do token é injetado no header `X-Client-Id` da integração e compõe o escopo de idempotência (ADR-0006).
   - O serviço só é alcançável pelo VPC Link, então não aceita o header vindo de fora.
-- **Cotas por consumidor:** usage plan + API key por canal, com dois planos para a demo.
+- **Cotas por consumidor:** usage plan + API key por canal, com três planos no sandbox.
 
   | Plano | Taxa | Burst | Quota |
   |---|---|---|---|
   | `plano-padrao` | 200 rps | 400 | 1 M/dia |
   | `plano-restrito` | 5 rps | 10 | 1.000/dia, para demonstrar o **429** |
+  | `plano-carga` | 200 rps | 400 | 1 M/dia; só a janela de medição com k6 sobe este plano e os dois tetos do WAF, pelo tfvars |
 
 - **Os números são de demonstração; a regra é a de produção.** A 5.000 TPS em 3 canais iguais (~1.667 rps cada), o plano de cada canal fica em 1,6 × o pico dele (~2.667 rps, a folga do ADR-0004), o WAF por consumidor em 2× isso (1,6 M em 5 min) e o WAF por IP acima da soma dos canais que dividem um egress; a quota diária sai do maior dia do canal (2×), que o enunciado não dá. A soma dos planos, 8.000 rps, é 80% do throttle de 10.000 da conta. Conta completa: `docs/capacidade.md`, seção 1.4.
 - **Proteção dura:**

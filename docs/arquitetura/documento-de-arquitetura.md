@@ -15,7 +15,7 @@
   |---|---|
   | 100 reservas simultâneas de R$ 100 num limite de R$ 1.000 → **exatamente 10 aprovadas e 90 recusadas**, saldo final zero | Testes (memória e DynamoDB) e demo HTTP ponta a ponta |
   | Invariantes do saldo verificadas para **qualquer** sequência de operações | Testes property-based |
-  | Desempenho | **Medido** na AWS real até 600 rps com 5.000 contratos e **extrapolado** para 5.000 TPS (`docs/capacidade.md` seções 3 a 5). Os 5.000 TPS **não foram executados** |
+  | Desempenho | **Medido** na AWS real até ~570 rps aceitos (600 oferecidos, 4,4% de 503) com 5.000 contratos e **extrapolado** para 5.000 TPS (`docs/capacidade.md` seções 3 a 5). Os 5.000 TPS **não foram executados** |
 
 - **Principais riscos aceitos:**
   - limite concedido eventualmente consistente com o legado (segundos);

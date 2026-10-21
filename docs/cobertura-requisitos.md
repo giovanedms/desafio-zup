@@ -27,7 +27,7 @@
 | ID | Requisito | Onde | Nível |
 |---|---|---|---|
 | NFR-01..02 | 80 M contas; 3–5 contratos/conta | ADR-0001; `docs/capacidade.md` §1 (sizing, key design) | **P/Dc** |
-| NFR-03 | ~5.000 TPS | `docs/capacidade.md` §3–5: medido na AWS (20/10) até 600 rps com 5.000 contratos; ~8 ms de CPU por autorização (~122 rps/vCPU), ~4,6 ms por operação no limite; 150 rps com p99 de gateway de 164 ms; extrapolação para 5.000 TPS (~106–200 vCPU) e custo (14,6 WRU por autorização). **5.000 TPS não foi executado** (custo e quota do sandbox); p99 ≤ 150 ms não atingido | **D** (medido em escala menor) + **Dc** (extrapolação) + **L** (5.000 TPS não executado) |
+| NFR-03 | ~5.000 TPS | `docs/capacidade.md` §3–5: medido na AWS (20/10) até ~570 rps aceitos (600 oferecidos, 4,4% de 503) com 5.000 contratos, na imagem 1.0.3, anterior às correções de 21/10 (não remedida, `docs/capacidade.md` §3); ~8 ms de CPU por autorização (~122 rps/vCPU), ~4,6 ms por operação no limite; 150 rps com p99 de gateway de 164 ms; extrapolação para 5.000 TPS (~106–200 vCPU) e custo (14,6 WRU por autorização). **5.000 TPS não foi executado** (custo e quota do sandbox); p99 ≤ 150 ms não atingido | **D** (medido em escala menor) + **Dc** (extrapolação) + **L** (5.000 TPS não executado) |
 | NFR-04 | Latência, SLO, RPO/RTO, retenção | ADR-0001 | **P** |
 
 ## Contrato de API
@@ -36,7 +36,7 @@
 |---|---|---|---|
 | API-01 | `POST /v1/contratos/{id}/autorizacoes` | `contracts/openapi/autorizacao-v1.yaml` | **D** |
 | API-02 | `Idempotency-Key` obrigatório | ausente/inválida → 400 (teste) | **D** |
-| API-03 | Campos e validações | `PedidoRequest` + `PedidoDeAutorizacao`; testes 400/422; corpos validados contra o OpenAPI (`services/autorizacao/tests/contract/test_api_bate_com_o_contrato.py`). `id_conta` é **conferido** contra a titular do contrato na réplica do core: divergente → 422 `CONTA_DIVERGENTE`, sem gravar nada (`limites` `Limite.atende`/`diagnosticar`, condição na escrita; testes nas duas pernas) | **D** |
+| API-03 | Campos e validações | `PedidoRequest` + `PedidoDeAutorizacao`; testes 400/422; corpos validados contra o OpenAPI (`services/autorizacao/tests/contract/test_api_bate_com_o_contrato.py`). `id_conta` é **conferido** contra a titular do contrato na réplica do core: divergente → 422 `CONTA_DIVERGENTE`, sem gravar nada (`limites` `Limite.atende`/`diagnosticar`, condição na escrita; testes nas duas pernas). **Desvio declarado:** o enunciado descreve `metadata` como objeto livre ("rastreio, geo"); aqui ele é uma **allowlist** (`canal`, `id_rastreio_canal`, `geo.uf`, `geo.municipio_ibge`) por minimização da LGPD, e campo fora dela dá 422 apontando o campo (ADR-0011, ADR-0017). Campo novo entra no schema de forma aditiva | **D** |
 | API-04 | 201 com `id_autorizacao` e saldo reservado | teste + demo | **D** |
 | API-05 | 200 replay | corpo idêntico byte a byte (teste + demo) | **D** |
 | API-06 | 402 limite insuficiente | teste + demo; nuance no ADR-0011 | **D** |
@@ -56,7 +56,7 @@
 |---|---|---|---|
 | EVT-01 | Schema `TransacaoAutorizada` v1 | `contracts/events/`; teste de contrato do produtor. A captura publica `TransacaoAutorizada` (DEBITO, com `id_autorizacao_original` opcional) e `ReservaCapturada` (`reserva-capturada.v1.schema.json`; `test_captura_cumpre_o_schema_da_transacao_autorizada_com_a_original`; ADR-0020) | **D** |
 | EVT-02 | EventBridge e roteamento | bus `financas` + regras (bootstrap e Terraform); teste de integração | **D** |
-| EVT-03 | Consumidores desacoplados | filas por consumidor + DLQ; fan-out provado na demo §6 (o mesmo CloudEvent em `antifraude`, `notificacoes` e no lançamento contábil). Só a contabilização tem consumidor implementado; antifraude e notificações são filas dos sistemas a jusante | **D** (fan-out) + **I** (consumidores) |
+| EVT-03 | Consumidores desacoplados | filas por consumidor + DLQ; fan-out provado na demo §6 (o mesmo CloudEvent em `antifraude`, `notificacoes` e no lançamento contábil). Só a contabilização tem consumidor implementado; antifraude e notificações são filas dos sistemas a jusante. **Data platform** (o 4º consumidor do enunciado) não tem fila: na produção é o archive do bus mais Firehose → S3; no sandbox, só o archive (ADR-0009, seção "Decisão") | **D** (fan-out) + **I** (consumidores) |
 | EVT-04 | Imutáveis, passado, CloudEvents | CloudEvent em `detail`; validação por schema | **D** |
 | EVT-05 | `event_id` para dedup | `id` estável gerado no outbox; inbox da contabilização (teste de reentrega e corrida); o item do outbox não expira por idade e o sweeper republica o que sobrou em páginas, até 10.000 por rodada (`relay/src/relay/sweeper.py`) | **D** |
 | EVT-06 | Evolução validada por registry | `scripts/compat_schemas.py` + `tests/contract/test_compat_schemas.py` (inclui `additionalProperties`, `pattern`, limites numéricos, `format` e tamanhos); inclui `enum`/`const` novos e composições (`allOf`, `anyOf`, `oneOf`, `not`, `dependencies`); gate na CI em push e PR, fail-closed; quebra deliberada só com registro em `contracts/events/quebras-aceitas.json` (motivo e data; ADR-0008). **Nuance:** o registry do EventBridge não valida (ADR-0008); o repositório + CI fazem esse papel | **D** |
@@ -86,7 +86,7 @@
 |---|---|---|---|
 | PAP-01 | Well-Architected | `docs/arquitetura/well-architected.md`; ADR-0013/0017 | **Dc** |
 | PAP-02 | Comunicar trade-offs | documento de arquitetura §1; diagramas em `docs/arquitetura/diagramas/`; ADRs com "quando deixa de ser boa" | **Dc** |
-| IA-01..04 | Explicar decisões, trade-offs, código e alternativas | `docs/uso-de-ia.md`; `COMO-LER.md` nos 3 serviços; "Quando esta decisão deixa de ser boa" nos 20 ADRs; alternativas discutidas em todos, com seção formal em 7 | **Dc** |
+| IA-01..04 | Explicar decisões, trade-offs, código e alternativas | `docs/uso-de-ia.md`; `COMO-LER.md` nos 3 serviços; "Quando esta decisão deixa de ser boa" nos 20 ADRs; alternativas discutidas em todos, com seção formal em 8 (0003–0007, 0009, 0016, 0020) | **Dc** |
 | ENT-01 | ZIP com código, IaC, diagramas, ADRs | `make zip` (`git archive HEAD`); 5 diagramas em `.mmd` e `.svg`; 20 ADRs | **I** |
 | DEF-03 | Demo executando | `make up && make demo` (local, sem AWS); roda no job `e2e` da esteira a cada push e sai com 1 em qualquer divergência | **D** |
 

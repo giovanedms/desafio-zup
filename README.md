@@ -75,7 +75,7 @@ docs/
 
 A lista completa está em `docs/cobertura-requisitos.md` (Limitações declaradas). Estas quatro mudam a leitura do resto:
 
-- **p99 ≤ 150 ms não atingido:** o melhor degrau medido na AWS deu 164 ms no gateway, a 150 rps e 33% de CPU; os 5.000 TPS são extrapolados de 600 rps medidos (`docs/capacidade.md`, seção 3).
+- **p99 ≤ 150 ms não atingido:** o melhor degrau medido na AWS deu 164 ms no gateway, a 150 rps e 33% de CPU; os 5.000 TPS são extrapolados do maior degrau medido, ~570 rps aceitos de 600 oferecidos, com 4,4% de 503 (`docs/capacidade.md`, seção 3).
 - **Trilha de 10 anos só desenhada** (Firehose → S3 Object Lock, ADR-0017): no sandbox, o único armazenamento durável dos eventos é o archive de 30 dias do bus.
 - **2 de 8 tipos de evento sem assinante:** `TransacaoCompensada` e `TransacaoEmReconciliacaoManual` ficam só no archive.
 - **Sem saldo credor:** o limite não guarda crédito a favor do cliente. CREDITO ou estorno de débito maior que o utilizado é recusado.

@@ -8,13 +8,16 @@ info:
     Autorização síncrona de transações financeiras com verificação e reserva de limite por contrato.
 
     **Idempotência:** toda operação mutante exige `Idempotency-Key`. O escopo é `(client_id do token, método, URI concreta, chave)`.
-    Repetir a mesma chave com o mesmo corpo devolve o resultado original: aprovação 201 → 200 com corpo idêntico; recusa → o mesmo 402.
+    Repetir a mesma chave com o mesmo corpo devolve o resultado original: aprovação 201 → 200 com corpo idêntico; recusa → o mesmo
+    status (402/404/409/422) com corpo idêntico. O corpo do replay guarda o `correlation_id` (e o `trace_id`) da execução original;
+    o header `X-Correlation-Id` é sempre o desta requisição.
     Mesma chave com corpo diferente → 422. Mesma chave ainda em processamento → 409. A chave vale enquanto a autorização
     estiver na retenção quente (30 dias), que é maior que a vida de uma reserva (7 dias).
 
     **Erros:** `application/problem+json` conforme RFC 9457 (sucessora da RFC 7807 citada no enunciado), inclusive os gerados
-    pelo gateway (400 de parâmetro ausente, 401, 403, 429, 5xx). Extensões: `codigo`, `correlation_id`, `trace_id` e, conforme
-    o caso, `erros`, `id_autorizacao` e `limite_disponivel`. Desvio: o 429 das regras rate-based do WAF sai com
+    pelo gateway (400 de parâmetro ausente, 401, 403, 429, 5xx) e os de roteamento do serviço (405 método não suportado, 404 rota
+    inexistente). Extensões: `codigo`, `correlation_id`, `trace_id` e, conforme o caso, `erros`, `erros_omitidos`,
+    `id_autorizacao` e `limite_disponivel`. Desvio: o 429 das regras rate-based do WAF sai com
     `Content-Type: application/json` e corpo fixo, sem `correlation_id` (ver o catálogo).
 
     **Validação do corpo:** a autoridade é o serviço. O gateway não valida o corpo (só a presença dos parâmetros obrigatórios),
@@ -88,7 +91,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AutorizacaoAprovada' }
         '200':
-          description: Replay idempotente de uma aprovação — corpo idêntico ao da resposta original.
+          description: |
+            Replay idempotente de uma aprovação — corpo idêntico ao da resposta original, inclusive o `correlation_id` da
+            execução original. O header `X-Correlation-Id` é o desta requisição.
           headers:
             Location: { $ref: '#/components/headers/Location' }
             X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' }
@@ -101,6 +106,7 @@ paths:
         '402': { $ref: '#/components/responses/LimiteInsuficiente' }
         '403': { $ref: '#/components/responses/SemPermissao' }
         '404': { $ref: '#/components/responses/ContratoNaoEncontrado' }
+        '405': { $ref: '#/components/responses/MetodoNaoPermitido' }
         '409': { $ref: '#/components/responses/Conflito' }
         '415': { $ref: '#/components/responses/TipoDeMidiaNaoSuportado' }
         '422': { $ref: '#/components/responses/RegraDeDominioViolada' }
@@ -129,6 +135,8 @@ paths:
         '401': { $ref: '#/components/responses/NaoAutenticado' }
         '403': { $ref: '#/components/responses/SemPermissao' }
         '404': { $ref: '#/components/responses/AutorizacaoNaoEncontrada' }
+        '405': { $ref: '#/components/responses/MetodoNaoPermitido' }
+        '422': { $ref: '#/components/responses/RegraDeDominioViolada' }
         '429': { $ref: '#/components/responses/LimiteDeRequisicoes' }
         '500': { $ref: '#/components/responses/ErroInterno' }
         '503': { $ref: '#/components/responses/Indisponivel' }
@@ -175,16 +183,23 @@ components:
       name: traceparent
       in: header
       required: false
-      description: W3C Trace Context.
+      description: |
+        W3C Trace Context. Valor fora do formato é ignorado: não entra em log, no registro da autorização, no evento publicado
+        nem na chamada a outro serviço (a requisição segue sem trace).
       schema: { type: string, pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$' }
 
   headers:
     Location:
-      description: URI da autorização criada.
-      schema: { type: string }
+      description: |
+        Referência RELATIVA à autorização (`autorizacoes/{id_autorizacao}`), resolvida contra a URI da requisição
+        (RFC 3986 §5.2): dá `.../contratos/{id_contrato}/autorizacoes/{id_autorizacao}` com ou sem o prefixo de stage do gateway.
+      schema: { type: string, example: 'autorizacoes/6f1c2b0e-3d4a-5b6c-8d7e-9f0a1b2c3d4e' }
     CorrelationId:
-      description: Correlação de negócio usada no processamento.
+      description: Correlação desta requisição (num replay, o corpo guarda a da execução original).
       schema: { type: string, format: uuid }
+    Allow:
+      description: Métodos suportados pelo recurso (RFC 9110 §10.2.1).
+      schema: { type: string, example: POST }
     IdempotentReplayed:
       description: Presente (valor `true`) quando a resposta é um replay idempotente.
       schema: { type: string, enum: ['true'] }
@@ -215,7 +230,9 @@ components:
           CAPTURA do hold (total ou parcial, até o valor reservado): o hold sai, o capturado vira utilizado e a sobra
           volta ao disponível, numa escrita só.
         - CREDITO: recompõe limite utilizado (ex.: pagamento). Não pode exceder o utilizado.
-        - ESTORNO: reverte uma autorização anterior aprovada (exige `id_autorizacao_original`).
+        - ESTORNO: reverte uma autorização anterior aprovada (exige `id_autorizacao_original`). O ESTORNO de um DEBITO devolve
+          utilizado e, como o CREDITO, não pode exceder o utilizado do momento: o modelo não tem saldo credor (débito já pago
+          por um CREDITO não tem o que devolver → 422 `CREDITO_EXCEDE_UTILIZADO`).
         Uma RESERVA sai de APROVADA por um único caminho (captura, estorno ou expiração): quem chega depois recebe 409.
     Metadata:
       type: object
@@ -242,9 +259,9 @@ components:
           type: string
           pattern: '^[A-Za-z0-9-]{1,16}$'
           description: |
-            Número da conta corrente, DECLARADO pelo chamador: só o formato é validado, e ele NÃO é conferido contra a
-            conta do contrato. A autoridade da decisão é o par contrato (path) + réplica do core; o `id_conta` é gravado
-            e propagado nos eventos como informado.
+            Número da conta corrente. Conferido contra a conta titular do contrato na réplica do core (BC Limites): diferente
+            → 422 `CONTA_DIVERGENTE` (recusa registrada e publicada, sem saldos). Vale em toda operação, inclusive estorno e
+            captura.
         valor:
           allOf: [ { $ref: '#/components/schemas/ValorPositivo' } ]
           description: Valor da transação em BRL, maior que zero, no máximo 2 casas decimais.
@@ -279,7 +296,7 @@ components:
             moeda: { type: string }
             id_autorizacao_original: { type: string, format: uuid }
             criada_em: { type: string, format: date-time }
-            correlation_id: { type: string, format: uuid }
+            correlation_id: { type: string, format: uuid, description: 'Da execução que aprovou (num replay, a original).' }
     Autorizacao:
       type: object
       required: [id_autorizacao, id_contrato, status, tipo_operacao, valor, moeda, criada_em]
@@ -297,7 +314,12 @@ components:
             ou o limite parados por minutos.
         motivo_recusa:
           type: string
-          enum: [LIMITE_INSUFICIENTE, CONTRATO_INATIVO, CREDITO_EXCEDE_UTILIZADO, CONTRATO_NAO_ENCONTRADO, ORIGINAL_JA_ENCERRADA, RESERVA_DIVERGENTE, RESERVA_NAO_ENCONTRADA, ESTORNO_EM_ANDAMENTO, RECUSA_DO_LIMITE]
+          enum: [LIMITE_INSUFICIENTE, CONTRATO_INATIVO, CREDITO_EXCEDE_UTILIZADO, CONTRATO_NAO_ENCONTRADO, ORIGINAL_JA_ENCERRADA, RESERVA_DIVERGENTE, RESERVA_NAO_ENCONTRADA, ESTORNO_EM_ANDAMENTO, RECUSA_DO_LIMITE, CONTA_DIVERGENTE]
+          description: |
+            Presente em RECUSADA. `CREDITO_EXCEDE_UTILIZADO`: o valor a devolver (CREDITO ou ESTORNO de débito) é maior que o
+            utilizado; o modelo não tem saldo credor. `CONTA_DIVERGENTE`: o `id_conta` informado não é o titular do contrato
+            (a autorização fica sem `saldos`: quem errou a conta não vê o saldo de um contrato alheio).
+            `RECUSA_DO_LIMITE`: motivo novo do BC Limites que esta versão ainda não mapeia.
         tipo_operacao: { $ref: '#/components/schemas/TipoOperacao' }
         valor: { $ref: '#/components/schemas/Dinheiro' }
         moeda: { type: string }
@@ -315,15 +337,20 @@ components:
         detail: { type: string }
         instance: { type: string }
         codigo: { type: string, description: Código estável e legível por máquina (o "código" pedido pelo enunciado). }
-        correlation_id: { type: string, format: uuid }
+        correlation_id: { type: string, format: uuid, description: 'Desta requisição; numa recusa registrada, o da execução que a criou (replay idêntico).' }
         trace_id: { type: string, pattern: '^[0-9a-f]{32}$', nullable: true }
         id_autorizacao: { type: string, format: uuid, description: Presente em recusas (402) — a recusa também é registrada. }
         limite_disponivel:
           type: number
           description: Presente na recusa por limite (402) quando o limite respondeu com saldos — o disponível do contrato no momento da recusa.
+        erros_omitidos:
+          type: integer
+          minimum: 1
+          description: Presente quando `erros` foi cortado nos 20 primeiros itens; quantos ficaram de fora.
         erros:
           type: array
-          description: Detalhe por campo em erros de validação (400/422).
+          maxItems: 20
+          description: Detalhe por campo em erros de validação (400/422), no máximo 20 (ver `erros_omitidos`).
           items:
             type: object
             required: [campo, mensagem]
@@ -335,13 +362,16 @@ components:
     RequisicaoMalFormada:
       description: |
         Sintaxe inválida, antes de qualquer regra:
-        - `/problemas/requisicao-mal-formada`: corpo que não é JSON (serviço); na AWS, também header obrigatório ausente ou vazio,
+        - `/problemas/requisicao-mal-formada`: corpo que não é JSON (serviço; inclui `NaN`/`Infinity`, que não são JSON pela
+          RFC 8259 §6); na AWS, também header obrigatório ausente ou vazio,
           como `Idempotency-Key` (gateway, `BAD_REQUEST_PARAMETERS`: ele só confere a presença dos parâmetros).
         - `/problemas/idempotency-key-invalida`: `Idempotency-Key` ausente (local) ou fora do formato UUID (serviço).
         Campo desconhecido, tipo errado ou campo obrigatório ausente no corpo NÃO são 400: são 422 (`RegraDeDominioViolada`).
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     NaoAutenticado:
-      description: Token ausente/ inválido (emitido pelo gateway). Ver `/problemas/nao-autenticado`.
+      description: |
+        Token ausente/inválido (emitido pelo gateway). No acesso direto ao serviço, `X-Client-Id` ausente ou fora de
+        `^[A-Za-z0-9._-]{1,64}$`. Ver `/problemas/nao-autenticado`.
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     SemPermissao:
       description: |
@@ -381,6 +411,13 @@ components:
       headers:
         Retry-After: { $ref: '#/components/headers/RetryAfter' }
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+    MetodoNaoPermitido:
+      description: |
+        Método HTTP que o recurso não suporta (acesso direto ao serviço; na AWS o gateway responde antes com 403
+        `SEM_PERMISSAO`). Ver `/problemas/metodo-nao-permitido`.
+      headers:
+        Allow: { $ref: '#/components/headers/Allow' }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     TipoDeMidiaNaoSuportado:
       description: Content-Type diferente de application/json.
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
@@ -391,9 +428,13 @@ components:
         - `VALIDACAO_DE_DOMINIO` (com `erros`): campo obrigatório ausente, tipo errado, campo desconhecido, `metadata` fora da
           allowlist, corpo que não é objeto, enum/pattern violado; valor ≤ 0 ou com mais de 2 casas; moeda ≠ BRL; ESTORNO sem
           `id_autorizacao_original`; `id_autorizacao_original` em RESERVA/CREDITO; `id_contrato` do corpo ≠ path; parâmetro
-          de path fora do pattern; recusa do limite sem código próprio.
+          de path fora do pattern (inclusive `id_autorizacao` que não é UUID, no GET); recusa do limite sem código próprio.
+          `erros` traz no máximo 20 itens (`erros_omitidos` diz quantos ficaram de fora).
         - `IDEMPOTENCY_KEY_REUTILIZADA`: mesma Idempotency-Key com corpo diferente.
-        - `CONTRATO_INATIVO`: contrato BLOQUEADO ou ENCERRADO. `CREDITO_EXCEDE_UTILIZADO`: CREDITO maior que o utilizado.
+        - `CONTRATO_INATIVO`: contrato BLOQUEADO ou ENCERRADO.
+        - `CREDITO_EXCEDE_UTILIZADO`: o valor a devolver (CREDITO ou ESTORNO de débito) é maior que o utilizado; o modelo não tem
+          saldo credor.
+        - `CONTA_DIVERGENTE`: `id_conta` diferente da conta titular do contrato.
         - `AUTORIZACAO_ORIGINAL_INVALIDA` (ESTORNO ou captura): original inexistente, de outro contrato ou de outro canal;
           tipo da original não estornável (só RESERVA e DEBITO) ou não capturável (só RESERVA); original não APROVADA;
           estorno com valor diferente do original (estorno parcial não é suportado na v1); captura maior que o reservado.
@@ -412,7 +453,9 @@ components:
       description: Falha inesperada. Seguro repetir com a mesma Idempotency-Key.
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     Indisponivel:
-      description: Degradação — circuit breaker aberto ou load shedding (fail-fast). Seguro repetir com a mesma Idempotency-Key após Retry-After.
+      description: |
+        Degradação — circuit breaker aberto, load shedding (fail-fast) ou banco de autorizações estrangulado/sem resposta/em
+        conflito de transação. Seguro repetir com a mesma Idempotency-Key após Retry-After.
       headers:
         Retry-After: { $ref: '#/components/headers/RetryAfter' }
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }

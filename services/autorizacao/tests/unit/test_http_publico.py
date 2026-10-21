@@ -9,13 +9,26 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from itertools import count
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin
 
+import jsonschema
 import pytest
-from autorizacao.adapters.inbound.http import criar_app
+from autorizacao.adapters.inbound.http import (
+    _CODIGO_DA_RECUSA,
+    _DETALHE_DA_RECUSA,
+    _DETALHE_DO_MOTIVO,
+    _PROBLEMAS,
+    MAX_ERROS_POR_PROBLEMA,
+    criar_app,
+)
+from autorizacao.adapters.outbound.cloudevents import para_cloudevent, serializar
 from autorizacao.adapters.outbound.memoria import RepositorioDeAutorizacoesEmMemoria
 from autorizacao.application.autorizar import AutorizarTransacao
 from autorizacao.application.consultar import ConsultarAutorizacao
 from autorizacao.application.portas import (
+    ArmazenamentoIndisponivel,
     ContratoInexistente,
     DesfechoNoLimite,
     LimitesIndisponivel,
@@ -23,7 +36,8 @@ from autorizacao.application.portas import (
     ResultadoNoLimite,
     TipoNoLimite,
 )
-from autorizacao.domain.eventos import SaldosDoLimite
+from autorizacao.domain.autorizacao import MotivoRecusa
+from autorizacao.domain.eventos import SaldosDoLimite, TransacaoAutorizada, TransacaoRecusada
 from fastapi.testclient import TestClient
 from plataforma.observabilidade import gateway_request_id_atual
 
@@ -43,43 +57,80 @@ class IdsSequenciais:
     _contador: count[int] = field(default_factory=count)
 
     def novo_id(self) -> str:
-        return f"ev-{next(self._contador)}"
+        """UUID determinístico: o id do evento vira o `id` do CloudEvent, que o schema exige UUID."""
+        return str(uuid.UUID(int=next(self._contador) + 1))
 
 
 @dataclass
 class LimitesFalso:
-    disponivel: Decimal = Decimal("1000.00")
-    contratos: set[str] = field(default_factory=lambda: {CTR})
+    """Dublê do port com as MESMAS pré-condições do agregado `Limite` real (LSP), não mais permissivo que ele:
+    idempotência antes de qualquer recusa; conta divergente da titular → CONTA_DIVERGENTE; RESERVAR/DEBITAR
+    exigem disponível; CREDITAR/ESTORNAR_DEBITO exigem utilizado ≥ valor; LIBERAR/CAPTURAR exigem o hold com o
+    valor gravado. Saldos com as invariantes do real: disponível = concedido − utilizado − reservado, e
+    utilizado/reservado nunca negativos."""
+
+    concedido: Decimal = Decimal("1000.00")
+    contas: dict[str, str] = field(default_factory=lambda: {CTR: "0001-1"})  # contrato → titular
     indisponivel: bool = False
+    utilizado: Decimal = Decimal("0.00")
+    holds: dict[str, Decimal] = field(default_factory=dict)
     aplicadas: dict[str, OperacaoNoLimite] = field(default_factory=dict)
     _versao: int = 1
+
+    @property
+    def reservado(self) -> Decimal:
+        return sum(self.holds.values(), Decimal("0.00"))
+
+    @property
+    def disponivel(self) -> Decimal:
+        return self.concedido - self.utilizado - self.reservado
 
     def aplicar(self, id_contrato: str, operacao: OperacaoNoLimite) -> ResultadoNoLimite:
         if self.indisponivel:
             raise LimitesIndisponivel("circuit breaker aberto")
-        if id_contrato not in self.contratos:
+        if id_contrato not in self.contas:
             raise ContratoInexistente(id_contrato)
         if operacao.id_operacao in self.aplicadas:
             return ResultadoNoLimite(DesfechoNoLimite.JA_APLICADA, self._saldos())
-        if operacao.tipo in (TipoNoLimite.RESERVAR, TipoNoLimite.DEBITAR):
-            if self.disponivel < operacao.valor:
-                return ResultadoNoLimite(
-                    DesfechoNoLimite.RECUSADA, self._saldos(), "LIMITE_INSUFICIENTE"
-                )
-            self.disponivel -= operacao.valor
-        else:
-            self.disponivel += operacao.valor
+        motivo = self._recusa(id_contrato, operacao)
+        if motivo is not None:
+            return ResultadoNoLimite(DesfechoNoLimite.RECUSADA, self._saldos(), motivo)
+        match operacao.tipo:
+            case TipoNoLimite.RESERVAR:
+                self.holds[operacao.id_operacao] = operacao.valor
+            case TipoNoLimite.DEBITAR:
+                self.utilizado += operacao.valor
+            case TipoNoLimite.CREDITAR | TipoNoLimite.ESTORNAR_DEBITO:
+                self.utilizado -= operacao.valor
+            case TipoNoLimite.LIBERAR_RESERVA:
+                del self.holds[operacao.id_reserva or ""]
+            case TipoNoLimite.CAPTURAR_RESERVA:
+                del self.holds[operacao.id_reserva or ""]
+                self.utilizado += operacao.valor
         self.aplicadas[operacao.id_operacao] = operacao
         self._versao += 1
         return ResultadoNoLimite(DesfechoNoLimite.APLICADA, self._saldos())
 
+    def _recusa(self, id_contrato: str, operacao: OperacaoNoLimite) -> str | None:
+        if operacao.id_conta is not None and operacao.id_conta != self.contas[id_contrato]:
+            return "CONTA_DIVERGENTE"
+        match operacao.tipo:
+            case TipoNoLimite.RESERVAR | TipoNoLimite.DEBITAR:
+                return "LIMITE_INSUFICIENTE" if self.disponivel < operacao.valor else None
+            case TipoNoLimite.CREDITAR | TipoNoLimite.ESTORNAR_DEBITO:
+                return "CREDITO_EXCEDE_UTILIZADO" if self.utilizado < operacao.valor else None
+            case TipoNoLimite.LIBERAR_RESERVA | TipoNoLimite.CAPTURAR_RESERVA:
+                gravado = self.holds.get(operacao.id_reserva or "")
+                if gravado is None:
+                    return "RESERVA_NAO_ENCONTRADA"
+                esperado = operacao.valor_reservado or operacao.valor
+                return "RESERVA_DIVERGENTE" if gravado != esperado else None
+        return None
+
     def _saldos(self) -> SaldosDoLimite:
+        assert self.utilizado >= 0 and self.reservado >= 0  # I2 do agregado real
         return SaldosDoLimite(
-            Decimal("1000.00"),
-            Decimal("0.00"),
-            Decimal("1000.00") - self.disponivel,
-            self.disponivel,
-            self._versao,
+            self.concedido, self.utilizado, self.reservado, self.disponivel, self._versao
         )
 
 
@@ -106,8 +157,12 @@ def limites() -> LimitesFalso:
     return LimitesFalso()
 
 
-def _cliente(limites: LimitesFalso, max_em_voo: int = 100) -> TestClient:
-    repositorio = RepositorioDeAutorizacoesEmMemoria()
+def _cliente(
+    limites: LimitesFalso,
+    max_em_voo: int = 100,
+    repositorio: RepositorioDeAutorizacoesEmMemoria | None = None,
+) -> TestClient:
+    repositorio = repositorio or RepositorioDeAutorizacoesEmMemoria()
     caso = AutorizarTransacao(repositorio, limites, RelogioFixo(), IdsSequenciais())
     return TestClient(criar_app(caso, ConsultarAutorizacao(repositorio), max_em_voo))
 
@@ -122,7 +177,7 @@ def test_201_com_location_corpo_e_saldos_como_numero(cliente: TestClient) -> Non
 
     assert resposta.status_code == 201
     corpo = resposta.json()
-    assert resposta.headers["location"] == f"{URL}/{corpo['id_autorizacao']}"
+    assert resposta.headers["location"] == f"autorizacoes/{corpo['id_autorizacao']}"
     assert "idempotent-replayed" not in resposta.headers
     assert '"saldo_reservado": 150.00' in resposta.text  # número cru, não string nem 150.0
     assert '"limite_disponivel": 850.00' in resposta.text
@@ -464,7 +519,7 @@ def test_valor_grande_sai_identico(cliente: TestClient) -> None:
     class Folgado(LimitesFalso):
         pass
 
-    limites = Folgado(disponivel=Decimal("99999999999999.99"))
+    limites = Folgado(concedido=Decimal("99999999999999.99"))
     cliente = _cliente(limites)
 
     resposta = cliente.post(URL, content=_corpo("12345678901234.56"), headers=_cabecalhos())
@@ -542,3 +597,290 @@ def test_gateway_request_id_fora_do_formato_e_ignorado(
     (registro,) = [r for r in caplog.records if r.getMessage() == "erro inesperado"]
     assert "gateway_request_id" not in registro.__dict__
     assert registro.__dict__["correlation_id"]
+
+
+# --- painel 6 -------------------------------------------------------------------------------------
+
+SCHEMAS_DE_EVENTO = Path(__file__).resolve().parents[4] / "contracts" / "events"
+TP_VALIDO = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+
+def _evento_publicado(repositorio: RepositorioDeAutorizacoesEmMemoria) -> dict[str, Any]:
+    """O CloudEvent que o outbox publicaria para a TransacaoAutorizada, já validado contra o schema."""
+    (evento,) = [e for e in repositorio.outbox if isinstance(e, TransacaoAutorizada)]
+    publicado: dict[str, Any] = json.loads(serializar(para_cloudevent(evento)))
+    schema = json.loads((SCHEMAS_DE_EVENTO / "transacao-autorizada.v1.schema.json").read_text())
+    validador = jsonschema.Draft4Validator(
+        schema, format_checker=jsonschema.Draft4Validator.FORMAT_CHECKER
+    )
+    assert not [e.message for e in validador.iter_errors(publicado)]
+    return publicado
+
+
+@pytest.mark.parametrize(
+    "hostil",
+    [
+        "X",  # sem hífen: derrubava o concluir depois do limite aplicado (500 com hold preso)
+        "a-DEADBEEF<script>alert(1)</script>",  # 2 partes: ia para dentro do CloudEvent publicado
+        "<script>alert(1)</script>",
+        "-".join(["00"] * 80),  # 80 partes
+    ],
+)
+def test_traceparent_hostil_e_ignorado_201_e_evento_no_schema(
+    limites: LimitesFalso, hostil: str
+) -> None:
+    repositorio = RepositorioDeAutorizacoesEmMemoria()
+    cliente = _cliente(limites, repositorio=repositorio)
+
+    resposta = cliente.post(URL, content=_corpo(), headers=_cabecalhos(traceparent=hostil))
+
+    assert resposta.status_code == 201
+    gravada = repositorio.obter(resposta.json()["id_autorizacao"])
+    assert gravada is not None and gravada.traceparent is None
+    publicado = _evento_publicado(repositorio)
+    assert "traceparent" not in publicado
+    assert publicado["data"]["trace_id"] is None
+
+
+def test_traceparent_valido_vai_ate_o_evento(limites: LimitesFalso) -> None:
+    repositorio = RepositorioDeAutorizacoesEmMemoria()
+    cliente = _cliente(limites, repositorio=repositorio)
+
+    resposta = cliente.post(URL, content=_corpo(), headers=_cabecalhos(traceparent=TP_VALIDO))
+
+    assert resposta.status_code == 201
+    publicado = _evento_publicado(repositorio)
+    assert publicado["traceparent"] == TP_VALIDO
+    assert publicado["data"]["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+
+
+def test_canal_do_metadata_vai_no_evento(limites: LimitesFalso) -> None:
+    repositorio = RepositorioDeAutorizacoesEmMemoria()
+    cliente = _cliente(limites, repositorio=repositorio)
+
+    cliente.post(URL, content=_corpo(metadata={"canal": "POS"}), headers=_cabecalhos())
+
+    assert _evento_publicado(repositorio)["data"]["canal"] == "POS"
+
+
+def test_location_relativo_resolve_com_e_sem_prefixo_de_stage(cliente: TestClient) -> None:
+    resposta = cliente.post(URL, content=_corpo(), headers=_cabecalhos())
+    id_aut = resposta.json()["id_autorizacao"]
+    location = resposta.headers["location"]
+    gateway = (
+        "https://abc.execute-api.sa-east-1.amazonaws.com/v1"  # stage `v1` antes do /v1 do path
+    )
+
+    local = urljoin(str(resposta.request.url), location)
+    atras_do_stage = urljoin(f"{gateway}{URL}", location)
+
+    assert local == f"http://testserver{URL}/{id_aut}"
+    assert atras_do_stage == f"{gateway}{URL}/{id_aut}"
+    assert cliente.get(local, headers={"X-Client-Id": "canal-pos"}).status_code == 200
+
+
+def test_armazenamento_indisponivel_e_503_com_retry_after(limites: LimitesFalso) -> None:
+    repositorio = RepositorioDeAutorizacoesEmMemoria()
+
+    def estrangulado(*_: object) -> None:
+        raise ArmazenamentoIndisponivel("registrar")
+
+    repositorio.registrar = estrangulado  # type: ignore[method-assign,assignment]
+    repositorio.obter = estrangulado  # type: ignore[method-assign,assignment]
+    cliente = _cliente(limites, repositorio=repositorio)
+
+    post = cliente.post(URL, content=_corpo(), headers=_cabecalhos())
+    get = cliente.get(f"{URL}/{uuid.uuid4()}", headers={"X-Client-Id": "canal-pos"})
+
+    for resposta in (post, get):
+        assert resposta.status_code == 503
+        assert resposta.headers["retry-after"] == "1"
+        assert resposta.json()["codigo"] == "SERVICO_INDISPONIVEL"
+    assert "mesma Idempotency-Key" in post.json()["detail"]
+
+
+def test_metodo_nao_suportado_e_405_em_problem_json(cliente: TestClient) -> None:
+    resposta = cliente.delete(URL, headers=_cabecalhos())
+
+    assert resposta.status_code == 405
+    assert resposta.headers["content-type"] == PROBLEM_JSON
+    assert resposta.headers["allow"] == "POST"
+    assert resposta.json()["codigo"] == "METODO_NAO_PERMITIDO"
+    assert resposta.json()["correlation_id"] == resposta.headers["x-correlation-id"]
+
+
+def test_rota_inexistente_e_404_em_problem_json(cliente: TestClient) -> None:
+    resposta = cliente.get("/v2/contratos/CTR-1/autorizacoes", headers=_cabecalhos())
+
+    assert resposta.status_code == 404
+    assert resposta.headers["content-type"] == PROBLEM_JSON
+    assert resposta.json()["codigo"] == "RECURSO_NAO_ENCONTRADO"
+
+
+@pytest.mark.parametrize("id_autorizacao", ["nao-e-uuid", "a" * 2100])
+def test_get_com_id_fora_do_formato_uuid_e_422_nunca_500(
+    cliente: TestClient, id_autorizacao: str
+) -> None:
+    resposta = cliente.get(f"{URL}/{id_autorizacao}", headers={"X-Client-Id": "canal-pos"})
+
+    assert resposta.status_code == 422
+    assert resposta.json()["codigo"] == "VALIDACAO_DE_DOMINIO"
+
+
+def test_get_com_uuid_maiusculo_acha_a_autorizacao(cliente: TestClient) -> None:
+    criada = cliente.post(URL, content=_corpo(), headers=_cabecalhos()).json()
+
+    resposta = cliente.get(
+        f"{URL}/{criada['id_autorizacao'].upper()}", headers={"X-Client-Id": "canal-pos"}
+    )
+
+    assert resposta.status_code == 200
+
+
+@pytest.mark.parametrize("constante", ["NaN", "Infinity", "-Infinity"])
+def test_nan_e_infinity_nao_sao_json_e_400(cliente: TestClient, constante: str) -> None:
+    resposta = cliente.post(URL, content=_corpo(constante), headers=_cabecalhos())
+
+    assert resposta.status_code == 400
+    assert resposta.json()["codigo"] == "REQUISICAO_MAL_FORMADA"
+
+
+@pytest.mark.parametrize("client_id", ["x" * 65, 'canal"; DROP--', "canal pos", "a/b", "a:b"])
+def test_client_id_fora_do_formato_e_401(cliente: TestClient, client_id: str) -> None:
+    resposta = cliente.post(
+        URL, content=_corpo(), headers=_cabecalhos(**{"X-Client-Id": client_id})
+    )
+
+    assert resposta.status_code == 401
+    assert resposta.json()["codigo"] == "NAO_AUTENTICADO"
+
+
+def test_client_id_do_cognito_e_dos_canais_locais_passa(cliente: TestClient) -> None:
+    for client_id in ("4p1k2n3m5o6q7r8s9t0u1v2w3x", "canal-pos", "canal_app.v2"):
+        resposta = cliente.post(
+            URL, content=_corpo(), headers=_cabecalhos(**{"X-Client-Id": client_id})
+        )
+        assert resposta.status_code == 201, client_id
+
+
+def test_422_corta_erros_em_20_e_diz_quantos_omitiu(cliente: TestClient) -> None:
+    extras = {f"campo_{i}": i for i in range(50)}
+
+    resposta = cliente.post(URL, content=_corpo(**extras), headers=_cabecalhos())
+
+    assert resposta.status_code == 422
+    corpo = resposta.json()
+    assert len(corpo["erros"]) == MAX_ERROS_POR_PROBLEMA == 20
+    assert corpo["erros_omitidos"] == 30
+
+
+def test_422_com_poucos_erros_nao_traz_erros_omitidos(cliente: TestClient) -> None:
+    resposta = cliente.post(URL, content=_corpo(extra="x"), headers=_cabecalhos())
+
+    assert "erros_omitidos" not in resposta.json()
+
+
+def test_replay_da_recusa_tem_corpo_identico_e_header_desta_requisicao(
+    cliente: TestClient,
+) -> None:
+    cabecalhos = _cabecalhos(traceparent=TP_VALIDO)
+    primeira = cliente.post(URL, content=_corpo("1000.01"), headers=cabecalhos)
+    outro_trace = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+    replay = cliente.post(
+        URL,
+        content=_corpo("1000.01"),
+        headers={**cabecalhos, "X-Correlation-Id": str(uuid.uuid4()), "traceparent": outro_trace},
+    )
+
+    assert replay.status_code == primeira.status_code == 402
+    assert replay.content == primeira.content  # correlation_id e trace_id da execução original
+    assert replay.headers["x-correlation-id"] != primeira.headers["x-correlation-id"]
+    assert replay.json()["correlation_id"] == primeira.headers["x-correlation-id"]
+
+
+def test_estorno_sem_utilizado_a_devolver_e_422_com_texto_dos_dois_casos(
+    cliente: TestClient,
+) -> None:
+    """DEBITO 50, CREDITO 50 (pagou), ESTORNO do débito: não há utilizado; o modelo não tem saldo credor."""
+    debito = cliente.post(
+        URL, content=_corpo("50.00", tipo_operacao="DEBITO"), headers=_cabecalhos()
+    ).json()
+    cliente.post(URL, content=_corpo("50.00", tipo_operacao="CREDITO"), headers=_cabecalhos())
+
+    estorno = cliente.post(
+        URL,
+        content=_corpo(
+            "50.00", tipo_operacao="ESTORNO", id_autorizacao_original=debito["id_autorizacao"]
+        ),
+        headers=_cabecalhos(),
+    )
+
+    assert estorno.status_code == 422
+    problema = estorno.json()
+    assert problema["codigo"] == "CREDITO_EXCEDE_UTILIZADO"
+    assert "ESTORNO" in problema["detail"] and "CREDITO" in problema["detail"]
+
+
+def test_conta_divergente_e_422_registrada_sem_expor_saldo_do_contrato_alheio(
+    limites: LimitesFalso,
+) -> None:
+    repositorio = RepositorioDeAutorizacoesEmMemoria()
+    cliente = _cliente(limites, repositorio=repositorio)
+    cabecalhos = _cabecalhos()
+
+    resposta = cliente.post(URL, content=_corpo(id_conta="9999-9"), headers=cabecalhos)
+    replay = cliente.post(URL, content=_corpo(id_conta="9999-9"), headers=cabecalhos)
+    consulta = cliente.get(
+        f"{URL}/{_id_gravado(repositorio)}", headers={"X-Client-Id": "canal-pos"}
+    )
+
+    assert resposta.status_code == 422
+    problema = resposta.json()
+    assert problema["codigo"] == "CONTA_DIVERGENTE"
+    assert problema["detail"] == "A conta informada não é a titular do contrato."
+    assert "limite_disponivel" not in problema and "saldo_reservado" not in problema
+    assert replay.status_code == 422 and replay.headers["idempotent-replayed"] == "true"
+    assert consulta.status_code == 200
+    assert consulta.json()["motivo_recusa"] == "CONTA_DIVERGENTE"
+    assert "saldos" not in consulta.json()
+    (recusa,) = [e for e in repositorio.outbox if isinstance(e, TransacaoRecusada)]
+    dados = json.loads(serializar(para_cloudevent(recusa)))["data"]
+    assert "limite_disponivel" not in dados and "versao_limite" not in dados
+    assert limites.disponivel == Decimal("1000.00")
+
+
+def _id_gravado(repositorio: RepositorioDeAutorizacoesEmMemoria) -> str:
+    (evento,) = repositorio.outbox
+    return str(evento.id_autorizacao)  # type: ignore[attr-defined]
+
+
+def test_toda_operacao_pedida_pelo_canal_leva_o_id_conta_ao_limite(
+    cliente: TestClient, limites: LimitesFalso
+) -> None:
+    reserva = cliente.post(URL, content=_corpo(), headers=_cabecalhos()).json()
+    cliente.post(
+        URL,
+        content=_corpo(tipo_operacao="ESTORNO", id_autorizacao_original=reserva["id_autorizacao"]),
+        headers=_cabecalhos(),
+    )
+
+    assert [op.id_conta for op in limites.aplicadas.values()] == ["0001-1", "0001-1"]
+
+
+# --- exaustividade dos mapas de recusa (C1) ------------------------------------------------------
+
+
+def test_todo_motivo_de_recusa_tem_codigo_e_todo_codigo_tem_problema() -> None:
+    assert set(MotivoRecusa) == set(_CODIGO_DA_RECUSA)
+    assert set(_CODIGO_DA_RECUSA.values()) <= set(_PROBLEMAS)
+    assert set(_DETALHE_DA_RECUSA) <= set(_PROBLEMAS)
+
+
+def test_todo_motivo_de_recusa_tem_detalhe() -> None:
+    sem_detalhe = [
+        m
+        for m in MotivoRecusa
+        if m not in _DETALHE_DO_MOTIVO and _CODIGO_DA_RECUSA[m] not in _DETALHE_DA_RECUSA
+    ]
+    assert sem_detalhe == []

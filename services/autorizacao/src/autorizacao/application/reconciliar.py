@@ -25,10 +25,14 @@ própria compensação o remove de uma autorização não aprovada.
 
 Tempo: cada passo relê o relógio e renova o lease (10 s), e faz no máximo uma chamada ao limite (≤ ~4 s com
 as duas tentativas). GRACA 60 s ≪ PRAZO_DE_REAPLICACAO 4 min < guarda do limite 5 min.
+
+Uma órfã que falha de forma inesperada conta como FALHOU (com o id no log) e o lote segue: um item envenenado
+não pode parar a reconciliação das outras nem o expirador que roda depois.
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections import Counter
 from dataclasses import dataclass
@@ -38,6 +42,7 @@ from typing import Protocol
 
 from autorizacao.application.autorizar import AutorizarTransacao
 from autorizacao.application.portas import (
+    ArmazenamentoIndisponivel,
     BuscaDeOrfas,
     ContratoInexistente,
     DesfechoNoLimite,
@@ -58,6 +63,8 @@ from autorizacao.domain.autorizacao import (
 )
 from autorizacao.domain.pedido import TipoOperacao
 
+_log = logging.getLogger(__name__)
+
 GRACA = timedelta(seconds=60)
 NAMESPACE_COMPENSACOES = uuid.UUID("e7f6a5b4-c3d2-4e1f-9a8b-7c6d5e4f3a2b")
 
@@ -77,7 +84,7 @@ class ResultadoDaReconciliacao(StrEnum):
     CONCLUIDA = "CONCLUIDA"
     ENCAMINHADA = "ENCAMINHADA"  # decisão humana: fila RM# + alarme
     IGNORADA = "IGNORADA"  # dentro da graça, ou outra execução assumiu primeiro
-    FALHOU = "FALHOU"  # Limites fora do ar etc.: continua em curso e volta na próxima rodada
+    FALHOU = "FALHOU"  # Limites/banco fora ou falha inesperada: continua em curso e volta na próxima rodada
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +97,18 @@ class ReconciliarOrfas:
     def executar(self, limite: int = 100) -> Counter[ResultadoDaReconciliacao]:
         contagem: Counter[ResultadoDaReconciliacao] = Counter()
         for orfa in self.repositorio.listar_orfas(self.relogio.agora() - GRACA, limite):
-            contagem[self.reconciliar(orfa)] += 1
+            try:
+                resultado = self.reconciliar(orfa)
+            except (
+                ArmazenamentoIndisponivel
+            ):  # inclusive no `assumir`, antes do try de `reconciliar`
+                resultado = ResultadoDaReconciliacao.FALHOU
+            except Exception:
+                _log.exception(
+                    "órfã %s: falha inesperada; fica para a próxima rodada", orfa.id_autorizacao
+                )
+                resultado = ResultadoDaReconciliacao.FALHOU
+            contagem[resultado] += 1
         return contagem
 
     def reconciliar(self, orfa: Autorizacao) -> ResultadoDaReconciliacao:
@@ -106,7 +124,7 @@ class ReconciliarOrfas:
                     return self._encaminhar(assumida, MotivoDaReconciliacao.FORA_DO_PRAZO)
                 return self._concluir(assumida)
             return self._compensar(assumida)
-        except (LimitesIndisponivel, LeasePerdido, EmAndamento):
+        except (LimitesIndisponivel, ArmazenamentoIndisponivel, LeasePerdido, EmAndamento):
             return ResultadoDaReconciliacao.FALHOU
 
     def _concluir(self, assumida: Autorizacao) -> ResultadoDaReconciliacao:
@@ -150,7 +168,7 @@ class ReconciliarOrfas:
                 id_operacao_de_compensacao(a.id_autorizacao),
                 a.valor,
                 a.id_autorizacao if reserva else None,
-            ),
+            ),  # sem id_conta: desfazer não pode ser barrado por conta que mudou depois (portabilidade)
         )
         if reversao.desfecho is DesfechoNoLimite.RECUSADA:
             if reserva and reversao.motivo == "RESERVA_NAO_ENCONTRADA":

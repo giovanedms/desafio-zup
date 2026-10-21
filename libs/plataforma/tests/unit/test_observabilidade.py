@@ -5,13 +5,16 @@ from __future__ import annotations
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 from plataforma.observabilidade import (
     contexto_de_log,
     correlation_id_atual,
     definir_contexto,
     gateway_request_id_atual,
     limpar_contexto,
+    trace_id_de,
     traceparent_atual,
+    traceparent_valido,
 )
 
 TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -76,3 +79,26 @@ def test_sem_gateway_o_contexto_de_log_so_tem_a_correlacao() -> None:
         assert contexto_de_log() == {"correlation_id": "corr-local"}
     finally:
         limpar_contexto(tokens)
+
+
+def test_traceparent_w3c_valido_passa_e_da_o_trace_id() -> None:
+    assert traceparent_valido(TP) == TP
+    assert trace_id_de(TP) == "4bf92f3577b34da6a3ce929d0e0e4736"
+
+
+@pytest.mark.parametrize(
+    "hostil",
+    [
+        None,
+        "",
+        "X",  # sem hífen: o split("-")[1] antigo levantava IndexError
+        "a-DEADBEEF<script>alert(1)</script>",  # 2 partes: virava trace_id no evento
+        "-".join(["00"] * 80),  # 80 partes
+        TP.upper(),  # W3C exige hex minúsculo
+        TP + "\n",  # `$` de regex aceitaria a quebra de linha no fim
+        TP + "-extra",
+    ],
+)
+def test_traceparent_fora_do_formato_vira_none(hostil: str | None) -> None:
+    assert traceparent_valido(hostil) is None
+    assert trace_id_de(hostil) is None

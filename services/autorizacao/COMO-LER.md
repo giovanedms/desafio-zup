@@ -38,6 +38,8 @@
 | Captura e estorno (ou expiração) do mesmo hold ao mesmo tempo | O hold no limite é o árbitro: um vence, os outros → 409 | `test_captura_que_perde_o_hold_e_recusada_e_nao_mexe_na_reserva` |
 | Dois estornos da mesma original ao mesmo tempo | Uma operação no limite (id derivado) + CAS na original: um vence, o outro → 409 | `test_dois_estornos_concorrentes_da_mesma_original_estornam_uma_vez` |
 | Sobrecarga | Load shedding → 503 imediato (`/saude` isento) | `test_http_publico.py` |
+| DynamoDB da autorização estrangulado, sem resposta ou em conflito de transação | Depois dos retries do SDK → `ArmazenamentoIndisponivel` → **503** com `Retry-After: 1`; repetir com a mesma chave é seguro (escrita condicional, commit incerto idempotente). Cancelamento de transação classificado por (índice do item, código) | `test_dynamodb_resiliencia.py` |
+| Uma órfã ou reserva que falha de forma inesperada (ex.: item antigo com `traceparent` lixo) | Conta como `FALHOU` com o id no log e o lote segue; as duas varreduras são independentes; o heartbeat só é renovado depois de uma rodada sem exceção (falha persistente derruba o healthcheck) | `test_orfa_envenenada_conta_como_falhou_e_as_outras_seguem`, `test_reconciliador_loop.py`, `test_reconciliador_localstack.py` |
 
 ## Perguntas prováveis e onde está a resposta
 

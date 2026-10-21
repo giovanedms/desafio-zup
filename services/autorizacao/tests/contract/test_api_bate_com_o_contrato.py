@@ -23,6 +23,10 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 import yaml  # PyYAML chega com uvicorn[standard], dependência do serviço
+from autorizacao.adapters.inbound.http import _PROBLEMAS
+from autorizacao.adapters.outbound.memoria import RepositorioDeAutorizacoesEmMemoria
+from autorizacao.application.portas import ArmazenamentoIndisponivel
+from autorizacao.domain.autorizacao import MotivoRecusa
 from jsonschema import Draft4Validator, FormatChecker
 
 RAIZ = Path(__file__).resolve().parents[4]
@@ -307,3 +311,110 @@ def test_o_conferidor_reprova_corpo_fora_do_contrato() -> None:
 
     with pytest.raises(AssertionError, match="fora do schema"):
         conferir(ruim, POST)
+
+
+# --- painel 6 -------------------------------------------------------------------------------------
+
+
+def test_debito_puro_e_credito_depois_do_debito_201(cliente: Any) -> None:
+    """Os 4 `tipo_operacao` passam pelo conferidor (o dublê agora tem as pré-condições do limite real)."""
+    debito = cliente.post(
+        URL, content=corpo("300.00", tipo_operacao="DEBITO"), headers=cabecalhos()
+    )
+    credito = cliente.post(
+        URL, content=corpo("100.00", tipo_operacao="CREDITO"), headers=cabecalhos()
+    )
+
+    assert debito.status_code == credito.status_code == 201
+    assert conferir(debito, POST)["limite_utilizado"] == 300
+    pago = conferir(credito, POST)
+    assert (pago["limite_utilizado"], pago["saldo_reservado"]) == (200, 0)
+
+
+def test_422_estorno_sem_utilizado_e_conta_divergente(cliente: Any) -> None:
+    debito = cliente.post(URL, content=corpo("50.00", tipo_operacao="DEBITO"), headers=cabecalhos())
+    cliente.post(URL, content=corpo("50.00", tipo_operacao="CREDITO"), headers=cabecalhos())
+    estorno = cliente.post(
+        URL,
+        content=corpo(
+            "50.00",
+            tipo_operacao="ESTORNO",
+            id_autorizacao_original=debito.json()["id_autorizacao"],
+        ),
+        headers=cabecalhos(),
+    )
+    conta = cliente.post(URL, content=corpo(id_conta="9999-9"), headers=cabecalhos())
+
+    assert conferir(estorno, POST)["codigo"] == "CREDITO_EXCEDE_UTILIZADO"
+    assert conferir(conta, POST)["codigo"] == "CONTA_DIVERGENTE"
+
+
+def test_get_422_id_que_nao_e_uuid(cliente: Any) -> None:
+    resposta = cliente.get(f"{URL}/{'a' * 2100}", headers={"X-Client-Id": "canal-pos"})
+
+    assert resposta.status_code == 422
+    assert conferir(resposta, GET)["codigo"] == "VALIDACAO_DE_DOMINIO"
+
+
+def test_405_nas_duas_operacoes(cliente: Any) -> None:
+    no_post = cliente.delete(URL, headers=cabecalhos())
+    no_get = cliente.post(f"{URL}/{uuid.uuid4()}", content=corpo(), headers=cabecalhos())
+
+    assert no_post.status_code == no_get.status_code == 405
+    assert conferir(no_post, POST)["codigo"] == "METODO_NAO_PERMITIDO"
+    assert conferir(no_get, GET)["codigo"] == "METODO_NAO_PERMITIDO"
+    assert no_get.headers["allow"] == "GET"
+
+
+def test_404_de_rota_inexistente_e_problema_do_catalogo(cliente: Any) -> None:
+    resposta = cliente.post("/v1/nada", content=corpo(), headers=cabecalhos())
+
+    problema = resposta.json()
+    assert resposta.status_code == 404
+    assert resposta.headers["content-type"] == "application/problem+json"
+    assert _linha_do_catalogo(problema["codigo"]) == ("recurso-nao-encontrado", 404)
+
+
+def test_503_banco_de_autorizacoes_indisponivel(limites: Any) -> None:
+    repositorio = RepositorioDeAutorizacoesEmMemoria()
+
+    def estrangulado(*_: object) -> None:
+        raise ArmazenamentoIndisponivel("registrar")
+
+    repositorio.registrar = estrangulado  # type: ignore[method-assign,assignment]
+    repositorio.obter = estrangulado  # type: ignore[method-assign,assignment]
+    cliente = novo_cliente(limites, repositorio=repositorio)
+
+    post = cliente.post(URL, content=corpo(), headers=cabecalhos())
+    get = cliente.get(f"{URL}/{uuid.uuid4()}", headers={"X-Client-Id": "canal-pos"})
+
+    assert post.headers["retry-after"] == get.headers["retry-after"] == "1"
+    assert conferir(post, POST)["codigo"] == "SERVICO_INDISPONIVEL"
+    assert conferir(get, GET)["codigo"] == "SERVICO_INDISPONIVEL"
+
+
+def test_400_nan_401_client_id_invalido_e_422_com_erros_cortados(cliente: Any) -> None:
+    nan = cliente.post(URL, content=corpo("NaN"), headers=cabecalhos())
+    intruso = cliente.post(URL, content=corpo(), headers=cabecalhos(**{"X-Client-Id": "a b"}))
+    muitos = cliente.post(
+        URL, content=corpo(**{f"campo_{i}": i for i in range(30)}), headers=cabecalhos()
+    )
+
+    assert conferir(nan, POST)["codigo"] == "REQUISICAO_MAL_FORMADA"
+    assert conferir(intruso, POST)["codigo"] == "NAO_AUTENTICADO"
+    cortado = conferir(muitos, POST)
+    assert (len(cortado["erros"]), cortado["erros_omitidos"]) == (20, 10)
+
+
+def test_todo_problema_do_servico_esta_no_catalogo_com_o_mesmo_tipo_e_status() -> None:
+    divergentes = {
+        codigo: (slug, status)
+        for codigo, (slug, _title, status) in _PROBLEMAS.items()
+        if _linha_do_catalogo(codigo) != (slug, status)
+    }
+    assert divergentes == {}
+
+
+def test_motivos_de_recusa_do_contrato_sao_os_do_dominio() -> None:
+    declarados = CONTRATO["components"]["schemas"]["Autorizacao"]["properties"]["motivo_recusa"]
+    assert set(declarados["enum"]) == {m.value for m in MotivoRecusa}

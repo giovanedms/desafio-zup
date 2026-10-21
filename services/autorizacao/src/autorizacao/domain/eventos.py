@@ -41,6 +41,7 @@ class TransacaoAutorizada(EventoDeDominio):
     id_estabelecimento: str | None
     saldos: SaldosDoLimite
     id_autorizacao_original: str | None = None  # preenchido na captura (DEBITO de uma RESERVA)
+    canal: str | None = None  # metadata.canal do pedido (PLD: o canal da operação vai no evento)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -53,6 +54,7 @@ class TransacaoRecusada(EventoDeDominio):
     id_conta: str
     id_estabelecimento: str | None
     saldos: SaldosDoLimite | None
+    canal: str | None = None  # metadata.canal do pedido, quando houver
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -79,7 +81,8 @@ class TransacaoCompensada(EventoDeDominio):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TransacaoEmReconciliacaoManual(EventoDeDominio):
     """Não deu para concluir com segurança de forma automática: decisão humana (fila RM#). O evento é a
-    trilha durável do caso (o item da fila não tem TTL enquanto estiver lá, mas o evento fica 10 anos)."""
+    trilha durável do caso (o item da fila não tem TTL enquanto estiver lá). A trilha de 10 anos é desenho
+    (ADR-0017); no sandbox o durável é o archive de 30 dias do barramento."""
 
     id_autorizacao: str
     tipo_operacao: str

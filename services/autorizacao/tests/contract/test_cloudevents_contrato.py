@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -198,3 +199,34 @@ def test_dinheiro_sai_como_numero_exato_no_json() -> None:
 def test_id_do_cloudevent_e_o_id_do_evento_de_dominio() -> None:
     publicado = para_cloudevent(EVENTOS["transacao-autorizada"])
     assert publicado["id"] == publicado["data"]["event_id"] == BASE["id_evento"]
+
+
+@pytest.mark.parametrize(
+    "gravado",
+    [
+        "X",
+        "a-DEADBEEF<script>alert(1)</script>",  # 2 partes: virava trace_id e extensão no evento
+        "-".join(["00"] * 80),
+        BASE["traceparent"].upper(),
+    ],
+)
+@pytest.mark.parametrize("slug", ["transacao-autorizada", "transacao-compensada"])
+def test_traceparent_gravado_fora_do_w3c_nao_entra_no_evento(slug: str, gravado: str) -> None:
+    """Defesa em profundidade: itens gravados antes da validação na borda podem guardar o header cru."""
+    evento = replace(EVENTOS[slug], traceparent=gravado)
+
+    publicado = json.loads(serializar(para_cloudevent(evento)))
+
+    assert not [e.message for e in validador(slug).iter_errors(publicado)]
+    assert "traceparent" not in publicado
+    assert publicado["data"]["trace_id"] is None
+
+
+@pytest.mark.parametrize("slug", ["transacao-autorizada", "transacao-recusada"])
+def test_canal_sai_no_evento_quando_o_pedido_informou(slug: str) -> None:
+    com_canal = json.loads(serializar(para_cloudevent(replace(EVENTOS[slug], canal="POS"))))
+    sem_canal = json.loads(serializar(para_cloudevent(EVENTOS[slug])))
+
+    assert not [e.message for e in validador(slug).iter_errors(com_canal)]
+    assert com_canal["data"]["canal"] == "POS"
+    assert "canal" not in sem_canal["data"]

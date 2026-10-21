@@ -105,6 +105,7 @@ class MotivoRecusa(StrEnum):
     RESERVA_DIVERGENTE = "RESERVA_DIVERGENTE"  # não deveria ocorrer: indica bug no chamador (409)
     RESERVA_NAO_ENCONTRADA = "RESERVA_NAO_ENCONTRADA"  # hold já capturado/estornado/expirado (409)
     ESTORNO_EM_ANDAMENTO = "ESTORNO_EM_ANDAMENTO"  # outro estorno da mesma original em voo (409)
+    CONTA_DIVERGENTE = "CONTA_DIVERGENTE"  # id_conta informado não é o titular do contrato (422)
     RECUSA_DO_LIMITE = (
         "RECUSA_DO_LIMITE"  # motivo novo do BC Limites que este BC ainda não mapeia (422)
     )
@@ -267,6 +268,7 @@ class Autorizacao:
                 id_estabelecimento=self.id_estabelecimento,
                 saldos=saldos,
                 id_autorizacao_original=self.id_autorizacao_original,
+                canal=self._canal(),
             )
             if self.eh_captura and original is not None:
                 id_derivado = str(uuid.uuid5(NAMESPACE_EVENTOS_DERIVADOS, id_evento))
@@ -309,6 +311,7 @@ class Autorizacao:
             id_conta=self.id_conta,
             id_estabelecimento=self.id_estabelecimento,
             saldos=saldos,
+            canal=self._canal(),
         )
         return replace(
             self,
@@ -429,6 +432,11 @@ class Autorizacao:
             atualizada_em=agora,
             **mudancas,  # type: ignore[arg-type]
         )
+
+    def _canal(self) -> str | None:
+        """`metadata.canal` do pedido (allowlist validada na borda), quando o canal informou."""
+        canal = self.metadata.get("canal")
+        return str(canal) if canal is not None else None
 
     def _base_do_evento(self, id_evento: str, agora: datetime) -> _BaseDoEvento:
         return {

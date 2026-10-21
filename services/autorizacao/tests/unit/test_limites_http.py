@@ -265,3 +265,21 @@ def test_consulta_de_contrato_inexistente_vira_contrato_inexistente() -> None:
 
     with pytest.raises(ContratoInexistente):
         gateway.consultar_operacao("CTR-X", ID_OP)
+
+
+@pytest.mark.parametrize(("id_conta", "no_corpo"), [("0001-1", True), (None, False)])
+def test_id_conta_vai_no_corpo_so_quando_informado(id_conta: str | None, no_corpo: bool) -> None:
+    corpos: list[dict[str, object]] = []
+
+    def tratador(requisicao: httpx.Request) -> httpx.Response:
+        corpos.append(json.loads(requisicao.content))
+        return httpx.Response(200, text=RESPOSTA_OK)
+
+    gateway, _, _ = _gateway(tratador)
+
+    gateway.aplicar(
+        "CTR-1", OperacaoNoLimite(TipoNoLimite.RESERVAR, ID_OP, Decimal("1.00"), id_conta=id_conta)
+    )
+
+    assert ("id_conta" in corpos[0]) is no_corpo
+    assert corpos[0].get("id_conta") == id_conta

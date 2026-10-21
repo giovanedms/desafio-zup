@@ -474,3 +474,29 @@ def test_prazo_no_futuro_aplica_normalmente(cliente: TestClient) -> None:
 
     assert resposta.status_code == 200
     assert resposta.json()["resultado"] == "APLICADA"
+
+
+def test_conta_divergente_e_recusa_200_e_o_mesmo_id_com_a_conta_certa_aplica(
+    cliente: TestClient,
+) -> None:
+    id_operacao = _novo_id()
+
+    errada = cliente.post(
+        OPERACOES, content=_corpo("DEBITAR", "10.00", id_operacao=id_operacao, id_conta="CONTA-2")
+    )
+    certa = cliente.post(
+        OPERACOES, content=_corpo("DEBITAR", "10.00", id_operacao=id_operacao, id_conta="CONTA-1")
+    )
+
+    assert errada.status_code == 200
+    assert (errada.json()["resultado"], errada.json()["motivo"]) == ("RECUSADA", "CONTA_DIVERGENTE")
+    assert '"limite_utilizado": 0.00' in errada.text
+    assert certa.json()["resultado"] == "APLICADA"
+
+
+@pytest.mark.parametrize("conta", ["", "conta com espaco", "0" * 17, "0001_1"])
+def test_id_conta_fora_do_padrao_devolve_422(cliente: TestClient, conta: str) -> None:
+    resposta = cliente.post(OPERACOES, content=_corpo("DEBITAR", "10.00", id_conta=conta))
+
+    assert resposta.status_code == 422
+    assert [e["campo"] for e in resposta.json()["erros"]] == ["id_conta"]

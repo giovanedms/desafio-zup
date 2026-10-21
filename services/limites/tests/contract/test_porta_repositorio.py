@@ -8,6 +8,7 @@ Se os dois passam, o adapter DynamoDB substitui o de referência sem nenhum cham
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -19,7 +20,14 @@ from limites.adapters.outbound.memoria import RepositorioDeLimitesEmMemoria
 from limites.application.portas import ContratoJaExiste, ContratoNaoEncontrado, RepositorioDeLimites
 from limites.domain.legado import AtualizacaoDoLegado
 from limites.domain.limite import JANELA_DE_DEDUPLICACAO, Limite, StatusContrato, TipoProduto
-from limites.domain.operacoes import CapturarReserva, Creditar, Debitar, LiberarReserva, Reservar
+from limites.domain.operacoes import (
+    CapturarReserva,
+    Creditar,
+    Debitar,
+    LiberarReserva,
+    OperacaoDeLimite,
+    Reservar,
+)
 from limites.domain.resultados import Desfecho, MotivoRecusa
 
 if TYPE_CHECKING:
@@ -34,6 +42,19 @@ def repositorio(request: pytest.FixtureRequest) -> RepositorioDeLimites:
         return RepositorioDeLimitesEmMemoria()
     cliente: DynamoDBClient = request.getfixturevalue("cliente_dynamodb_local")
     return RepositorioDeLimitesDynamoDB(cliente, request.getfixturevalue("tabela_limites"))
+
+
+@pytest.fixture(params=["memoria", pytest.param("dynamodb", marks=pytest.mark.integracao)])
+def duas_tasks(request: pytest.FixtureRequest) -> tuple[RepositorioDeLimites, RepositorioDeLimites]:
+    """Duas tasks do serviço sobre o mesmo estado. No DynamoDB cada uma tem o próprio cache de vencidas."""
+    if request.param == "memoria":
+        repositorio = RepositorioDeLimitesEmMemoria()
+        return repositorio, repositorio
+    cliente: DynamoDBClient = request.getfixturevalue("cliente_dynamodb_local")
+    tabela: str = request.getfixturevalue("tabela_limites")
+    return RepositorioDeLimitesDynamoDB(cliente, tabela), RepositorioDeLimitesDynamoDB(
+        cliente, tabela
+    )
 
 
 def contrato(
@@ -309,3 +330,75 @@ def test_guarda_de_idempotencia_fica_limitada_a_janela(repositorio: RepositorioD
     assert set(final.operacoes_recentes) == {"n-0", "n-1", "n-2"}
     assert final.utilizado == Decimal("63.00")
     final.verificar_invariantes()
+
+
+def test_remove_de_carona_nunca_apaga_entrada_fresca_reaplicada_por_outra_task(
+    duas_tasks: tuple[RepositorioDeLimites, RepositorioDeLimites],
+) -> None:
+    """Painel 6, F-5: a task A viu `d-velho` vencido; a B o compactou e reaplicou (entrada fresca). O REMOVE de
+    carona da A não pode apagar a entrada nova, senão o retry de `d-velho` dentro da janela debita de novo."""
+    task_a, task_b = duas_tasks
+    id_contrato = contrato(task_a)
+    task_a.aplicar(id_contrato, Debitar("d-velho", Decimal("10.00")), AGORA)
+    depois = AGORA + JANELA_DE_DEDUPLICACAO + timedelta(minutes=1)
+    task_a.aplicar(id_contrato, Debitar("a-1", Decimal("1.00")), depois)  # A vê d-velho vencido
+    task_b.aplicar(id_contrato, Debitar("b-1", Decimal("1.00")), depois)  # B também vê...
+    task_b.aplicar(id_contrato, Debitar("b-2", Decimal("1.00")), depois)  # ...e o remove de carona
+    reaplicado = task_b.aplicar(id_contrato, Debitar("d-velho", Decimal("10.00")), depois)
+    assert reaplicado.desfecho is Desfecho.APLICADA  # fora da janela é operação nova
+
+    a_2 = task_a.aplicar(
+        id_contrato, Debitar("a-2", Decimal("1.00")), depois + timedelta(seconds=1)
+    )
+    retry = task_b.aplicar(
+        id_contrato, Debitar("d-velho", Decimal("10.00")), depois + timedelta(seconds=10)
+    )
+
+    assert a_2.desfecho is Desfecho.APLICADA  # a escrita da A passa (sem compactar)
+    assert retry.desfecho is Desfecho.JA_APLICADA
+    final = task_a.obter(id_contrato)
+    assert final is not None
+    assert "d-velho" in final.operacoes_recentes
+    assert final.utilizado == Decimal("24.00")  # 10 + 1 + 1 + 1 + 10 + 1: nenhum débito em dobro
+
+
+# --- Conta conferida contra a réplica (CONTA_DIVERGENTE) ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "operacao",
+    [
+        lambda conta: Reservar("r2", Decimal("100.00"), id_conta=conta),
+        lambda conta: Debitar("d2", Decimal("100.00"), id_conta=conta),
+        lambda conta: Creditar("c2", Decimal("50.00"), id_conta=conta),
+        lambda conta: LiberarReserva("l2", "r1", Decimal("150.00"), id_conta=conta),
+        lambda conta: CapturarReserva(
+            "k2", "r1", Decimal("150.00"), Decimal("150.00"), id_conta=conta
+        ),
+    ],
+    ids=["RESERVAR", "DEBITAR", "CREDITAR", "LIBERAR_RESERVA", "CAPTURAR_RESERVA"],
+)
+def test_conta_divergente_recusa_sem_efeito_e_o_mesmo_id_com_a_conta_certa_aplica(
+    repositorio: RepositorioDeLimites, operacao: Callable[[str], OperacaoDeLimite]
+) -> None:
+    id_contrato = contrato(repositorio)
+    repositorio.aplicar(id_contrato, Reservar("r1", Decimal("150.00")), AGORA)
+    repositorio.aplicar(id_contrato, Debitar("d1", Decimal("100.00")), AGORA)
+    antes = repositorio.obter(id_contrato)
+    assert antes is not None
+
+    errada = repositorio.aplicar(id_contrato, operacao("0001-2"), AGORA)
+
+    assert (errada.desfecho, errada.motivo) == (Desfecho.RECUSADA, MotivoRecusa.CONTA_DIVERGENTE)
+    assert errada.saldos == antes.saldos
+    assert repositorio.obter(id_contrato) == antes  # nem a guarda mudou
+    certa = repositorio.aplicar(id_contrato, operacao("0001-1"), AGORA)
+    assert certa.desfecho is Desfecho.APLICADA
+
+
+def test_sem_id_conta_nada_muda(repositorio: RepositorioDeLimites) -> None:
+    id_contrato = contrato(repositorio)
+
+    resultado = repositorio.aplicar(id_contrato, Debitar("d1", Decimal("100.00")), AGORA)
+
+    assert resultado.desfecho is Desfecho.APLICADA

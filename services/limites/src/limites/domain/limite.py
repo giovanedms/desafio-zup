@@ -114,6 +114,8 @@ class Limite:
         p = plano.precondicoes
         if self.ja_aplicou(plano.id_operacao):
             return False
+        if p.id_conta is not None and p.id_conta != self.id_conta:
+            return False
         if p.contrato_ativo and self.status is not StatusContrato.ATIVO:
             return False
         if p.disponivel_minimo is not None and self.disponivel < p.disponivel_minimo:
@@ -158,7 +160,9 @@ class Limite:
 
         Usado pelos DOIS adapters (memória e DynamoDB, que recebe o item antigo via
         ReturnValuesOnConditionCheckFailure) — a classificação nunca é duplicada.
-        A ordem importa: idempotência vem antes de qualquer recusa.
+        A ordem importa: idempotência vem antes de qualquer recusa (o retry de uma operação aplicada é JA_APLICADA
+        mesmo que o legado tenha mudado a conta depois); a conta vem antes das outras recusas, para quem não é da
+        conta não saber nada dos holds do contrato.
         """
         plano = operacao.planejar()
         p = plano.precondicoes
@@ -166,6 +170,8 @@ class Limite:
             return Desfecho.JA_APLICADA, None
         if p.reserva_inexistente is not None and p.reserva_inexistente in self.reservas:
             return Desfecho.JA_APLICADA, None  # RESERVAR repetido com o hold ainda vivo
+        if p.id_conta is not None and p.id_conta != self.id_conta:
+            return Desfecho.RECUSADA, MotivoRecusa.CONTA_DIVERGENTE
         if p.reserva_existente is not None:
             id_reserva, valor = p.reserva_existente
             if id_reserva not in self.reservas:

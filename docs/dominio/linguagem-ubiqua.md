@@ -30,18 +30,19 @@ Os termos abaixo são os mesmos no enunciado, nos contratos (OpenAPI e eventos),
 |---|---|---|
 | **Limite** | Saldo de crédito de um contrato; agregado com as invariantes I1–I6 | `limites/domain/limite.py::Limite` |
 | **Limite concedido** | Teto definido pelo crédito no core legado (dono: legado) | `concedido` |
-| **Utilizado** | Valor consumido (débitos menos créditos) | `utilizado` |
+| **Utilizado** | **Saldo devedor líquido** do contrato: débitos e capturas somam; créditos (pagamento) e estornos abatem, de qualquer débito e não de um débito específico. Não existe saldo credor: crédito ou estorno maior que o utilizado é recusado (`CREDITO_EXCEDE_UTILIZADO`). Exemplo: compra 100 → pagamento 100 → compra 100 → estorno da 1ª compra = 100 − 100 + 100 − 100 = 0, que é o que o limite deve mostrar (não é vazamento) | `utilizado` |
 | **Reservado / saldo reservado** | Soma das reservas (holds) ativas — o `saldo_reservado` do enunciado | `reservado` |
 | **Disponível** | Concedido − utilizado − reservado | `disponivel` |
 | **Reserva (hold)** | Valor comprometido sem consumo, identificado pelo id da autorização | `reservas` |
 | **Operação** | Comando sobre o limite: reservar, debitar, creditar, liberar reserva, capturar reserva, estornar débito | `domain/operacoes.py` |
 | **Captura de reserva** | `CAPTURAR_RESERVA`: numa escrita só, `reservado −= valor_reservado`, `utilizado += valor` e remoção do hold | `CapturarReserva` |
 | **Árbitro do hold** | O hold decide a disputa: captura, estorno e expiração removem o hold e a primeira que o remove vence. As outras são RECUSADAS com `RESERVA_NAO_ENCONTRADA` (409 `conflito-de-estado` no BC Autorização) | ADR-0020; `Limite.diagnosticar` |
-| **Guarda de idempotência** | Mapa `ops` no item do contrato com os ids das operações aplicadas nos últimos 5 min. Faz o retry depois de timeout virar JA_APLICADA. Entradas vencidas saem no `REMOVE` da escrita seguinte do mesmo contrato, sem escrita extra | `JANELA_DE_DEDUPLICACAO`, `operacoes_expiradas` |
+| **Guarda de idempotência** | Mapa `ops` no item do contrato com os ids das operações aplicadas nos últimos 5 min. Faz o retry depois de timeout virar JA_APLICADA. Entradas vencidas saem no `REMOVE` da escrita seguinte do mesmo contrato, sem escrita extra; cada `REMOVE` só apaga entrada ainda vencida (ou já removida), nunca uma reaplicada por outra task dentro da janela. Recusa não grava nada na guarda | `JANELA_DE_DEDUPLICACAO`, `operacoes_expiradas`, `compilar` |
 | **Plano** | Pré-condições + efeitos de uma operação; o adapter o compila numa escrita atômica | `Plano` |
 | **Diagnóstico** | Por que uma operação não foi aplicada (já aplicada, ou recusada com motivo) | `Limite.diagnosticar` |
+| **Conta divergente** | `CONTA_DIVERGENTE`: recusa da operação cujo `id_conta` (opcional no contrato interno) não é a conta do contrato na réplica do core. Sem efeito nenhum, nem na guarda: o mesmo `id_operacao` com a conta certa ainda é aplicado. A idempotência vem antes (retry de operação já aplicada é JA_APLICADA mesmo se o legado trocou a conta depois), e a conta vem antes das outras recusas (quem não é da conta não fica sabendo de status nem de holds) | `MotivoRecusa.CONTA_DIVERGENTE`, `Precondicoes.id_conta` |
 | **Contrato quente** | Contrato com volume de operações próximo do teto por item (~8 op/s sustentadas, porque a guarda mora no item). Observado por `OperacoesNaGuarda` e Contributor Insights | ADR-0016 |
-| **Atualização do legado** | Mudança de concedido ou status vinda do core, com versão monotônica | `domain/legado.py` |
+| **Atualização do legado** | Mudança de concedido, status, conta ou produto vinda do core, com versão monotônica. Nunca toca utilizado nem reservado | `domain/legado.py` |
 
 ## BC Contabilização
 

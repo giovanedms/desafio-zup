@@ -10,7 +10,7 @@
    - Chama o caso de uso **no threadpool**, porque o boto3 é bloqueante.
 2. **`application/casos_de_uso.py` → `AplicarOperacaoNoLimite.executar`:** uma linha. Injeta o relógio e chama a **porta** `AplicacaoDeOperacoes`. Não sabe o que é DynamoDB (DIP).
 3. **`domain/operacoes.py` → `Reservar.planejar()`:** a regra, sem ler estado.
-   - **Pré-condições:** contrato ATIVO, `disponivel ≥ valor`, hold com esse id ainda não existe.
+   - **Pré-condições:** contrato ATIVO, `disponivel ≥ valor`, hold com esse id ainda não existe e, se o chamador mandou `id_conta`, o contrato é dessa conta (senão `CONTA_DIVERGENTE`).
    - **Efeitos:** `reservado += valor`, cria o hold.
    - Cada operação é uma subclasse (OCP).
 4. **`adapters/outbound/dynamodb.py` → `compilar(plano)`:** traduz o plano numa **única** `UpdateItem`.
@@ -31,7 +31,7 @@
 
 - O mapa `ops` guarda os ids aplicados nos últimos 5 min (`JANELA_DE_DEDUPLICACAO`). A condição `attribute_not_exists(ops.#op)` faz o **retry do SDK depois de um timeout** falhar, e o diagnóstico devolve JA_APLICADA.
 - O hold (`reservas.<id>`) é a guarda da RESERVA enquanto ela existir (até 7 dias), mesmo depois da compactação do `ops`.
-- **Compactação de carona:** as entradas vencidas vistas na resposta de uma escrita (`Limite.operacoes_expiradas`) saem no `REMOVE` da escrita seguinte do mesmo contrato. Não há escrita extra.
+- **Compactação de carona:** as entradas vencidas vistas na resposta de uma escrita (`Limite.operacoes_expiradas`) saem no `REMOVE` da escrita seguinte do mesmo contrato. Não há escrita extra. Cada `REMOVE` é condicionado (`ops.#xN < :corte`, ou a entrada já sumiu): o cache é por task, e outra task pode ter reaplicado o id. Se só essa condição falhar, a escrita repete sem compactar. Prova com duas tasks: `test_porta_repositorio.py::test_remove_de_carona_nunca_apaga_entrada_fresca_reaplicada_por_outra_task`.
 - Escrita que deixa a guarda com 200 entradas ou mais emite uma linha JSON `guarda_de_idempotencia` no stdout, que alimenta a métrica `OperacoesNaGuarda` e o Contributor Insights (ADR-0016).
 
 ## Captura, estorno e expiração disputam o hold
@@ -55,7 +55,7 @@ Estão em `domain/limite.py` (I1–I6), são verificadas por `verificar_invarian
 - **`adapters/inbound/legado/traducao.py`:** layout de 84 posições → `AtualizacaoDoLegado`.
   - `id_contrato` cabe em 20 posições e `id_conta` em 16, com `[A-Za-z0-9-]`. `formatar` levanta `RegistroLegadoInvalido` em vez de truncar, e `traduzir` rejeita id fora do pattern (a mensagem vai para a DLQ). Valor máximo do layout: 999.999.999.999.999,99.
 - **`domain/legado.py::sincronizar`:** a regra (versão obsoleta é ignorada; o disponível acompanha o concedido).
-- **`RepositorioDeLimitesDynamoDB.sincronizar`:** CAS só nos campos do legado, então não conflita com reservas.
+- **`RepositorioDeLimitesDynamoDB.sincronizar`:** CAS só nos campos do legado (concedido, status, conta, produto, versão), então não conflita com reservas.
 
 ## Perguntas prováveis e onde está a resposta
 
@@ -69,3 +69,5 @@ Estão em `domain/limite.py` (I1–I6), são verificadas por `verificar_invarian
 | "Como se captura um hold?" | `CapturarReserva`; ADR-0020 |
 | "O que acontece se captura e estorno chegarem juntos?" | O hold é o árbitro: um vence, o outro recebe `RESERVA_NAO_ENCONTRADA`. Teste de corrida no contrato da porta (20 capturas × 10 liberações → 1 aplicada) |
 | "O DynamoDB estrangulou, e agora?" | 503 com `Retry-After: 1`, não 500; o canal repete com a mesma chave |
+| "Um canal pode mexer no contrato de outra conta?" | Não, se mandar `id_conta`: a condição da escrita confere a conta da réplica e recusa com `CONTA_DIVERGENTE` (ADR-0005) |
+| "Quem garante que a API interna bate com o contrato?" | `tests/contract/test_api_interna_bate_com_o_contrato.py`: enums do contrato = enums do domínio, e cada resposta validada no schema |

@@ -17,8 +17,8 @@ from limites.adapters.outbound.dynamodb import RepositorioDeLimitesDynamoDB
 from limites.adapters.outbound.memoria import RepositorioDeLimitesEmMemoria
 from limites.domain.legado import AtualizacaoDoLegado, ResultadoDaSincronizacao
 from limites.domain.limite import StatusContrato, TipoProduto
-from limites.domain.operacoes import Reservar
-from limites.domain.resultados import Desfecho
+from limites.domain.operacoes import Debitar, Reservar
+from limites.domain.resultados import Desfecho, MotivoRecusa
 
 if TYPE_CHECKING:
     from limites.application.portas import RepositorioDeLimites, SincronizacaoComLegado
@@ -43,11 +43,13 @@ def atualizacao(
     versao: int,
     concedido: str = "1000.00",
     status: StatusContrato = StatusContrato.ATIVO,
+    id_conta: str = "0001-1",
+    tipo_produto: TipoProduto = TipoProduto.CREDITO,
 ) -> AtualizacaoDoLegado:
     return AtualizacaoDoLegado(
         id_contrato="CTR-L1",
-        id_conta="0001-1",
-        tipo_produto=TipoProduto.CREDITO,
+        id_conta=id_conta,
+        tipo_produto=tipo_produto,
         concedido=Decimal(concedido),
         status=status,
         versao_legado=versao,
@@ -155,3 +157,58 @@ def test_corrida_de_reservas_com_atualizacoes_do_legado(
     assert final.concedido == Decimal("1500.00")
     assert final.reservado == Decimal("400.00")
     assert final.disponivel == final.concedido - final.utilizado - final.reservado
+
+
+def test_legado_troca_conta_e_produto_sem_tocar_o_saldo(repositorio: RepositorioCompleto) -> None:
+    """F-4: o legado é dono de conta e produto; antes a réplica os congelava no primeiro registro."""
+    repositorio.sincronizar(atualizacao(1))
+    repositorio.aplicar("CTR-L1", Reservar("r1", Decimal("300.00")), AGORA)
+
+    resultado = repositorio.sincronizar(
+        atualizacao(2, id_conta="0002-9", tipo_produto=TipoProduto.CONSORCIO)
+    )
+
+    assert resultado is ResultadoDaSincronizacao.ATUALIZADO
+    limite = repositorio.obter("CTR-L1")
+    assert limite is not None
+    assert (limite.id_conta, limite.tipo_produto) == ("0002-9", TipoProduto.CONSORCIO)
+    assert (limite.reservado, limite.disponivel, dict(limite.reservas)) == (
+        Decimal("300.00"),
+        Decimal("700.00"),
+        {"r1": Decimal("300.00")},
+    )
+    antiga = repositorio.aplicar(
+        "CTR-L1", Debitar("d1", Decimal("10.00"), id_conta="0001-1"), AGORA
+    )
+    nova = repositorio.aplicar("CTR-L1", Debitar("d1", Decimal("10.00"), id_conta="0002-9"), AGORA)
+    assert antiga.motivo is MotivoRecusa.CONTA_DIVERGENTE
+    assert nova.desfecho is Desfecho.APLICADA
+
+
+def test_corrida_de_reservas_com_troca_de_produto_pelo_legado(
+    repositorio: RepositorioCompleto,
+) -> None:
+    """O CAS de conta/produto convive com reservas que conferem a conta (que não muda aqui): nada se perde."""
+    repositorio.sincronizar(atualizacao(1))
+    produtos = [TipoProduto.CONSORCIO, TipoProduto.CREDITO]
+
+    def reservar(i: int) -> Desfecho:
+        operacao = Reservar(f"r-{i}", Decimal(10), id_conta="0001-1")
+        return repositorio.aplicar("CTR-L1", operacao, AGORA).desfecho
+
+    def sincronizar(versao: int) -> ResultadoDaSincronizacao:
+        return repositorio.sincronizar(atualizacao(versao, tipo_produto=produtos[versao % 2]))
+
+    with ThreadPoolExecutor(max_workers=24) as pool:
+        reservas = [pool.submit(reservar, i) for i in range(40)]
+        sincronizacoes = [pool.submit(sincronizar, v) for v in range(2, 7)]
+        desfechos = [f.result() for f in reservas]
+        for f in sincronizacoes:
+            f.result()
+
+    assert desfechos.count(Desfecho.APLICADA) == 40
+    final = repositorio.obter("CTR-L1")
+    assert final is not None
+    final.verificar_invariantes()
+    assert (final.versao_legado, final.tipo_produto) == (6, TipoProduto.CONSORCIO)
+    assert final.reservado == Decimal("400.00")

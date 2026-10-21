@@ -18,6 +18,7 @@ from limites.domain.operacoes import (
     Debitar,
     EstornarDebito,
     LiberarReserva,
+    OperacaoDeLimite,
     Reservar,
 )
 from limites.domain.resultados import Desfecho, MotivoRecusa
@@ -99,6 +100,16 @@ def test_credito_vale_mesmo_com_contrato_bloqueado() -> None:
     bloqueado = Limite(**{**_campos(ativo), "status": StatusContrato.BLOQUEADO})
 
     assert bloqueado.atende(Creditar("c1", Decimal("300.00")).planejar())
+
+
+def test_credito_vale_com_contrato_encerrado_porque_quita_divida() -> None:
+    """Encerrar o contrato não apaga o saldo devedor: o pagamento continua recompondo o utilizado (F-9)."""
+    ativo = limite_de("1000.00").aplicar(Debitar("d1", Decimal("300.00")).planejar(), AGORA)
+    encerrado = Limite(**{**_campos(ativo), "status": StatusContrato.ENCERRADO})
+
+    assert encerrado.aplicar(
+        Creditar("c1", Decimal("300.00")).planejar(), AGORA
+    ).utilizado == Decimal("0.00")
 
 
 def test_credito_maior_que_o_utilizado_e_recusado() -> None:
@@ -188,3 +199,75 @@ def test_dinheiro_normaliza_para_duas_casas() -> None:
 
 def _campos(limite: Limite) -> dict[str, object]:
     return {nome: getattr(limite, nome) for nome in limite.__dataclass_fields__}
+
+
+# --- Conta conferida contra a réplica (CONTA_DIVERGENTE) ----------------------------------------
+
+
+def _todas_as_operacoes(id_conta: str | None) -> list[OperacaoDeLimite]:
+    return [
+        Reservar("r9", Decimal("10.00"), id_conta=id_conta),
+        Debitar("d9", Decimal("10.00"), id_conta=id_conta),
+        Creditar("c9", Decimal("10.00"), id_conta=id_conta),
+        EstornarDebito("e9", Decimal("10.00"), id_conta=id_conta),
+        LiberarReserva("l9", "r1", Decimal("100.00"), id_conta=id_conta),
+        CapturarReserva("k9", "r1", Decimal("100.00"), Decimal("100.00"), id_conta=id_conta),
+    ]
+
+
+def _com_hold_e_debito() -> Limite:
+    return (
+        limite_de("1000.00")
+        .aplicar(Reservar("r1", Decimal("100.00")).planejar(), AGORA)
+        .aplicar(Debitar("d1", Decimal("100.00")).planejar(), AGORA)
+    )
+
+
+@pytest.mark.parametrize("operacao", _todas_as_operacoes("0001-2"), ids=lambda o: o.tipo.value)
+def test_conta_divergente_recusa_toda_operacao(operacao: OperacaoDeLimite) -> None:
+    limite = _com_hold_e_debito()
+
+    assert not limite.atende(operacao.planejar())
+    assert limite.diagnosticar(operacao) == (Desfecho.RECUSADA, MotivoRecusa.CONTA_DIVERGENTE)
+
+
+@pytest.mark.parametrize(
+    "operacao",
+    _todas_as_operacoes("0001-1") + _todas_as_operacoes(None),
+    ids=lambda o: o.tipo.value,
+)
+def test_conta_certa_ou_ausente_nao_muda_nada(operacao: OperacaoDeLimite) -> None:
+    assert _com_hold_e_debito().atende(operacao.planejar())
+
+
+def test_conta_divergente_vem_antes_das_outras_recusas() -> None:
+    """Quem não é da conta não fica sabendo se o contrato está bloqueado nem se o hold existe."""
+    bloqueado = limite_de("1000.00", StatusContrato.BLOQUEADO)
+
+    assert bloqueado.diagnosticar(Debitar("d1", Decimal("1.00"), id_conta="0001-2")) == (
+        Desfecho.RECUSADA,
+        MotivoRecusa.CONTA_DIVERGENTE,
+    )
+    assert bloqueado.diagnosticar(
+        LiberarReserva("l1", "nao-existe", Decimal("1.00"), id_conta="0001-2")
+    ) == (Desfecho.RECUSADA, MotivoRecusa.CONTA_DIVERGENTE)
+
+
+def test_operacao_aplicada_repetida_e_ja_aplicada_mesmo_com_conta_trocada_depois() -> None:
+    """Idempotência antes da conta: se o legado trocou a conta depois, o retry não pode virar recusa."""
+    debito = Debitar("d1", Decimal("100.00"), id_conta="0001-1")
+    aplicado = limite_de("1000.00").aplicar(debito.planejar(), AGORA)
+    portado = Limite(**{**_campos(aplicado), "id_conta": "0002-9"})
+
+    assert portado.diagnosticar(debito) == (Desfecho.JA_APLICADA, None)
+
+
+def test_recusa_por_conta_nao_entra_na_guarda_e_o_mesmo_id_corrigido_aplica() -> None:
+    limite = limite_de("1000.00")
+    errada = Debitar("d1", Decimal("100.00"), id_conta="0001-2")
+
+    assert limite.diagnosticar(errada) == (Desfecho.RECUSADA, MotivoRecusa.CONTA_DIVERGENTE)
+    corrigida = limite.aplicar(
+        Debitar("d1", Decimal("100.00"), id_conta="0001-1").planejar(), AGORA
+    )
+    assert corrigida.utilizado == Decimal("100.00")

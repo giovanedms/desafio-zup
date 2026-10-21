@@ -53,7 +53,8 @@ class AplicacaoDeOperacoes(Protocol):
         Contrato (verificado pela mesma suíte nos dois adapters — LSP):
           - pré-condição atendida → APLICADA, com os saldos exatos pós-operação;
           - operação já aplicada → JA_APLICADA, sem reaplicar;
-          - pré-condição não atendida → RECUSADA com motivo (sem efeito no estado);
+          - pré-condição não atendida → RECUSADA com motivo (sem efeito no estado, nem na guarda: o mesmo id
+            corrigido, ex.: com a conta certa, ainda aplica);
           - contrato inexistente → ContratoNaoEncontrado;
           - concorrência no mesmo contrato nunca produz erro: escritas são serializadas.
         """
@@ -68,9 +69,9 @@ class CadastroDeLimites(Protocol):
 
 class SincronizacaoComLegado(Protocol):
     def sincronizar(self, atualizacao: AtualizacaoDoLegado) -> ResultadoDaSincronizacao:
-        """Aplica a atualização do legado com compare-and-set nos campos do legado (concedido, status,
-        versao_legado). Não conflita com o caminho quente: reservas mexem em utilizado/reservado/disponível
-        com expressões comutativas."""
+        """Aplica a atualização do legado com compare-and-set nos campos do legado (concedido, status, id_conta,
+        tipo_produto, versao_legado). Não conflita com o caminho quente: reservas mexem em
+        utilizado/reservado/disponível com expressões comutativas."""
         ...
 
 

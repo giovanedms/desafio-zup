@@ -35,6 +35,7 @@ class Precondicoes:
     utilizado_minimo: Decimal | None = None
     reserva_existente: tuple[str, Decimal] | None = None  # (id_reserva, valor exato)
     reserva_inexistente: str | None = None  # id_reserva que ainda não pode existir
+    id_conta: str | None = None  # conta declarada pelo chamador; ≠ da réplica → CONTA_DIVERGENTE
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,9 +56,15 @@ class Plano:
 
 
 class OperacaoDeLimite(ABC):
-    """Comando sobre o limite. Nova operação = nova subclasse (OCP); adapters não mudam."""
+    """Comando sobre o limite. Nova operação = nova subclasse (OCP); adapters não mudam.
+
+    Toda operação aceita `id_conta` (opcional): se vier, o contrato precisa ser dessa conta na réplica do core, ou a
+    operação é RECUSADA com CONTA_DIVERGENTE sem efeito (inclusive na guarda: o mesmo id com a conta certa ainda
+    aplica). Fecha o "canal opera contrato de outra conta" (BOLA) sem modelo de permissão novo.
+    """
 
     id_operacao: str
+    id_conta: str | None
 
     @property
     @abstractmethod
@@ -77,6 +84,7 @@ class Reservar(OperacaoDeLimite):
 
     id_operacao: str
     quantia: Decimal
+    id_conta: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "quantia", dinheiro_positivo(self.quantia))
@@ -97,6 +105,7 @@ class Reservar(OperacaoDeLimite):
                 disponivel_minimo=self.quantia,
                 # Idempotência enquanto o hold existir (até 7 dias), não só na janela da guarda.
                 reserva_inexistente=self.id_operacao,
+                id_conta=self.id_conta,
             ),
             Efeitos(delta_reservado=self.quantia, criar_reserva=(self.id_operacao, self.quantia)),
         )
@@ -108,6 +117,7 @@ class Debitar(OperacaoDeLimite):
 
     id_operacao: str
     quantia: Decimal
+    id_conta: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "quantia", dinheiro_positivo(self.quantia))
@@ -123,7 +133,9 @@ class Debitar(OperacaoDeLimite):
     def planejar(self) -> Plano:
         return Plano(
             self.id_operacao,
-            Precondicoes(contrato_ativo=True, disponivel_minimo=self.quantia),
+            Precondicoes(
+                contrato_ativo=True, disponivel_minimo=self.quantia, id_conta=self.id_conta
+            ),
             Efeitos(delta_utilizado=self.quantia),
         )
 
@@ -132,11 +144,14 @@ class Debitar(OperacaoDeLimite):
 class Creditar(OperacaoDeLimite):
     """Recompõe limite utilizado (ex.: pagamento). Não pode deixar o utilizado negativo.
 
-    Não exige contrato ATIVO: pagamento de contrato bloqueado continua recompondo o limite.
+    Não exige contrato ATIVO: pagamento de contrato BLOQUEADO ou ENCERRADO continua quitando a dívida e
+    recompondo o limite (encerrar o contrato não apaga o saldo devedor). `utilizado` é saldo devedor líquido:
+    não há saldo credor, então crédito maior que o utilizado é recusado (CREDITO_EXCEDE_UTILIZADO).
     """
 
     id_operacao: str
     quantia: Decimal
+    id_conta: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "quantia", dinheiro_positivo(self.quantia))
@@ -152,7 +167,7 @@ class Creditar(OperacaoDeLimite):
     def planejar(self) -> Plano:
         return Plano(
             self.id_operacao,
-            Precondicoes(utilizado_minimo=self.quantia),
+            Precondicoes(utilizado_minimo=self.quantia, id_conta=self.id_conta),
             Efeitos(delta_utilizado=-self.quantia),
         )
 
@@ -170,6 +185,7 @@ class LiberarReserva(OperacaoDeLimite):
     id_operacao: str
     id_reserva: str
     quantia: Decimal
+    id_conta: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "quantia", dinheiro_positivo(self.quantia))
@@ -185,7 +201,7 @@ class LiberarReserva(OperacaoDeLimite):
     def planejar(self) -> Plano:
         return Plano(
             self.id_operacao,
-            Precondicoes(reserva_existente=(self.id_reserva, self.quantia)),
+            Precondicoes(reserva_existente=(self.id_reserva, self.quantia), id_conta=self.id_conta),
             Efeitos(delta_reservado=-self.quantia, remover_reserva=self.id_reserva),
         )
 
@@ -203,6 +219,7 @@ class CapturarReserva(OperacaoDeLimite):
     id_reserva: str
     valor_reservado: Decimal
     quantia: Decimal
+    id_conta: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "valor_reservado", dinheiro_positivo(self.valor_reservado))
@@ -221,7 +238,10 @@ class CapturarReserva(OperacaoDeLimite):
     def planejar(self) -> Plano:
         return Plano(
             self.id_operacao,
-            Precondicoes(reserva_existente=(self.id_reserva, self.valor_reservado)),
+            Precondicoes(
+                reserva_existente=(self.id_reserva, self.valor_reservado),
+                id_conta=self.id_conta,
+            ),
             Efeitos(
                 delta_reservado=-self.valor_reservado,
                 delta_utilizado=self.quantia,
@@ -236,6 +256,7 @@ class EstornarDebito(OperacaoDeLimite):
 
     id_operacao: str
     quantia: Decimal
+    id_conta: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "quantia", dinheiro_positivo(self.quantia))
@@ -251,6 +272,6 @@ class EstornarDebito(OperacaoDeLimite):
     def planejar(self) -> Plano:
         return Plano(
             self.id_operacao,
-            Precondicoes(utilizado_minimo=self.quantia),
+            Precondicoes(utilizado_minimo=self.quantia, id_conta=self.id_conta),
             Efeitos(delta_utilizado=-self.quantia),
         )

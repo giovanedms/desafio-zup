@@ -13,6 +13,23 @@ info:
 
     Concorrência: operações no mesmo contrato são serializadas pelo DynamoDB (escrita condicional de item único), então
     não existe falha por contenção (ADR-0005). Estrangulamento do banco (contrato quente) volta 503 com Retry-After.
+
+    ## Segurança
+
+    Esta API **não tem autenticação de aplicação** (nenhum token, chave ou header de identidade é lido), e por isso não
+    declara `securitySchemes`. A fronteira de confiança é a **rede**: o security group do serviço só deixa
+    `autorizacao` e `reconciliador` alcançarem a porta 8080 (frente de Terraform), e o serviço não é publicado no API
+    Gateway. Na produção, a autenticação leste-oeste é **mTLS do ECS Service Connect com certificados da AWS Private
+    CA**: só quem tem certificado da malha abre conexão. A autorização de objeto vem no corpo: o chamador manda o
+    `id_conta` do pedido e a operação é recusada com `CONTA_DIVERGENTE` se o contrato não for dessa conta (ADR-0014).
+
+    ## Evolução
+
+    Campo novo no corpo da requisição entra sempre opcional. O consumidor **deve tolerar valor novo de `motivo`**
+    (e de qualquer enum de resposta): motivo desconhecido é recusa de negócio, não erro de payload. Foi assim que
+    `CONTA_DIVERGENTE` entrou sem versão nova.
+# Sem autenticação de aplicação, de propósito e declarado: a fronteira é a rede (ver "Segurança" na descrição).
+security: []
 tags:
   - name: Limites
 servers:
@@ -34,6 +51,9 @@ paths:
 
         Hold disputado: LIBERAR_RESERVA e CAPTURAR_RESERVA do mesmo `id_reserva` disputam o hold; a primeira que o
         remove vence e as demais voltam `RECUSADA` com `RESERVA_NAO_ENCONTRADA` (nunca sucesso silencioso).
+
+        Recusa não consome o `id_operacao`: nada é gravado, nem na guarda, então o mesmo id corrigido (por exemplo,
+        com o `id_conta` certo) ainda é aplicado.
       parameters:
         - $ref: '#/components/parameters/IdContrato'
         - $ref: '#/components/parameters/CorrelationId'
@@ -59,7 +79,8 @@ paths:
         '422':
           description: |
             Operação inválida: valor ausente, ≤ 0 ou com mais de 2 casas; tipo desconhecido; `id_reserva` ausente em
-            LIBERAR_RESERVA/CAPTURAR_RESERVA; `valor_reservado` ausente em CAPTURAR_RESERVA; captura maior que o reservado.
+            LIBERAR_RESERVA/CAPTURAR_RESERVA; `valor_reservado` ausente em CAPTURAR_RESERVA; captura maior que o reservado;
+            `id_conta` fora do pattern.
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
         '500':
           $ref: '#/components/responses/ErroInterno'
@@ -86,17 +107,14 @@ paths:
           description: Estado da operação no limite.
           content:
             application/json:
-              schema:
-                type: object
-                required: [id_operacao, na_guarda, reserva_ativa, versao]
-                properties:
-                  id_operacao: { type: string, format: uuid }
-                  na_guarda: { type: boolean }
-                  reserva_ativa: { type: boolean }
-                  versao: { type: integer, minimum: 1 }
+              schema: { $ref: '#/components/schemas/EstadoDaOperacao' }
         '404':
           description: Contrato inexistente na réplica do core.
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+        '422':
+          $ref: '#/components/responses/ParametroInvalido'
+        '500':
+          $ref: '#/components/responses/ErroInterno'
         '503':
           $ref: '#/components/responses/Indisponivel'
   /interno/v1/contratos/{id_contrato}/limite:
@@ -117,12 +135,17 @@ paths:
         '404':
           description: Contrato inexistente na réplica do core.
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
+        '422':
+          $ref: '#/components/responses/ParametroInvalido'
         '500':
           $ref: '#/components/responses/ErroInterno'
         '503':
           $ref: '#/components/responses/Indisponivel'
 components:
   responses:
+    ParametroInvalido:
+      description: Parâmetro de caminho fora do formato (`id_contrato` fora do pattern, `id_operacao` que não é UUID).
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     ErroInterno:
       description: Falha inesperada (bug). Não traz detalhe interno; use o correlation_id para achar o log.
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
@@ -178,7 +201,8 @@ components:
           description: |
             - RESERVAR: reservado += valor (hold). Exige disponível ≥ valor e contrato ATIVO.
             - DEBITAR: utilizado += valor. Exige disponível ≥ valor e contrato ATIVO.
-            - CREDITAR: utilizado −= valor. Exige utilizado ≥ valor.
+            - CREDITAR: utilizado −= valor. Exige utilizado ≥ valor (não existe saldo credor). Não exige contrato ATIVO:
+              pagamento de contrato bloqueado ou encerrado continua quitando a dívida.
             - LIBERAR_RESERVA: desfaz o hold `id_reserva` (estorno de reserva, expiração ou compensação).
             - CAPTURAR_RESERVA: o hold `id_reserva` vira consumo. reservado −= valor_reservado, utilizado += valor, e a
               sobra (valor_reservado − valor) volta ao disponível, numa escrita. Não exige contrato ATIVO: o hold já foi
@@ -193,8 +217,21 @@ components:
         valor_reservado:
           allOf: [ { $ref: '#/components/schemas/Dinheiro' } ]
           description: Obrigatório em CAPTURAR_RESERVA; conferido contra o hold gravado (diferente → RESERVA_DIVERGENTE).
+        id_conta:
+          type: string
+          pattern: '^[A-Za-z0-9-]{1,16}$'
+          description: |
+            Opcional, em qualquer `tipo` (mesmo pattern do `id_conta` da API pública). Se vier, é conferido contra a
+            conta do contrato na réplica do core: diferente → `RECUSADA` com `CONTA_DIVERGENTE`, sem efeito. Ausente,
+            nada é conferido (compatível com o chamador antigo). A conferência é contra a conta ATUAL: se o legado
+            trocou a conta do contrato depois do hold (portabilidade), captura/liberação com a conta antiga é recusada;
+            a compensação de sistema (expiração, reconciliação) que não vem de um pedido do canal pode omitir o campo.
+            Retry de operação já aplicada continua `JA_APLICADA` (a idempotência é avaliada antes da conta).
     Saldos:
       type: object
+      description: |
+        `limite_utilizado` é o saldo devedor líquido: débitos e capturas somam; créditos e estornos abatem, de qualquer
+        débito. Nunca fica negativo (não há saldo credor: devolver mais que o utilizado é recusado).
       required: [limite_concedido, limite_utilizado, saldo_reservado, limite_disponivel, versao]
       properties:
         limite_concedido: { $ref: '#/components/schemas/Dinheiro' }
@@ -209,11 +246,26 @@ components:
         resultado: { type: string, enum: [APLICADA, JA_APLICADA, RECUSADA] }
         motivo:
           type: string
-          enum: [LIMITE_INSUFICIENTE, CONTRATO_INATIVO, CREDITO_EXCEDE_UTILIZADO, RESERVA_DIVERGENTE, RESERVA_NAO_ENCONTRADA]
+          enum:
+            - LIMITE_INSUFICIENTE
+            - CONTRATO_INATIVO
+            - CREDITO_EXCEDE_UTILIZADO
+            - RESERVA_DIVERGENTE
+            - RESERVA_NAO_ENCONTRADA
+            - CONTA_DIVERGENTE
           description: |
             Presente quando resultado = RECUSADA. RESERVA_NAO_ENCONTRADA: o hold já foi capturado, liberado ou expirado
-            por outra operação.
+            por outra operação. CONTA_DIVERGENTE: o `id_conta` enviado não é a conta do contrato na réplica.
+            O consumidor deve tolerar valor novo neste enum (tratar como recusa de negócio).
         saldos: { $ref: '#/components/schemas/Saldos' }
+    EstadoDaOperacao:
+      type: object
+      required: [id_operacao, na_guarda, reserva_ativa, versao]
+      properties:
+        id_operacao: { type: string, format: uuid }
+        na_guarda: { type: boolean }
+        reserva_ativa: { type: boolean }
+        versao: { type: integer, minimum: 1 }
     Limite:
       allOf:
         - $ref: '#/components/schemas/Saldos'
@@ -236,3 +288,12 @@ components:
         codigo: { type: string }
         correlation_id: { type: string, format: uuid }
         trace_id: { type: string, nullable: true }
+        erros:
+          type: array
+          description: Detalhe por campo nos erros de validação (422).
+          items:
+            type: object
+            required: [campo, mensagem]
+            properties:
+              campo: { type: string }
+              mensagem: { type: string }

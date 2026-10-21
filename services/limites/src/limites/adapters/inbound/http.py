@@ -26,7 +26,7 @@ import simplejson
 from fastapi import FastAPI, Path, Request
 from fastapi.exceptions import RequestValidationError
 from plataforma.problemas import MEDIA_TYPE, Problema
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import JSONResponse, Response
@@ -59,6 +59,8 @@ _TRACEPARENT = re.compile(r"^[0-9a-f]{2}-(?P<trace_id>[0-9a-f]{32})-[0-9a-f]{16}
 # Mesmo padrão de `IdContrato` no contrato OpenAPI: 20 posições é o NUM-CONTRATO do registro do legado
 # (ACL, `traducao.py`); aceitar mais seria publicar ids que a réplica nunca terá.
 IdContrato = Annotated[str, Path(pattern=r"^[A-Za-z0-9-]{1,20}$")]
+# Mesmo padrão do `id_conta` da API pública (16 posições: NUM-CONTA do registro do legado).
+IdConta = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9-]{1,16}$")]
 
 # codigo -> (slug do `type`, title, status HTTP); espelha contracts/problem-types/catalogo.md.
 _PROBLEMAS: Mapping[str, tuple[str, str, int]] = {
@@ -89,6 +91,7 @@ class OperacaoRequest(BaseModel):
     valor: Decimal
     id_reserva: UUID | None = None
     valor_reservado: Decimal | None = None
+    id_conta: IdConta | None = None  # se vier, ≠ da conta do contrato → RECUSADA/CONTA_DIVERGENTE
 
 
 class _Rejeicao(Exception):
@@ -136,22 +139,24 @@ def _ler_operacao(corpo: bytes) -> OperacaoDeLimite:
 
 def _para_operacao(r: OperacaoRequest) -> OperacaoDeLimite:
     """Ids viram `str(uuid)` canônico: mesma operação, mesma chave de idempotência."""
-    id_operacao = str(r.id_operacao)
+    id_operacao, conta = str(r.id_operacao), r.id_conta
     match r.tipo:
         case "RESERVAR":
-            return Reservar(id_operacao, r.valor)
+            return Reservar(id_operacao, r.valor, id_conta=conta)
         case "DEBITAR":
-            return Debitar(id_operacao, r.valor)
+            return Debitar(id_operacao, r.valor, id_conta=conta)
         case "CREDITAR":
-            return Creditar(id_operacao, r.valor)
+            return Creditar(id_operacao, r.valor, id_conta=conta)
         case "ESTORNAR_DEBITO":
-            return EstornarDebito(id_operacao, r.valor)
+            return EstornarDebito(id_operacao, r.valor, id_conta=conta)
         case "LIBERAR_RESERVA":
-            return LiberarReserva(id_operacao, _id_reserva(r), r.valor)
+            return LiberarReserva(id_operacao, _id_reserva(r), r.valor, id_conta=conta)
         case "CAPTURAR_RESERVA":
             if r.valor_reservado is None:
                 raise _campo_obrigatorio("valor_reservado", r.tipo)
-            return CapturarReserva(id_operacao, _id_reserva(r), r.valor_reservado, r.valor)
+            return CapturarReserva(
+                id_operacao, _id_reserva(r), r.valor_reservado, r.valor, id_conta=conta
+            )
 
 
 def _id_reserva(r: OperacaoRequest) -> str:

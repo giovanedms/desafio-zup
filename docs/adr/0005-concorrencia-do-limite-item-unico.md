@@ -42,10 +42,12 @@ Fatos que restringem a escolha (da documentação oficial da AWS; os links princ
 - **O adapter compila o plano.** O plano vira `ConditionExpression` + `UpdateExpression` (`adapters/outbound/dynamodb.py::compilar`). A regra mora num lugar só e o banco a executa de forma atômica.
 - **Guarda de idempotência no item:**
   - `ops.<id_operacao>`, com **janela de 5 min**. A compactação vai **de carona**: as entradas vencidas vistas na resposta de uma escrita saem no `REMOVE` da escrita seguinte do mesmo contrato, sem escrita extra (`compilar(..., remover_ops)`). O que garante que 5 min bastam é o prazo de reaplicação do chamador (ADR-0006);
+  - **cada `REMOVE` de carona é condicionado** a `attribute_not_exists(ops.#xN) OR ops.#xN < :corte` (`:corte` = início da janela, a mesma regra de `operacoes_expiradas`). O cache de vencidas é de cada task, e outra task pode ter reaplicado o id depois que ele saiu da guarda: sem a condição, o `REMOVE` apagaria a entrada **fresca** e um retry dentro da janela aplicaria de novo (painel 6, F-5). Se a condição falha e o plano cabia no item devolvido (`ALL_OLD`), a escrita repete **sem compactar**. No pior caso (toda pré-condição e o máximo de 50 remoções) a condição tem ~3,2 KB, abaixo do limite de 4 KB por expressão (teste em `test_compilar.py`);
   - `reservas.<id>`: o próprio hold, enquanto existir. Ele também é o árbitro entre captura, estorno e expiração (ADR-0020).
 - **O retry do SDK é seguro.** Depois de um commit incerto, o retry falha na guarda e o resultado é diagnosticado como `JA_APLICADA`.
 - **`ReturnValues=ALL_NEW`** devolve os saldos exatos.
-- **Quando a condição falha.** `ReturnValuesOnConditionCheckFailure=ALL_OLD` traz o item antigo, e o **mesmo** `Limite.diagnosticar()` do domínio explica o porquê (já aplicada / limite insuficiente / contrato inativo / crédito excede utilizado / reserva divergente / reserva não encontrada).
+- **Conta conferida na mesma escrita.** Se o chamador manda `id_conta`, o plano ganha a pré-condição `id_conta = :conta`; contrato de outra conta → `RECUSADA`/`CONTA_DIVERGENTE`, sem efeito e sem gastar a guarda (o mesmo id com a conta certa ainda aplica). Fecha o "canal opera contrato de outra conta" (painel 6, G4) sem leitura extra.
+- **Quando a condição falha.** `ReturnValuesOnConditionCheckFailure=ALL_OLD` traz o item antigo, e o **mesmo** `Limite.diagnosticar()` do domínio explica o porquê (já aplicada / conta divergente / reserva não encontrada / reserva divergente / contrato inativo / limite insuficiente / crédito excede utilizado).
 - **Estrangulamento não é bug.** `ProvisionedThroughputExceeded`/`Throttling` depois dos retries do SDK vira `ArmazenamentoIndisponivel` → 503 com `Retry-After`, não 500 (o retry é seguro pela guarda).
 
 **Nenhuma transação toca o item de Limite.** Transação aparece só no BC Autorização, em itens sem contenção (ADR-0007).
@@ -71,6 +73,7 @@ Fatos que restringem a escolha (da documentação oficial da AWS; os links princ
 |---|---|
 | `ReturnValuesOnConditionCheckFailure` ausente num emulador | Fallback de leitura consistente com retry limitado (`ContencaoPersistente` → 503) |
 | Contrato quente (acima de ~8 op/s sustentadas, pelo custo da guarda no item) | Alarme de guarda + reserva fragmentada (ADR-0016) |
+| `REMOVE` de carona de uma task apagar a entrada que outra acabou de gravar (id reaplicado) | `REMOVE` condicionado ao corte da janela e repetição sem compactar; teste com duas tasks na suíte de contrato (memória e DynamoDB) |
 
 ## Quando esta decisão deixa de ser boa
 

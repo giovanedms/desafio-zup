@@ -3,7 +3,9 @@
 Autoridade por atributo durante a migração (ADR-0014):
   - legado é dono de: existência do contrato, conta, produto, LIMITE CONCEDIDO e STATUS;
   - este BC é dono de: utilizado, reservado e reservas (saldo em tempo real).
-A atualização do legado nunca toca utilizado/reservado; o disponível acompanha a variação do concedido.
+A atualização do legado nunca toca utilizado/reservado; o disponível acompanha a variação do concedido. Conta e
+produto também são do legado: uma versão nova que os muda (portabilidade de conta, reclassificação de produto) é
+aplicada na réplica, e a partir daí `id_conta` da operação é conferido contra a conta nova (CONTA_DIVERGENTE).
 
 O feed do legado pode chegar fora de ordem e repetido: cada registro traz uma versão monotônica; versão
 menor ou igual à já aplicada é OBSOLETA e ignorada (idempotência e ordem resolvidas pela versão).
@@ -42,7 +44,9 @@ class AtualizacaoDoLegado:
 
 class ResultadoDaSincronizacao(StrEnum):
     CRIADO = "CRIADO"  # carga inicial / contrato novo
-    ATUALIZADO = "ATUALIZADO"  # concedido e/ou status mudaram → LimiteAlterado (via CDC)
+    # concedido, status, conta e/ou produto mudaram. O CDC publica LimiteAlterado só se concedido ou status
+    # mudou (o evento não carrega conta nem produto).
+    ATUALIZADO = "ATUALIZADO"
     SEM_MUDANCA = "SEM_MUDANCA"  # versão nova, mesmos valores: só registra a versão
     OBSOLETA = "OBSOLETA"  # versão ≤ aplicada: fora de ordem ou repetida, ignorada
 
@@ -63,7 +67,12 @@ def sincronizar(
         return novo, ResultadoDaSincronizacao.CRIADO
     if atualizacao.versao_legado <= atual.versao_legado:
         return None, ResultadoDaSincronizacao.OBSOLETA
-    mudou = atualizacao.concedido != atual.concedido or atualizacao.status is not atual.status
+    mudou = (
+        atualizacao.concedido != atual.concedido
+        or atualizacao.status is not atual.status
+        or atualizacao.id_conta != atual.id_conta
+        or atualizacao.tipo_produto is not atual.tipo_produto
+    )
     if not mudou:
         return replace(atual, versao_legado=atualizacao.versao_legado), (
             ResultadoDaSincronizacao.SEM_MUDANCA
@@ -71,6 +80,8 @@ def sincronizar(
     variacao = atualizacao.concedido - atual.concedido
     novo = replace(
         atual,
+        id_conta=atualizacao.id_conta,
+        tipo_produto=atualizacao.tipo_produto,
         concedido=atualizacao.concedido,
         disponivel=atual.disponivel + variacao,
         status=atualizacao.status,

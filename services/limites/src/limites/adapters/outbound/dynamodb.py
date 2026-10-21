@@ -18,7 +18,7 @@ from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -39,7 +39,7 @@ from limites.application.portas import (
     ContratoNaoEncontrado,
 )
 from limites.domain.legado import AtualizacaoDoLegado, ResultadoDaSincronizacao, sincronizar
-from limites.domain.limite import Limite, StatusContrato, TipoProduto
+from limites.domain.limite import JANELA_DE_DEDUPLICACAO, Limite, StatusContrato, TipoProduto
 from limites.domain.operacoes import OperacaoDeLimite, Plano
 from limites.domain.resultados import Desfecho, ResultadoDaOperacao
 
@@ -66,6 +66,7 @@ _CODIGOS_TRANSITORIOS = frozenset(
 _log_da_guarda = logging.getLogger("limites.guarda")
 _serializar = TypeSerializer().serialize
 _desserializar = TypeDeserializer().deserialize
+_EPOCA = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 @dataclass
@@ -113,6 +114,8 @@ def compilar(plano: Plano, agora: datetime, remover_ops: Sequence[str] = ()) -> 
     if p.reserva_inexistente is not None:
         rn = x.nome("#rn", p.reserva_inexistente)
         condicoes.append(f"attribute_not_exists({reservas()}.{rn})")
+    if p.id_conta is not None:
+        condicoes.append(f"{x.nome('#conta', 'id_conta')} = {x.valor(':conta', p.id_conta)}")
 
     versao = x.nome("#versao", "versao")
     sets = [
@@ -136,12 +139,13 @@ def compilar(plano: Plano, agora: datetime, remover_ops: Sequence[str] = ()) -> 
     removes = []
     if e.remover_reserva is not None:
         removes.append(f"{reservas()}.{x.nome('#rr', e.remover_reserva)}")
-    # Compactação de carona: tira da guarda as operações vencidas vistas na escrita anterior deste contrato.
-    # Remover chave de mapa vencida é seguro sem condição (ninguém mais a consulta) e não custa escrita extra.
     # O id desta operação nunca entra no REMOVE: SET e REMOVE do mesmo caminho é ValidationException (o painel
     # reproduziu com dois retries do mesmo id depois da janela: o 1º põe o id no cache de vencidas).
-    removiveis = [v for v in remover_ops if v != plano.id_operacao]
-    removes.extend(f"{ops}.{x.nome(f'#x{i}', vencida)}" for i, vencida in enumerate(removiveis))
+    carona = _compactacao_de_carona(
+        x, ops, [v for v in remover_ops if v != plano.id_operacao], agora
+    )
+    removes += [remove for remove, _ in carona]
+    condicoes += [condicao for _, condicao in carona]
     if removes:
         expressao += " REMOVE " + ", ".join(removes)
     return {
@@ -150,6 +154,36 @@ def compilar(plano: Plano, agora: datetime, remover_ops: Sequence[str] = ()) -> 
         "ExpressionAttributeNames": x.nomes,
         "ExpressionAttributeValues": x.valores,
     }
+
+
+def _compactacao_de_carona(
+    x: _Expressao, ops: str, vencidas: Sequence[str], agora: datetime
+) -> list[tuple[str, str]]:
+    """(REMOVE, condição) para cada operação vencida vista na escrita anterior deste contrato, sem escrita extra.
+
+    Cada REMOVE leva condição: o cache de vencidas é desta task, e outra pode ter reaplicado o id depois que ele saiu
+    da guarda (entrada FRESCA). Sem a condição, o REMOVE a apagaria e um retry dentro da janela aplicaria a operação
+    de novo (painel 6, F-5). Entrada que já sumiu (outra task a removeu) passa. Se só esta condição falhar,
+    `_aplicar` repete a escrita sem compactar.
+    """
+    if not vencidas:
+        return []  # sem `:corte` declarado: valor sobrando = ValidationException
+    corte = x.valor(":corte", _corte_da_janela(agora))
+    pares = []
+    for i, vencida in enumerate(vencidas):
+        entrada = f"{ops}.{x.nome(f'#x{i}', vencida)}"
+        pares.append((entrada, f"(attribute_not_exists({entrada}) OR {entrada} < {corte})"))
+    return pares
+
+
+def _corte_da_janela(agora: datetime) -> int:
+    """Menor instante (epoch em s) ainda DENTRO da janela: entrada da guarda com `ts < corte` está vencida.
+
+    É a regra de `Limite.operacoes_expiradas` (agora − quando > janela) para os segundos inteiros que a guarda grava:
+    ts < agora − janela ⟺ ts < ⌈agora − janela⌉. Conta inteira, sem float.
+    """
+    segundos, resto = divmod(agora - JANELA_DE_DEDUPLICACAO - _EPOCA, timedelta(seconds=1))
+    return segundos + (1 if resto else 0)
 
 
 @contextmanager
@@ -203,8 +237,8 @@ class RepositorioDeLimitesDynamoDB:
         self, id_contrato: str, operacao: OperacaoDeLimite, agora: datetime
     ) -> ResultadoDaOperacao:
         plano = operacao.planejar()
+        vencidas = self._tirar_vencidas(id_contrato)
         for _ in range(TENTATIVAS_DE_DIAGNOSTICO):
-            vencidas = self._tirar_vencidas(id_contrato)
             try:
                 resposta = self._cliente.update_item(
                     TableName=self._tabela,
@@ -224,9 +258,13 @@ class RepositorioDeLimitesDynamoDB:
                 if not item_antigo:
                     raise ContratoNaoEncontrado(id_contrato) from erro
                 antigo = _de_item(item_antigo)
-                self._guardar_vencidas(id_contrato, antigo.operacoes_expiradas(agora))
                 if antigo.atende(plano):
-                    continue  # só acontece no fallback de leitura: o estado mudou nesse meio-tempo
+                    # O plano cabia no item: falhou a condição de um REMOVE de carona (id reaplicado por outra task,
+                    # F-5) ou, no fallback de leitura, o estado mudou nesse meio-tempo. Repete sem compactar; as
+                    # vencidas voltam a ser calculadas da resposta da escrita.
+                    vencidas = ()
+                    continue
+                self._guardar_vencidas(id_contrato, antigo.operacoes_expiradas(agora))
                 desfecho, motivo = antigo.diagnosticar(operacao)
                 return ResultadoDaOperacao(desfecho, antigo.saldos, motivo)
         raise ContencaoPersistente(id_contrato)
@@ -248,9 +286,11 @@ class RepositorioDeLimitesDynamoDB:
     def sincronizar(self, atualizacao: AtualizacaoDoLegado) -> ResultadoDaSincronizacao:
         """Aplica a atualização do legado: GetItem consistente → regra do domínio → escrita condicional.
 
-        O compare-and-set cobre SÓ os campos do legado (versao_legado, concedido, status). A escrita não
-        toca utilizado/reservado/reservas, e o disponível muda por delta (`disponivel + :delta`): reservas
-        concorrentes (que também usam expressões comutativas) nunca fazem esta condição falhar.
+        O compare-and-set cobre SÓ os campos do legado (versao_legado, concedido, status, id_conta,
+        tipo_produto). A escrita não toca utilizado/reservado/reservas, e o disponível muda por delta
+        (`disponivel + :delta`): reservas concorrentes (que também usam expressões comutativas) nunca fazem esta
+        condição falhar. O inverso pode acontecer, e é a serialização certa: a operação que chega depois da troca
+        de conta é recusada com CONTA_DIVERGENTE.
         Condição falhou = o legado mexeu no item entre a leitura e a escrita → relê e reavalia.
         """
         for _ in range(TENTATIVAS_DE_SINCRONIZACAO):
@@ -314,16 +354,22 @@ def _escrita_do_legado(
     if resultado is ResultadoDaSincronizacao.ATUALIZADO:
         concedido = x.nome("#c", "concedido")
         status = x.nome("#status", "status")
+        conta = x.nome("#conta", "id_conta")
+        produto = x.nome("#produto", "tipo_produto")
         disponivel = x.nome("#disp", "disponivel")
         versao = x.nome("#versao", "versao")
         condicoes += [
             f"{concedido} = {x.valor(':c_atual', atual.concedido)}",
             f"{status} = {x.valor(':st_atual', atual.status.value)}",
+            f"{conta} = {x.valor(':conta_atual', atual.id_conta)}",
+            f"{produto} = {x.valor(':prod_atual', atual.tipo_produto.value)}",
         ]
         sets += [
             f"{concedido} = {x.valor(':c', atualizacao.concedido)}",
             f"{disponivel} = {disponivel} + {x.valor(':delta', atualizacao.concedido - atual.concedido)}",
             f"{status} = {x.valor(':st', atualizacao.status.value)}",
+            f"{conta} = {x.valor(':conta', atualizacao.id_conta)}",
+            f"{produto} = {x.valor(':prod', atualizacao.tipo_produto.value)}",
             f"{versao} = {versao} + {x.valor(':um', 1)}",
         ]
     return {

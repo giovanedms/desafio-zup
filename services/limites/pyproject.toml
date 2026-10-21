@@ -7,10 +7,14 @@ dependencies = [
   "uvicorn[standard]",
   "pydantic>=2",
   "boto3",
-  "httpx",
   "simplejson>=4.2.0",
   "plataforma",
 ]
+
+[dependency-groups]
+# Só nos testes: o TestClient do Starlette usa httpx. O serviço não faz chamada HTTP de saída, então httpx não vai
+# para a imagem (o Dockerfile instala com --no-dev).
+dev = ["httpx"]
 
 [build-system]
 requires = ["hatchling"]

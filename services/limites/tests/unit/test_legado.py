@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -199,6 +200,46 @@ def test_bloqueio_pelo_legado_recusa_novas_reservas() -> None:
         Desfecho.RECUSADA,
         MotivoRecusa.CONTRATO_INATIVO,
     )
+
+
+@pytest.mark.parametrize(
+    ("id_conta", "tipo_produto"),
+    [("0002-87654321-0", TipoProduto.CREDITO), ("0001-12345678-9", TipoProduto.CONSORCIO)],
+    ids=["portabilidade-de-conta", "reclassificacao-de-produto"],
+)
+def test_legado_e_dono_de_conta_e_produto_e_a_mudanca_e_aplicada(
+    id_conta: str, tipo_produto: TipoProduto
+) -> None:
+    """F-4: antes, conta e produto congelavam no primeiro registro (SEM_MUDANCA para sempre)."""
+    atual, _ = sincronizar(None, atualizacao(versao=1))
+    assert atual is not None
+    atual = atual.aplicar(Reservar("r1", Decimal("300.00")).planejar(), AGORA)
+    mudanca = replace(atualizacao(versao=2), id_conta=id_conta, tipo_produto=tipo_produto)
+
+    novo, resultado = sincronizar(atual, mudanca)
+
+    assert resultado is ResultadoDaSincronizacao.ATUALIZADO
+    assert novo is not None
+    assert (novo.id_conta, novo.tipo_produto) == (id_conta, tipo_produto)
+    assert (novo.versao, novo.versao_legado) == (atual.versao + 1, 2)
+    assert (novo.reservado, novo.disponivel, dict(novo.reservas)) == (
+        atual.reservado,
+        atual.disponivel,
+        dict(atual.reservas),
+    )  # saldo do BC intacto
+
+
+def test_depois_da_portabilidade_a_conta_antiga_e_divergente() -> None:
+    atual, _ = sincronizar(None, atualizacao(versao=1))
+    assert atual is not None
+    novo, _ = sincronizar(atual, replace(atualizacao(versao=2), id_conta="0002-87654321-0"))
+    assert novo is not None
+
+    antiga = Reservar("r1", Decimal("1.00"), id_conta="0001-12345678-9")
+    nova = Reservar("r1", Decimal("1.00"), id_conta="0002-87654321-0")
+
+    assert novo.diagnosticar(antiga) == (Desfecho.RECUSADA, MotivoRecusa.CONTA_DIVERGENTE)
+    assert novo.atende(nova.planejar())
 
 
 @settings(max_examples=150)

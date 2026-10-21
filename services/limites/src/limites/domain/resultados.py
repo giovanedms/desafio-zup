@@ -19,6 +19,7 @@ class MotivoRecusa(StrEnum):
     CREDITO_EXCEDE_UTILIZADO = "CREDITO_EXCEDE_UTILIZADO"
     RESERVA_DIVERGENTE = "RESERVA_DIVERGENTE"  # valor ≠ do hold gravado: bug no chamador
     RESERVA_NAO_ENCONTRADA = "RESERVA_NAO_ENCONTRADA"  # hold já capturado, liberado ou expirado
+    CONTA_DIVERGENTE = "CONTA_DIVERGENTE"  # id_conta informado ≠ conta do contrato na réplica
 
 
 @dataclass(frozen=True, slots=True)

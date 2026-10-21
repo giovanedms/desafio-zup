@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
 
@@ -19,9 +19,11 @@ from limites.adapters.outbound.dynamodb import (
     ArmazenamentoIndisponivel,
     RepositorioDeLimitesDynamoDB,
     _para_item,
+    compilar,
 )
-from limites.domain.limite import Limite, TipoProduto
+from limites.domain.limite import JANELA_DE_DEDUPLICACAO, Limite, TipoProduto
 from limites.domain.operacoes import Debitar
+from limites.domain.resultados import Desfecho
 
 AGORA = datetime(2026, 10, 20, 13, 0, tzinfo=UTC)
 
@@ -132,3 +134,60 @@ def test_muitas_reservas_com_guarda_pequena_tambem_vira_linha_json(
         "operacoes_na_guarda": 1,
         "reservas_ativas": LIMIAR_DE_ALERTA_DA_GUARDA,
     }
+
+
+def _escrita(id_contrato: str, plano_e_remocoes: dict[str, object]) -> dict[str, object]:
+    return {
+        "TableName": "limites",
+        "Key": {"id_contrato": {"S": id_contrato}},
+        "ReturnValues": "ALL_NEW",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        **plano_e_remocoes,
+    }
+
+
+def test_remove_de_carona_que_acha_entrada_fresca_repete_a_escrita_sem_compactar() -> None:
+    """F-5, sequência exata de chamadas: esta task viu `d-velho` vencido; outra o reaplicou (entrada fresca).
+
+    A 1ª escrita leva o REMOVE condicionado e falha só por ele; a 2ª vai sem REMOVE e aplica. Sem a condição,
+    o REMOVE apagaria a entrada fresca e um retry de `d-velho` dentro da janela debitaria de novo.
+    """
+    t0 = AGORA
+    t1 = t0 + JANELA_DE_DEDUPLICACAO + timedelta(minutes=1)
+    base = Limite.novo("CTR-1", "0001-1", TipoProduto.CREDITO, Decimal("1000.00"))
+    com_velho = base.aplicar(Debitar("d-velho", Decimal("1.00")).planejar(), t0)
+    visto = com_velho.aplicar(Debitar("x", Decimal("1.00")).planejar(), t1)  # d-velho vencido aqui
+    reaplicado = replace(  # outra task compactou e reaplicou d-velho em t1
+        visto,
+        operacoes_recentes=MappingProxyType({"x": t1, "d-velho": t1}),
+        utilizado=visto.utilizado + 1,
+        disponivel=visto.disponivel - 1,
+        versao=visto.versao + 2,
+    )
+    w = Debitar("w", Decimal("1.00"))
+    depois = reaplicado.aplicar(w.planejar(), t1)
+    cliente, stub = _cliente()
+    stub.add_response(
+        "update_item",
+        {"Attributes": _para_item(visto)},
+        _escrita("CTR-1", compilar(Debitar("x", Decimal("1.00")).planejar(), t1)),
+    )
+    stub.add_client_error(
+        "update_item",
+        service_error_code="ConditionalCheckFailedException",
+        expected_params=_escrita("CTR-1", compilar(w.planejar(), t1, ("d-velho",))),
+        modeled_fields={"Item": _para_item(reaplicado)},
+    )
+    stub.add_response(
+        "update_item",
+        {"Attributes": _para_item(depois)},
+        _escrita("CTR-1", compilar(w.planejar(), t1)),
+    )
+    repositorio = RepositorioDeLimitesDynamoDB(cliente, "limites")  # type: ignore[arg-type]
+
+    with stub:
+        repositorio.aplicar("CTR-1", Debitar("x", Decimal("1.00")), t1)
+        resultado = repositorio.aplicar("CTR-1", w, t1)
+
+    stub.assert_no_pending_responses()
+    assert resultado.desfecho is Desfecho.APLICADA

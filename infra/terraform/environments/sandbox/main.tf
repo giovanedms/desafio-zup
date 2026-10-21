@@ -71,9 +71,26 @@ module "ecr" {
   source = "../../modules/ecr"
 }
 
-# Bus, archive, filas e DLQs.
+# Bus, archive, filas, DLQs e schema registry dos contratos de evento.
 module "eventos" {
   source = "../../modules/eventos"
+
+  # A regra da data platform usa a mesma DLQ de entrega dos targets do bus.
+  regras_externas_na_dlq_de_entrega = [module.plataforma_de_dados.regra_arn]
+}
+
+# Data platform (4º consumidor): regra do bus -> Firehose -> S3 particionado por tipo e data, com alarme de defasagem.
+module "plataforma_de_dados" {
+  source                   = "../../modules/plataforma_de_dados"
+  limite_de_permissoes_arn = local.limite_de_permissoes_arn
+
+  account_id         = var.account_id
+  bus_nome           = module.eventos.bus_nome
+  sources            = module.eventos.sources
+  dlq_de_entrega_arn = module.eventos.entrega_dlq_arn
+  ativa              = var.plataforma_de_dados_ativa
+  forcar_destruicao  = !var.deletion_protection
+  acoes_alarme       = [module.observabilidade.topico_alarmes_arn]
 }
 
 # ---------------------------------------------------------------- ECS
@@ -169,6 +186,7 @@ module "limites" {
   max_tasks                = var.tasks_max
   service_connect_publicar = "limites"
   janelas_de_pico          = var.janelas_de_pico
+  escala_preditiva         = var.modo_escala_preditiva
 
   variaveis_ambiente = {
     AWS_REGION     = "sa-east-1"
@@ -198,6 +216,7 @@ module "autorizacao" {
   max_tasks           = var.tasks_max
   target_group_arn    = module.api.target_group_arn
   janelas_de_pico     = var.janelas_de_pico
+  escala_preditiva    = var.modo_escala_preditiva
 
   variaveis_ambiente = {
     AWS_REGION          = "sa-east-1"
@@ -393,7 +412,21 @@ module "api" {
   deletion_protection       = var.deletion_protection
 }
 
-# Funções Lambda: relay (outbox -> bus), relay-cdc-limites (stream de limites -> bus), sweeper (agendado) e contabilização (SQS).
+# ---------------------------------------------------------------- consumidores de referência (antifraude, notificações)
+
+# Zip do pacote consumidores. Fica aqui, com o bloco que a usa; mesma semântica de var.zip_relay.
+
+locals {
+  zip_consumidores = coalesce(var.zip_consumidores, "${path.module}/../../build/consumidores.zip")
+
+  # Toda fila de assinatura sem consumidor próprio (hoje antifraude e notificacoes; a contabilização tem o dela) ganha
+  # o consumidor de referência: o evento não fica parado na fila, e o alarme idade-da-fila-<fila> passa a medir atraso
+  # de consumo de verdade. As filas e as DLQs continuam do módulo eventos.
+  consumidores_de_referencia = { for fila, arn in module.eventos.filas_arns : fila => arn if fila != "contabilizacao" }
+}
+
+# Funções Lambda: relay (outbox -> bus), relay-cdc-limites (stream de limites -> bus), sweeper (agendado), contabilização
+# (SQS) e os consumidores de referência (SQS, uma função por fila).
 module "lambdas" {
   limite_de_permissoes_arn = local.limite_de_permissoes_arn
   source                   = "../../modules/lambdas"
@@ -416,6 +449,10 @@ module "lambdas" {
     inbox_nome       = module.dados.nomes["contabilizacao-inbox"]
     inbox_arn        = module.dados.arns["contabilizacao-inbox"]
   }
+
+  consumidores        = local.consumidores_de_referencia
+  zip_consumidores    = local.zip_consumidores
+  deletion_protection = var.deletion_protection
 }
 
 # Dashboard e alarmes (burn rate do SLO, p99, DLQs, idade das filas, Errors e IteratorAge das Lambdas, sinais de log).
@@ -441,10 +478,14 @@ module "observabilidade" {
   log_group_autorizacao   = module.autorizacao.log_group_nome
   log_group_cdc           = module.lambdas.cdc_limites_log_group_nome
 
-  funcoes_lambda = {
-    relay          = module.lambdas.relay_nome
-    sweeper        = module.lambdas.sweeper_nome
-    cdc-limites    = module.lambdas.cdc_limites_nome
-    contabilizacao = module.lambdas.contabilizacao_nome
-  }
+  # Os consumidores de referência entram com a chave consumidor-<fila> (alarme lambda-erros-consumidor-<fila>).
+  funcoes_lambda = merge(
+    {
+      relay          = module.lambdas.relay_nome
+      sweeper        = module.lambdas.sweeper_nome
+      cdc-limites    = module.lambdas.cdc_limites_nome
+      contabilizacao = module.lambdas.contabilizacao_nome
+    },
+    module.lambdas.consumidores_funcoes,
+  )
 }

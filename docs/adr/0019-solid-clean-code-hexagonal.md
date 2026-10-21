@@ -11,10 +11,11 @@ O enunciado pede SOLID "de forma explícita e justificada no código", Clean Cod
 
 ## Decisão
 
-**Arquitetura hexagonal por serviço**, com a regra de dependência **verificada na CI** por import-linter (`.importlinter`). Nove contratos:
+**Arquitetura hexagonal por serviço**, com a regra de dependência **verificada na CI** por import-linter (`.importlinter`). Onze contratos:
 
 - em cada serviço, `adapters → application → domain`, e `domain`/`application` **proibidos** de importar `fastapi`, `starlette`, `pydantic`, `boto3`, `botocore`, `httpx` e `uvicorn`;
 - no `relay`, `local`/`lambda_handler`/`sweeper` (entradas) → `cdc_limites`/`eventbridge`/`outbox_dynamodb` (adapters) → `nucleo`, e `nucleo` **proibido** de importar `boto3` e `botocore`;
+- nos `consumidores` (consumidores de referência de antifraude e notificações), `lambda_sqs` (entrada) → `esquemas`/`inbox_dynamodb`/`inbox_memoria` (adapters) → `nucleo`, e `nucleo` **proibido** de importar `boto3`, `botocore` e `jsonschema`;
 - a `plataforma` (`libs/plataforma`, pacote compartilhado) **proibida** de importar `fastapi`, `starlette`, `pydantic`, `boto3`, `botocore`, `httpx` e `uvicorn`. Como ela está em `root_packages`, o import-linter também a atravessa: um `domain → plataforma.x → boto3` quebra o contrato do serviço.
 
 Um import de `boto3` no núcleo quebra o build, e isso é teste automatizado, não afirmação: `tests/contract/test_gate_de_arquitetura.py` roda o `lint-imports` com este `.importlinter` contra um pacote-fixture (em diretório temporário) com `import boto3` em `autorizacao.domain` e em `relay.nucleo`, e confere que o contrato correspondente fica `BROKEN` e o build sai com 1.

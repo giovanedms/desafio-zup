@@ -4,6 +4,7 @@ root_packages =
     autorizacao
     limites
     contabilizacao
+    consumidores
     relay
     plataforma
 include_external_packages = True
@@ -94,6 +95,25 @@ source_modules =
 forbidden_modules =
     boto3
     botocore
+
+# Consumidores de referência (Lambdas das filas antifraude e notificacoes): entrada > adapters > núcleo.
+[importlinter:contract:consumidores-layers]
+name = consumidores: entrada > adapters > nucleo
+type = layers
+layers =
+    consumidores.lambda_sqs
+    consumidores.esquemas | consumidores.inbox_dynamodb | consumidores.inbox_memoria
+    consumidores.nucleo
+
+[importlinter:contract:consumidores-nucleo-puro]
+name = consumidores: nucleo sem AWS SDK nem biblioteca de JSON Schema
+type = forbidden
+source_modules =
+    consumidores.nucleo
+forbidden_modules =
+    boto3
+    botocore
+    jsonschema
 
 # Pacote compartilhado (libs/plataforma, sem dependências no pyproject). Como root_package ele é atravessado:
 # um `domain -> plataforma.x -> boto3` quebra o contrato do serviço. Aqui ele mesmo fica proibido de importar

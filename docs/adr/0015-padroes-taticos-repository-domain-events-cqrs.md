@@ -30,11 +30,11 @@ O enunciado pede para "discutir uso (ou não) de CQRS, Repository, Domain Events
 ### CQRS: **leve**
 
 - **Sem modelo de leitura separado no caminho quente.** As leituras são por chave (GET da autorização, retrato do limite) e servidas pelo próprio modelo de escrita com leitura consistente. Um segundo modelo traria defasagem e um sincronizador para manter, sem ganho para esse acesso.
-- **A separação existe onde há ganho:** os eventos alimentam modelos de leitura de outros contextos (lançamentos da contabilização, data platform, antifraude). É CQRS **entre** bounded contexts, não dentro de um.
+- **A separação existe onde há ganho:** os eventos alimentam modelos de leitura de outros contextos (lançamentos da contabilização, data platform, antifraude). É CQRS **entre** bounded contexts, não dentro de um. No repositório, os consumidores de referência de antifraude e notificações (`services/consumidores`) param antes do modelo de leitura: validam, deduplicam e registram o que o sistema a jusante receberia. O modelo de leitura de cada um é do dono.
 
 ### Event Sourcing: **não**
 
-- **A trilha de auditoria pedida já sai dos eventos imutáveis**, publicados e arquivados: 10 anos em S3 Object Lock na produção, que é desenho; no sandbox, o archive de 30 dias do bus (ADR-0017).
+- **A trilha de auditoria pedida já sai dos eventos imutáveis**, publicados e arquivados: na produção, 10 anos em S3 com Object Lock (desenho), pelo caminho Firehose → S3 da data platform, que está na IaC; no sandbox, esse bucket expira em 30 dias, sem Object Lock, e o archive do bus guarda 30 dias para replay (ADR-0017).
 - Event sourcing no item quente agravaria a contenção: cada reserva viraria um append sequenciado por contrato.
 - E traria snapshot, upcasting de eventos e reconstrução, sem requisito que o pague.
 

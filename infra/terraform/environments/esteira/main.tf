@@ -92,6 +92,26 @@ resource "aws_iam_policy" "limite" {
         Resource = "arn:aws:ecr:sa-east-1:${var.account_id}:repository/*"
       },
       {
+        # Data platform: o EventBridge entrega no Firehose, e o Firehose grava no bucket próprio (SSE-KMS aws/s3).
+        Sid      = "EntregarNaPlataformaDeDados"
+        Effect   = "Allow"
+        Action   = ["firehose:PutRecord", "firehose:PutRecordBatch"]
+        Resource = "arn:aws:firehose:sa-east-1:${var.account_id}:deliverystream/*"
+      },
+      {
+        Sid      = "GravarNoBucketDaPlataformaDeDados"
+        Effect   = "Allow"
+        Action   = "s3:PutObject"
+        Resource = "arn:aws:s3:::desafio-zup-plataforma-de-dados-${var.account_id}/*"
+      },
+      {
+        Sid       = "CifrarPeloS3"
+        Effect    = "Allow"
+        Action    = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Resource  = "*"
+        Condition = { StringEquals = { "kms:ViaService" = "s3.sa-east-1.amazonaws.com" } }
+      },
+      {
         # Ações sem suporte a nível de recurso na AWS: só existem com Resource "*".
         Sid      = "SemNivelDeRecurso"
         Effect   = "Allow"
@@ -176,6 +196,7 @@ resource "aws_iam_role_policy" "iam_delegada" {
           StringEquals = {
             "iam:PassedToService" = [
               "ecs-tasks.amazonaws.com", "lambda.amazonaws.com", "apigateway.amazonaws.com", "scheduler.amazonaws.com",
+              "firehose.amazonaws.com", "events.amazonaws.com",
             ]
           }
         }

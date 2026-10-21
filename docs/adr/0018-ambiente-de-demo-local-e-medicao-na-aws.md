@@ -29,7 +29,8 @@ Fatos (da documentação oficial da AWS; os links principais estão em Referênc
 3. **Desempenho medido na AWS real**, numa janela curta (apply → medição → gravação → destroy). Feito em 20/10/2026:
    - k6 disparado da máquina do operador contra o API Gateway em sa-east-1. A latência do k6 inclui a internet; a de servidor vem das métricas do gateway (`Latency`/`IntegrationLatency`), por isso não foi preciso rodar o k6 dentro da região;
    - a mesma corrida de concorrência contra o DynamoDB real (`tests/e2e/aws.py corrida`);
-   - degraus de 150 a 600 rps com CPU por serviço (Container Insights), latência por salto e WRU por tabela, relatório em `docs/capacidade.md`. Sem vídeo: a saída da demo local fica gravada como plano B.
+   - degraus de 150 a 600 rps com CPU por serviço (Container Insights), latência por salto e WRU por tabela, relatório em `docs/capacidade.md`. Sem vídeo: a saída da demo local fica gravada como plano B;
+   - em 21/10, o teste de 5.000 rps (`docs/capacidade.md` §3.1). Aí o k6 rodou **dentro de sa-east-1**, numa task Fargate de 8 vCPU criada e apagada fora do Terraform: a 5.000 rps, a vazão oferecida não podia depender da máquina e da conexão do operador, e a latência do k6 fica comparável à do gateway.
 4. **Plano B se a imagem fixada falhar:** `amazon/dynamodb-local` + ElasticMQ, com os mesmos adapters (só muda o endpoint).
 
 ## Consequências

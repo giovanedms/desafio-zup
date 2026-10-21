@@ -82,6 +82,46 @@ variable "concorrencia_maxima_sqs" {
   }
 }
 
+variable "consumidores" {
+  description = "Consumidores de referência: nome curto (antifraude, notificacoes) -> ARN da fila que ele consome. Cada um ganha função, ESM, role, log group e inbox próprios. Vazio = nenhum."
+  type        = map(string)
+  default     = {}
+}
+
+variable "zip_consumidores" {
+  description = "Caminho do zip do pacote consumidores (scripts/empacotar_lambdas.sh). Obrigatório quando há consumidores."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = length(var.consumidores) == 0 || var.zip_consumidores != null
+    error_message = "zip_consumidores é obrigatório quando consumidores não está vazio."
+  }
+}
+
+# Mesma conta da contabilização (concorrência = taxa de lotes x duração do lote). No pico de docs/capacidade.md §1.1
+# (5.000 aprovações + ~500 recusas/s) cada fila recebe ~5.500 mensagens/s: antifraude, as TransacaoAutorizada e as
+# TransacaoRecusada; notificações, as mesmas, mais estornos e LimiteAlterado, que ficam fora daquele mix. Lote de 10
+# com 2 escritas por evento novo (reivindicar e concluir) a ~4 ms = ~80 ms, ~100 ms com a validação e o overhead
+# (estimativa, não medida). 5.500 / 10 x 0,1 s = 55 em voo; 100 = ~10.000 mensagens/s, ~1,8x o pico. É teto, não
+# reserva; somado ao da contabilização (200), 400 das 1.000 execuções concorrentes da conta (ADR-0004).
+variable "concorrencia_maxima_consumidores" {
+  description = "Teto de concorrência do ESM de cada consumidor de referência (maximum_concurrency, 2 a 1.000). 100 = ~10.000 mensagens/s com lotes de ~100 ms, ~1,8x o pico de ~5.500/s por fila."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.concorrencia_maxima_consumidores >= 2 && var.concorrencia_maxima_consumidores <= 1000
+    error_message = "concorrencia_maxima_consumidores deve estar entre 2 e 1000 (limites do maximum_concurrency do ESM de SQS)."
+  }
+}
+
+variable "deletion_protection" {
+  description = "Proteção contra exclusão das inboxes dos consumidores. false no sandbox para o destroy funcionar; true em produção."
+  type        = bool
+  default     = false
+}
+
 variable "memoria_mb" {
   description = "Memória das funções."
   type        = number

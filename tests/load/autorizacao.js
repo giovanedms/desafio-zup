@@ -33,14 +33,21 @@ function contaDe(contrato) {
   return "0001-77777777-7";
 }
 const PAD = parseInt(__ENV.PAD || "4", 10);
-function contratosPadrao() {
-  const lista = [];
-  for (let i = 1; i <= N_CONTRATOS; i++) lista.push(`${PREFIXO}${String(i).padStart(PAD, "0")}`);
-  return lista;
+// Com CONTRATOS explícitos, sorteia da lista; senão sorteia o número (sem montar a lista: com 100 mil contratos e
+// milhares de VUs, uma lista por VU esgota a memória do gerador).
+function sortearContrato() {
+  if (CONTRATOS) return CONTRATOS[Math.floor(Math.random() * CONTRATOS.length)];
+  const n = 1 + Math.floor(Math.random() * N_CONTRATOS);
+  return `${PREFIXO}${String(n).padStart(PAD, "0")}`;
 }
 const CONTRATOS = __ENV.CONTRATOS
   ? __ENV.CONTRATOS.split(",").map((c) => c.trim()).filter((c) => c)
-  : contratosPadrao();
+  : null;
+// VUs do gerador: o padrão (um por rps) é folgado para poucas centenas de rps; a 5.000 rps, com respostas de
+// dezenas de ms, bastam centenas em voo, e milhares de VUs só gastam memória do gerador.
+const VUS_PRE = parseInt(__ENV.VUS_PRE || "0", 10);
+const VUS_MAX = parseInt(__ENV.VUS_MAX || "0", 10);
+const RAMPA = __ENV.RAMPA || "3m";
 
 // Contagem por status (submétricas por tag só existem com threshold; contadores dedicados não).
 const STATUS_CONHECIDOS = [0, 200, 201, 202, 400, 401, 402, 403, 404, 409, 422, 429, 500, 502, 503, 504];
@@ -66,20 +73,33 @@ const CENARIOS = {
     rate: RPS,
     timeUnit: "1s",
     duration: DURACAO,
-    preAllocatedVUs: Math.max(20, RPS),
-    maxVUs: Math.max(100, RPS * 4),
+    preAllocatedVUs: VUS_PRE || Math.max(20, RPS),
+    maxVUs: VUS_MAX || Math.max(100, RPS * 4),
+  },
+  // Pico: rampa de RPS/10 até RPS em RAMPA e patamar de DURACAO em RPS (o on-demand e o autoscaling não gostam de
+  // degrau seco, e a rampa mostra onde a latência começa a subir).
+  pico: {
+    executor: "ramping-arrival-rate",
+    startRate: Math.max(1, Math.floor(RPS / 10)),
+    timeUnit: "1s",
+    stages: [
+      { duration: RAMPA, target: RPS },
+      { duration: DURACAO, target: RPS },
+    ],
+    preAllocatedVUs: VUS_PRE || Math.max(20, RPS),
+    maxVUs: VUS_MAX || Math.max(100, RPS * 4),
   },
 };
 
 if (!CENARIOS[CENARIO]) {
-  throw new Error(`CENARIO inválido: ${CENARIO} (use corretude ou vazao)`);
+  throw new Error(`CENARIO inválido: ${CENARIO} (use corretude, vazao ou pico)`);
 }
 
 export const options = {
   scenarios: { [CENARIO]: CENARIOS[CENARIO] },
   summaryTrendStats: ["avg", "min", "med", "p(90)", "p(95)", "p(99)", "max"],
   thresholds:
-    CENARIO === "vazao"
+    CENARIO === "vazao" || CENARIO === "pico"
       ? {
           http_req_failed: ["rate<0.01"],
           "http_req_duration{expected_response:true}": [`p(99)<${P99_MS}`],
@@ -149,7 +169,7 @@ export default function (dados) {
     registrar(r);
     check(r, { "status 201 ou 402": (x) => x.status === 201 || x.status === 402 });
   } else {
-    const contrato = CONTRATOS[Math.floor(Math.random() * CONTRATOS.length)];
+    const contrato = sortearContrato();
     const r = autorizar(contrato, "DEBITO", 1.0, dados, {
       responseCallback: http.expectedStatuses(201, 402),
     });

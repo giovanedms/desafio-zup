@@ -15,7 +15,7 @@
   |---|---|
   | 100 reservas simultâneas de R$ 100 num limite de R$ 1.000 → **exatamente 10 aprovadas e 90 recusadas**, saldo final zero | Testes (memória e DynamoDB) e demo HTTP ponta a ponta |
   | Invariantes do saldo verificadas para **qualquer** sequência de operações | Testes property-based |
-  | Desempenho | **Medido** na AWS real até ~570 rps aceitos (600 oferecidos, 4,4% de 503) com 5.000 contratos e **extrapolado** para 5.000 TPS (`docs/capacidade.md` seções 3 a 5). Os 5.000 TPS **não foram executados** |
+  | Desempenho | **Medido** na AWS real a **5.000 rps oferecidos** por 8 min (21/10): 96,2% aceitos e 3,8% de 503 com 60 tasks de 1 vCPU por serviço a ~85% de CPU, nenhum 500, e toda aprovação chegou ao lançamento contábil. Aceitar 100% pede ~150–160 vCPU (acima da quota de 140); o p99 de 150 ms não foi atingido (164 ms no melhor degrau, a 150 rps) (`docs/capacidade.md` seções 3 e 3.1) |
 
 - **Principais riscos aceitos:**
   - limite concedido eventualmente consistente com o legado (segundos);
@@ -78,6 +78,8 @@ flowchart TB
 ```
 Diagrama: [02-containers.svg](diagramas/02-containers.svg).
 
+O diagrama acima (e o SVG) é anterior a três peças que estão na IaC: os consumidores de referência das filas `antifraude` e `notificacoes` (Lambdas `desafio-consumidor-<fila>`, com inbox própria; `services/consumidores`), a regra `para-plataforma-de-dados` do bus → Firehose → S3 (data platform) e o Schema Registry `financas` com os 8 contratos. Detalhe em `docs/operacao/infraestrutura.md`, seções 4.5, 4.6 e 4.10.
+
 ## 4. Fluxo síncrono de uma autorização
 
 ```mermaid
@@ -119,7 +121,8 @@ Diagrama: [03-sequencia-autorizacao.svg](diagramas/03-sequencia-autorizacao.svg)
 
 - **Caminho:** outbox (mesma escrita do estado) → Stream → relay → bus `financas` → regras → filas com DLQ → consumidores idempotentes (inbox).
 - **Formato:** CloudEvents 1.0 estruturado em `detail`, com o `id` estável para dedup e `versao_limite` para ordem por contrato.
-- **Contratos:** `contracts/events/` (JSON Schema + exemplos), verificados por teste no produtor e por gate de compatibilidade na CI.
+- **Contratos:** `contracts/events/` (JSON Schema + exemplos), verificados por teste no produtor e por gate de compatibilidade na CI, e publicados pelo Terraform no Schema Registry `financas` (catálogo: ele não valida).
+- **Consumidores:** contabilização (partidas dobradas, inbox na mesma escrita); na AWS, consumidores de referência de antifraude e notificações (validam pelo schema, deduplicam, registram uma linha por evento); data platform pela regra → Firehose → S3 particionado por tipo e data.
 - **ADRs:** 0007, 0008, 0009.
 - **Diagrama:** [04-fluxo-de-eventos.svg](diagramas/04-fluxo-de-eventos.svg).
 
@@ -139,13 +142,14 @@ Ver `docs/dominio/` (linguagem ubíqua e agregados) e o ADR-0002. Os agregados:
   - ECS Fargate com Service Connect: ARM64 é o alvo de produção (ADR-0004); o sandbox implantado pela esteira roda X86_64, porque o runner do GitHub é x86;
   - NLB interno + VPC Link;
   - DynamoDB on-demand com PITR;
-  - EventBridge, SQS e Lambdas arm64;
+  - EventBridge (com Schema Registry), SQS e Lambdas arm64;
+  - Firehose → S3 da data platform;
   - Cognito, WAF;
   - CloudWatch: dashboard e alarmes.
 - **Diagrama:** [05-implantacao-aws.svg](diagramas/05-implantacao-aws.svg).
 - **State:** S3 com KMS e lock nativo.
 - **Deploy:** pela esteira do GitHub Actions (OIDC, sem chave de longa duração) a cada push na `main`, ou `make deploy`, que exige `CONFIRMO:` e confere o ID da conta.
-- **Inventário completo** (209 recursos do sandbox, ambiente `esteira`, bootstrap da conta, custo e desvios): `docs/operacao/infraestrutura.md`.
+- **Inventário completo** (251 recursos do sandbox, ambiente `esteira`, bootstrap da conta, custo e desvios): `docs/operacao/infraestrutura.md`.
 
 ## 8. Qualidade
 

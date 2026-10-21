@@ -39,3 +39,24 @@ waf_limite_por_ip         = 300000
 # plano_carga               = { rate_limit = 6000, burst_limit = 5000, quota_dia = 50000000 }
 # waf_limite_por_consumidor = 2000000  # >= rate_limit x 300 s, com folga
 # waf_limite_por_ip         = 20000000 # o k6 sai de um IP só
+#
+# Data platform na janela: a regra para-plataforma-de-dados soma 1 invocation por evento no bus (4 x 5.000 = 20.000/s
+# no DEBITO, a quota inteira) e o Firehose Direct PUT tem quota própria. Desligar durante a carga e religar depois; para
+# ter esses eventos no S3, replay do archive só para essa regra (runbook R6):
+# plataforma_de_dados_ativa = false
+#
+# Janela de 5.000 rps (docs/capacidade.md §3.1, 21/10/2026): além dos três acima, trocar a capacidade do topo por
+# estes valores e voltar depois. ~121 das 140 vCPU de Fargate da conta (mais o gerador k6, se rodar em Fargate); o
+# warm throughput é cobrado uma vez e NÃO pode ser reduzido depois (fica nas tabelas até o destroy):
+# cpu             = 1024 # MAX_EM_VOO derivado = 37
+# memoria         = 2048
+# tasks_desejadas = 60
+# tasks_min       = 60
+# tasks_max       = 60
+# warm_throughput = {
+#   limites                    = { escrita = 10000 }
+#   autorizacoes               = { escrita = 17000, indices = { gsi_orfas = { escrita = 11000 } } }
+#   autorizacoes-outbox        = { escrita = 32000 }
+#   contabilizacao-lancamentos = { escrita = 11500 }
+#   contabilizacao-inbox       = { escrita = 11500 }
+# }

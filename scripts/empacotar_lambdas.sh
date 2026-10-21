@@ -2,6 +2,7 @@
 # Gera os zips das Lambdas (arm64, Python 3.13) em infra/terraform/build/.
 #   relay.zip           -> pacote `relay` (relay + sweeper)
 #   contabilizacao.zip  -> pacote `contabilizacao`
+#   consumidores.zip    -> pacote `consumidores` (antifraude e notificacoes), com os schemas de contracts/events
 # Dependências são resolvidas do uv.lock (--frozen) e instaladas para a plataforma do Lambda
 # (aarch64-manylinux2014), independentemente da máquina que roda o script. Idempotente: recria os zips.
 # Requer: uv, zip.
@@ -41,6 +42,7 @@ empacotar() {
   # O próprio pacote como pacotes normais, sem dependências (já instaladas acima).
   (cd "${RAIZ}" && uv pip install --quiet --target "${dir}" --python-platform "${PLATAFORMA}" \
     --python-version "${PYTHON_VERSION}" --no-deps "$(caminho_do_pacote "${pacote}")")
+  extras_do_pacote "${pacote}" "${dir}"
 
   find "${dir}" -type d -name '__pycache__' -prune -exec rm -rf {} +
   rm -f "${zip_final}"
@@ -53,9 +55,24 @@ caminho_do_pacote() {
   case "$1" in
     relay) echo "./relay" ;;
     contabilizacao) echo "./services/contabilizacao" ;;
+    consumidores) echo "./services/consumidores" ;;
     *) echo "erro: pacote desconhecido '$1'" >&2; return 1 ;;
+  esac
+}
+
+# Arquivos que não são Python e entram no zip de um pacote.
+extras_do_pacote() {
+  local pacote="$1" dir="$2"
+  case "${pacote}" in
+    consumidores)
+      # Os schemas publicados, não uma cópia mantida à mão: o consumidor valida contra o contrato (ADR-0008) e lê
+      # daqui (consumidores/lambda_sqs.py, DIRETORIO_DOS_ESQUEMAS). Sem nenhum schema, o cp falha e o script para.
+      mkdir -p "${dir}/consumidores/esquemas"
+      cp "${RAIZ}"/contracts/events/*.schema.json "${dir}/consumidores/esquemas/"
+      ;;
   esac
 }
 
 empacotar relay
 empacotar contabilizacao
+empacotar consumidores

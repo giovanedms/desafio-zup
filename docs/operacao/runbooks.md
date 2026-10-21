@@ -1,6 +1,6 @@
 # Runbooks
 
-Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes citados estão em `infra/terraform/modules/observabilidade` e notificam (ao disparar e ao voltar a OK) o tópico SNS `desafio-autorizacao-alarmes` (output `topico_alarmes`). No sandbox ninguém assina por padrão: `email_alarmes` no tfvars, ou uma assinatura do plantão no tópico. Os nomes completos levam o prefixo `desafio-autorizacao-`; a descrição de cada alarme aponta o runbook.
+Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes citados estão em `infra/terraform/modules/observabilidade` (o de defasagem da data platform, em `modules/plataforma_de_dados`) e notificam (ao disparar e ao voltar a OK) o tópico SNS `desafio-autorizacao-alarmes` (output `topico_alarmes`). No sandbox ninguém assina por padrão: `email_alarmes` no tfvars, ou uma assinatura do plantão no tópico. Os nomes completos levam o prefixo `desafio-autorizacao-`; a descrição de cada alarme aponta o runbook.
 
 | Alarme | Runbook |
 |---|---|
@@ -14,13 +14,14 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 | `lambda-erros-<função>`, `relay-cdc-limites-iterator-age` | R12 |
 | `idade-da-fila-<fila>` | R13 |
 | `motivo-desconhecido-do-limite`, `cdc-registro-malformado`, `outbox-registro-malformado`, `efeito-sem-evento` | R14 |
+| `plataforma-de-dados-defasagem` | R15 |
 
 ## R1. Mensagens na DLQ de um consumidor
 
 - **Sintoma:** alarme `dlq-<fila>` (mensagens visíveis na DLQ > 0). A DLQ só recebe o que esgotou as 5 tentativas: consumidor parado **sem** erro (fila só envelhecendo) não chega aqui, aparece no R13.
 - **Diagnóstico:**
   1. ler 1 mensagem da DLQ (`aws sqs receive-message`);
-  2. procurar o `id` do CloudEvent nos logs do consumidor;
+  2. procurar o `id` do CloudEvent nos logs do consumidor (nos consumidores de referência, a linha `evento_invalido` traz o `message_id`, que a DLQ preserva);
   3. classificar: evento inválido (bug no produtor ou schema), dependência fora ou bug no consumidor.
 - **Ação:** corrigir a causa e **redrive** da DLQ para a fila original (`aws sqs start-message-move-task`). Reprocessar é seguro porque o consumidor é idempotente (inbox).
 - **Verificação:** DLQ zerada; inbox contém os ids; nenhum lançamento duplicado.
@@ -28,6 +29,7 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
   1. Ler os atributos da mensagem: `ERROR_CODE` (ex.: `NO_PERMISSIONS` = queue policy da fila do consumidor quebrada; `THROTTLING`), `ERROR_MESSAGE`, `RULE_ARN` e `TARGET_ARN` (a fila de destino).
   2. Corrigir a causa (normalmente a queue policy do consumidor ou a fila apagada).
   3. Reenviar cada mensagem para a fila do seu `TARGET_ARN` (o corpo já é o evento no formato que o consumidor recebe) e apagar da DLQ. O `start-message-move-task` não serve aqui: a DLQ é de todos os targets, e o destino muda por mensagem. Repetir é seguro (consumidores idempotentes).
+  4. Se o `TARGET_ARN` for o Firehose da data platform (`deliverystream/financas-plataforma-de-dados`), reenviar com `aws firehose put-record --cli-input-json file://req.json`, com `DeliveryStreamName` e `Record.Data` (o corpo da mensagem) em base64. Repetir é seguro: quem lê o S3 deduplica por `(source, id)`.
   ```bash
   # Lê 10 mensagens com os atributos do EventBridge (só o TARGET_ARN e o ERROR_CODE na tela)
   aws sqs receive-message --profile desafio-zup --queue-url <url da financas-entrega-dlq> \
@@ -49,11 +51,12 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 ## R3. Aumento de quota antes de pico (início de mês, campanha)
 
 - **Quotas** (ajustáveis, com prazo de dias; conta em `docs/capacidade.md`, seção 1):
-  - EventBridge **PutEvents 12.000/s** e **Invocations 25.000/s** (as aprovadas, 6.000 e 20.000, não cobrem o mix com captura);
-  - vCPU de Fargate ~200 (a conta tem 140) e `tasks_max` compatível;
+  - EventBridge **PutEvents 12.000/s** e **Invocations 25.000/s** (as aprovadas, 6.000 e 20.000, não cobrem o mix com captura); com a regra da data platform ligada, **Invocations ~37.000/s** (ela soma 1 por evento: 21.500/s já no DEBITO);
+  - Firehose Direct PUT do stream da data platform: o padrão em sa-east-1 é 1.000 requisições/s e 1 MiB/s, abaixo do pico (`docs/capacidade.md` §1.1). Sem o aumento, desligar a regra no pico (`plataforma_de_dados_ativa = false`, R6) e fazer replay do archive depois;
+  - vCPU de Fargate ~200 (a conta tem 140) e `tasks_max` compatível. O teste de 5.000 rps (`docs/capacidade.md` §3.1) usou 120 vCPU e aceitou ~96%; aceitar tudo pede ~150–160;
   - DynamoDB: quota de throughput por tabela ~75.000 WRU/s (o `autorizacoes-outbox` passa dos 40.000 padrão com mais de ~21% de capturas no mix, `docs/capacidade.md` §1.6);
-  - concorrência de Lambda e throttle do API Gateway, se o pico passar do desenho. O ESM da contabilização tem teto de 200 em voo (`concorrencia_maxima_sqs`), dimensionado para ~10.000 eventos/s com lotes de ~100 ms (conta em `modules/lambdas/variables.tf`); acima disso, subir o teto no tfvars (até 1.000, que é a conta inteira) e acompanhar o alarme `idade-da-fila-contabilizacao` (R13).
-- **DynamoDB:** `warm_throughput` no tfvars (módulo `dados`) nas tabelas `limites`, `autorizacoes` (e no `gsi_orfas`) e `autorizacoes-outbox` a 2× o pico esperado, com pelo menos 1 dia de antecedência. Valores no ADR-0013. **Não dá para desfazer** (a AWS não deixa reduzir) e o aumento é cobrado: só em produção ou com decisão explícita.
+  - concorrência de Lambda e throttle do API Gateway, se o pico passar do desenho. O ESM da contabilização tem teto de 200 em voo (`concorrencia_maxima_sqs`), dimensionado para ~10.000 eventos/s com lotes de ~100 ms (conta em `modules/lambdas/variables.tf`); acima disso, subir o teto no tfvars (até 1.000, que é a conta inteira) e acompanhar o alarme `idade-da-fila-contabilizacao` (R13). **A 5.000 rps (21/10) o teto de 200 não acompanhou ~4.770 eventos/s** e a fila atrasou até 335 s: antes de um pico desse tamanho, subir o teto (ou o lote) e medir. Os consumidores de referência têm teto de 100 cada (`concorrencia_maxima_consumidores`).
+- **DynamoDB:** `warm_throughput` no tfvars (módulo `dados`) nas tabelas `limites`, `autorizacoes` (e no `gsi_orfas`) e `autorizacoes-outbox` a 2× o pico esperado, com pelo menos 1 dia de antecedência; a janela de 5.000 rps também aqueceu as duas tabelas da contabilização (valores em `terraform.tfvars.example`). Valores de produção no ADR-0013. **Não dá para desfazer** (a AWS não deixa reduzir) e o aumento é cobrado: só em produção ou com decisão explícita (a janela de 21/10 custou ~US$ 67 de pré-aquecimento, estimado).
 - **ECS:** janela em `janelas_de_pico` (tfvars). O default do sandbox já sobe o mínimo para 4 tasks no dia 1 de cada mês, 06:30–12:00 de Brasília. Para uma campanha avulsa, acrescentar uma janela com `inicio`/`fim` em `cron(...)` ou `at(...)`.
   - **Não fazer apply durante a janela:** o apply devolve o mínimo do alvo de autoscaling ao valor de base (`tasks_min`), e a capacidade pré-aquecida pode descer. Se for inevitável, subir `tasks_min` no mesmo apply.
 - **Shards dos GSIs esparsos** (`shards_dos_indices`, padrão 64): para um pico acima de ~5.000 TPS sustentados, subir antes (o leitor e o escritor sobem juntos no mesmo apply). Nunca reduzir.
@@ -80,6 +83,8 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
   - O alvo faz, em ordem: pacotes das Lambdas → `apply -target=module.ecr` → `make imagens` (build + push; tag que já existe é pulada, porque as tags do ECR são imutáveis) → apply completo com a tag e a arquitetura das tasks (`ARQ=amd64` → X86_64; `arm64` → ARM64, que exige buildx com emulação ou máquina ARM).
   - Versão nova de código = `TAG` nova (ex.: 1.0.5). O `make imagens` não roda o `trivy image`: rodar à mão antes (`trivy image --severity CRITICAL --exit-code 1 <imagem>`).
 - **Janela de medição (k6):** o `plano-carga` nasce estacionado em 200 rps. Antes dos degraus, subir no tfvars os três juntos (`plano_carga`, `waf_limite_por_consumidor`, `waf_limite_por_ip`, valores em `terraform.tfvars.example`) e aplicar; ao terminar, voltar ao default e aplicar de novo. Uma API key com 6.000 rps esquecida no ar é 60% do throttle da conta.
+  - **Data platform na janela:** `plataforma_de_dados_ativa = false` antes da carga (a regra soma 1 invocation por evento e o Direct PUT do Firehose tem quota baixa, R3). Depois, religar (`true`, apply) e, se os eventos da janela precisarem chegar ao S3, replay do archive `financas-archive` só para a regra `para-plataforma-de-dados` (`aws events start-replay` com `Destination.FilterArns` = ARN da regra). O replay reentrega eventos que a data platform pode já ter: quem lê o S3 deduplica por `(source, id)`.
+  - **Janela de 5.000 rps** (`docs/capacidade.md` §3.1): além dos três, 60 tasks de 1 vCPU por serviço com autoscaling travado e warm throughput (bloco em `terraform.tfvars.example`), contratos de carga criados antes e o k6 numa task Fargate dentro da região (`tests/load/README.md`). Conferir a quota de vCPU de Fargate: stack e gerador somaram 128,5 das 140. O warm throughput não volta com o apply de retorno.
 - **Ambiente `esteira`** (role, boundary e o perímetro da trilha): **nunca** pela própria esteira. O administrador aplica com o profile administrativo (`docs/operacao/infraestrutura.md`, seção 3).
   - **Encerrar:** `make destroy ... CONFIRMO="CONFIRMO: destroy na conta desafio-zup"`.
 
@@ -161,25 +166,28 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 
 ## R12. Lambda com erro, ou CDC de limites atrasado (alarmes `lambda-erros-<função>` e `relay-cdc-limites-iterator-age`)
 
-- **Sintoma:** `Errors` ≥ 1 em 5 min numa das 4 funções (`relay`, `sweeper`, `cdc-limites`, `contabilizacao`), ou o `IteratorAge` do `desafio-relay-cdc-limites` acima de 60 s. `Errors` conta invocação que terminou em exceção, timeout ou falta de memória; a falha **parcial** de lote (`ReportBatchItemFailures`) não conta e aparece no `IteratorAge` e na DLQ.
+- **Sintoma:** `Errors` ≥ 1 em 5 min numa das 6 funções (`relay`, `sweeper`, `cdc-limites`, `contabilizacao`, `consumidor-antifraude`, `consumidor-notificacoes`), ou o `IteratorAge` do `desafio-relay-cdc-limites` acima de 60 s. `Errors` conta invocação que terminou em exceção, timeout ou falta de memória; a falha **parcial** de lote (`ReportBatchItemFailures`) não conta e aparece no `IteratorAge` e na DLQ.
 - **Diagnóstico** (log group `/aws/lambda/<função>`; o `REPORT` da invocação mostra `Duration`, `Max Memory Used` e `Status: timeout` quando é o caso):
   - **`sweeper`:** o caso grave é o backlog grande no outbox (relay parado por muito tempo): a varredura não termina em 60 s ou não cabe em 256 MB. `Max Memory Used` perto do limite ou `Status: timeout` confirmam. Enquanto o sweeper falha, o outbox não é drenado por ele;
   - **`relay`:** `PutEvents` estrangulado (quota), permissão no bus, entrada rejeitada pelo `PutEvents`. Item de outbox malformado não conta como `Errors`: é falha parcial do lote, com alarme `outbox-registro-malformado` (R14). Ver também o R2;
   - **`cdc-limites`:** registro do Stream que o código não consegue converter ou `PutEvents` falhando. O `IteratorAge` do CDC sobe junto quando o erro é persistente: o lote é retentado até 5 vezes e depois vai para a `relay-cdc-limites-dlq` (alarme `dlq-relay-cdc-limites-dlq`, R1);
-  - **`contabilizacao`:** exceção no lote inteiro (configuração, permissão, tabela, ou uma mensagem que o código não trata e derruba a invocação). A falha de uma mensagem tratada volta pela resposta parcial de lote e, depois de 5 recebimentos, vai para a DLQ (R1).
+  - **`contabilizacao`:** exceção no lote inteiro (configuração, permissão, tabela, ou uma mensagem que o código não trata e derruba a invocação). A falha de uma mensagem tratada volta pela resposta parcial de lote e, depois de 5 recebimentos, vai para a DLQ (R1);
+  - **`consumidor-<fila>`:** quase sempre configuração (`CONSUMIDOR`/`TABELA_INBOX` ausentes, ou schemas fora do zip em `consumidores/esquemas`; refazer `make pacotes`), que derruba a invocação inteira de propósito. Evento inválido e falha da inbox por mensagem não contam como `Errors`: voltam como falha parcial do lote (R1).
 - **Ação:** causa externa (quota, permissão, DynamoDB) → corrigir e deixar o retry automático trabalhar; código → corrigir e reimplantar (push na `main`). Sweeper com backlog grande: subir à mão, temporariamente, a memória e o timeout da função para drenar (`aws lambda update-function-configuration --function-name desafio-sweeper --memory-size 1024 --timeout 300`; o próximo apply devolve os valores do Terraform) e tratar a causa do relay parado (R2). CDC atrasado sem erro: volume de escrita no `limites` acima do que os shards do Stream entregam; acompanhar até drenar.
 - **Verificação:** `Errors` volta a 0, `IteratorAge` abaixo de 60 s, DLQs vazias (ou redrive feito, R1).
 
 ## R13. Fila consumidora envelhecendo (alarme `idade-da-fila-<fila>`)
 
 - **Sintoma:** a mensagem mais antiga de `contabilizacao`, `antifraude` ou `notificacoes` espera há mais de 300 s (acima da visibilidade de 180 s, então uma falha transitória isolada não dispara). A DLQ não acusa isso: o redrive é por número de recebimentos, não por espera.
-- **No sandbox:** `antifraude` e `notificacoes` **não têm consumidor** (representam sistemas a jusante, `docs/operacao/infraestrutura.md` §4.5). O alarme delas entra em ALARM 5 min depois do primeiro evento e fica assim até as mensagens expirarem (14 dias). É o sinal correto (ninguém consome); para limpar depois de uma demo, `aws sqs purge-queue` na fila. Em produção, cada alarme é do dono do consumidor.
-- **Diagnóstico (`contabilizacao`):**
-  1. a função está sendo invocada? `Invocations` e `Errors` de `desafio-contabilizacao` (R12 se houver erro);
-  2. está no teto? `ConcurrentExecutions` da função perto de 200 (o `maximum_concurrency` do ESM) = a chegada passou do dimensionamento (~10.000 eventos/s com lotes de ~100 ms);
-  3. está lenta? `Duration` subiu (DynamoDB das tabelas da contabilização estrangulando, `WriteThrottleEvents`);
-  4. o ESM está habilitado? (`aws lambda list-event-source-mappings --function-name desafio-contabilizacao`).
-- **Ação:** no teto → subir `concorrencia_maxima_sqs` no tfvars (R3) e aplicar; lenta por DynamoDB → ver throttling e quota da tabela; ESM desabilitado → habilitar. O consumidor é idempotente (inbox): a fila drena sem lançamento duplicado.
+- **Consumidores:** `contabilizacao` → `desafio-contabilizacao`; `antifraude` e `notificacoes` → `desafio-consumidor-<fila>` (consumidores de referência: validam pelo schema, deduplicam na inbox `desafio-consumidor-<fila>-inbox` e registram uma linha `evento_consumido` por evento). Em produção, o consumidor e o alarme são do dono do sistema a jusante. No ambiente local as duas filas não têm consumidor.
+- **Um evento inválido também dispara, uma vez:** ele volta como falha do lote a cada recebimento e envelhece até o SQS o mandar para o fim da fila e tirá-lo da métrica, a partir do 3º recebimento (~6 min com a visibilidade de 180 s; documentação das métricas do SQS, `ApproximateAgeOfOldestMessage`). Depois de 5 recebimentos vai para a DLQ (`dlq-<fila>-dlq`, R1). A linha `evento_invalido` em `/aws/lambda/desafio-consumidor-<fila>` traz o `message_id` e o caminho e a regra que falharam, sem o valor.
+- **Já aconteceu a 5.000 rps** (21/10, `docs/capacidade.md` §3.1): a `contabilizacao` chegou a 335 s com o ESM no teto de 200 e drenou sozinha depois do teste, sem erro. É o caso "no teto" abaixo.
+- **Diagnóstico** (`<função>` = `desafio-contabilizacao` ou `desafio-consumidor-<fila>`):
+  1. a função está sendo invocada? `Invocations` e `Errors` de `<função>` (R12 se houver erro);
+  2. está no teto? `ConcurrentExecutions` da função perto do `maximum_concurrency` do ESM: 200 na contabilização (`concorrencia_maxima_sqs`) e 100 nos de referência (`concorrencia_maxima_consumidores`) = a chegada passou do dimensionamento;
+  3. está lenta? `Duration` alta = as tabelas da contabilização ou a inbox estrangulando (`WriteThrottleEvents`). Nos de referência, contador `EM_ANDAMENTO` alto na linha `lote` = o mesmo evento chegando em paralelo (relay e sweeper), que se resolve sozinho depois da visibilidade;
+  4. o ESM está habilitado? (`aws lambda list-event-source-mappings --function-name <função>`).
+- **Ação:** no teto → subir `concorrencia_maxima_sqs` ou `concorrencia_maxima_consumidores` no tfvars (R3) e aplicar; lenta por DynamoDB → ver throttling e quota da tabela; ESM desabilitado → habilitar. Os consumidores são idempotentes (inbox): a fila drena sem efeito duplicado.
 - **Verificação:** `ApproximateAgeOfOldestMessage` caindo até ficar abaixo de 300 s e o alarme em OK.
 
 ## R14. Sinal de contrato ou de registro que o relay não converte (alarmes `motivo-desconhecido-do-limite`, `cdc-registro-malformado`, `outbox-registro-malformado` e `efeito-sem-evento`)
@@ -201,3 +209,13 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
   - **Ação:** decidir na fila humana (R7): o efeito está no limite e falta o fato contábil; publicar o evento correspondente ou desfazer o efeito com registro de quem decidiu. Abrir incidente: o invariante quebrou em algum lugar.
   - **Verificação:** nenhuma linha nova em 5 min e a autorização fora da fila.
 - **Filtro sem linha:** os filtros existem mesmo que a linha nunca apareça (a métrica fica em 0). O alarme em OK não prova que o sinal está ligado; quem prova é o teste do serviço que emite a linha, e `relay/tests/unit/test_sinais_de_log.py` cruza o termo de cada filtro do relay com a linha emitida.
+
+## R15. Data platform atrasada (alarme `plataforma-de-dados-defasagem`)
+
+- **Sintoma:** `DeliveryToS3.DataFreshness` do Firehose `financas-plataforma-de-dados` acima de 900 s (máximo em 5 min): há registro esperando há mais de 15 min para chegar ao S3. Com o buffer de 60 s, o normal é perto de 1–2 min. Sem tráfego não há ponto, e o alarme fica em OK.
+- **Diagnóstico:**
+  1. o log `/aws/kinesisfirehose/financas-plataforma-de-dados`, stream `DestinationDelivery`: `S3.AccessDenied` aponta para a role do Firehose, o permissions boundary ou a bucket policy; `DynamicPartitioning.*`, para a consulta JQ que tira o `tipo` do `detail-type`;
+  2. objetos em `erros/` no bucket `desafio-zup-plataforma-de-dados-<conta>`: o que o Firehose desistiu de particionar ou entregar;
+  3. falha antes do Firehose (regra sem permissão, throttling do Direct PUT) não aparece aqui: vai para a `financas-entrega-dlq`, com `TARGET_ARN` do stream (R1).
+- **Ação:** corrigir a permissão ou a consulta e aplicar. O Firehose retenta a entrega no S3 e guarda os registros por até 24 h; o que já está em `erros/` se reenvia à mão (`aws firehose put-record`, como no R1).
+- **Verificação:** objeto novo em `eventos/tipo=<detail-type>/ano=/mes=/dia=/` cerca de 1 min depois de um evento, e o alarme em OK.

@@ -77,3 +77,15 @@ variable "tentativas_maximas_entrega" {
     error_message = "tentativas_maximas_entrega deve estar entre 0 e 185."
   }
 }
+
+variable "regras_externas_na_dlq_de_entrega" {
+  description = "ARNs de regras deste bus criadas fora do módulo (ex.: a da data platform) cujos targets usam a DLQ de entrega. Entram no aws:SourceArn da policy da DLQ."
+  type        = list(string)
+  default     = []
+}
+
+variable "diretorio_contratos" {
+  description = "Diretório dos contratos de evento (*.schema.json) publicados no schema registry. null = contracts/events do repositório."
+  type        = string
+  default     = null
+}

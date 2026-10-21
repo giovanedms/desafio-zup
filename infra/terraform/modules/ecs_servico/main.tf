@@ -204,9 +204,8 @@ resource "aws_appautoscaling_target" "this" {
 }
 
 # Target tracking de CPU a 60%. O scale-out reativo leva ~2 min para servir e, na medição, pediu tasks ~6 min depois
-# do início da sobrecarga (ADR-0004, docs/capacidade.md): para o pico previsível há as janelas agendadas abaixo.
-# Predictive scaling (aws_appautoscaling_policy PredictiveScaling, disponível em sa-east-1) fica como evolução:
-# precisa de histórico de carga, que o sandbox não tem.
+# do início da sobrecarga (ADR-0004, docs/capacidade.md): para o pico previsível há as janelas agendadas abaixo e,
+# opcional, a política preditiva logo depois desta.
 resource "aws_appautoscaling_policy" "cpu" {
   name               = "${var.nome}-cpu-alvo"
   policy_type        = "TargetTrackingScaling"
@@ -225,13 +224,41 @@ resource "aws_appautoscaling_policy" "cpu" {
   }
 }
 
+# Predictive scaling (RN-04, pico previsível) sobre a mesma CPU e o mesmo alvo do target tracking. Em ForecastOnly só
+# gera a previsão de carga e de capacidade, sem agir: compara-se com o pico real antes de passar a ForecastAndScale.
+# A previsão precisa de pelo menos 24 h de métrica do service; no sandbox efêmero ela pode nem aparecer. Criada
+# depois da política de CPU pelo mesmo motivo das ações agendadas abaixo.
+resource "aws_appautoscaling_policy" "previsao" {
+  count = var.escala_preditiva == null ? 0 : 1
+
+  name               = "${var.nome}-cpu-previsao"
+  policy_type        = "PredictiveScaling"
+  service_namespace  = aws_appautoscaling_target.this.service_namespace
+  scalable_dimension = aws_appautoscaling_target.this.scalable_dimension
+  resource_id        = aws_appautoscaling_target.this.resource_id
+
+  predictive_scaling_policy_configuration {
+    mode = var.escala_preditiva
+
+    metric_specification {
+      target_value = var.alvo_cpu_percent
+
+      predefined_metric_pair_specification {
+        predefined_metric_type = "ECSServiceCPUUtilization"
+      }
+    }
+  }
+
+  depends_on = [aws_appautoscaling_policy.cpu]
+}
+
 locals {
   janelas_de_pico = { for j in var.janelas_de_pico : j.nome => j }
 }
 
 # Pico previsível (RN-04): no início de cada janela o MÍNIMO sobe (capacidade quente antes do tráfego chegar, sem
 # esperar o target tracking); o target tracking continua agindo entre o mínimo e o máximo.
-# Depende da política de CPU: chamadas simultâneas no mesmo alvo de autoscaling podem ser recusadas pela API
+# Depende das políticas: chamadas simultâneas no mesmo alvo de autoscaling podem ser recusadas pela API
 # (ConcurrentUpdateException) e o provider só repete ObjectNotFoundException.
 resource "aws_appautoscaling_scheduled_action" "inicio_do_pico" {
   for_each = local.janelas_de_pico
@@ -248,7 +275,7 @@ resource "aws_appautoscaling_scheduled_action" "inicio_do_pico" {
     max_capacity = coalesce(each.value.max_tasks, var.max_tasks)
   }
 
-  depends_on = [aws_appautoscaling_policy.cpu]
+  depends_on = [aws_appautoscaling_policy.cpu, aws_appautoscaling_policy.previsao]
 }
 
 # Fim da janela: volta ao mínimo e ao máximo de base. Criado depois do início (mesmo motivo acima). Atenção: um apply

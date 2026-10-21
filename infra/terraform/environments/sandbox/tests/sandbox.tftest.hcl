@@ -837,3 +837,418 @@ run "task_roles_menor_privilegio" {
     error_message = "As task roles devem exigir aws:SourceAccount e aws:SourceArn (ECS desta conta e região)."
   }
 }
+
+# --- Schema registry: os 8 contratos de contracts/events, com o conteúdo do arquivo e o tipo draft-04 -------------
+run "eventos_schema_registry_com_os_contratos" {
+  command = plan
+
+  module {
+    source = "../../modules/eventos"
+  }
+
+  variables {
+    regras_externas_na_dlq_de_entrega = ["arn:aws:events:sa-east-1:123456789012:rule/financas/para-plataforma-de-dados"]
+  }
+
+  override_resource {
+    target          = aws_sqs_queue.entrega_dlq
+    override_during = plan
+    values = {
+      arn = "arn:aws:sqs:sa-east-1:123456789012:financas-entrega-dlq"
+    }
+  }
+
+  override_resource {
+    target          = aws_cloudwatch_event_rule.this
+    override_during = plan
+    values = {
+      arn = "arn:aws:events:sa-east-1:123456789012:rule/financas/para-x"
+    }
+  }
+
+  override_resource {
+    target          = aws_cloudwatch_event_rule.limite_alterado
+    override_during = plan
+    values = {
+      arn = "arn:aws:events:sa-east-1:123456789012:rule/financas/limite-alterado-para-notificacoes"
+    }
+  }
+
+  assert {
+    condition     = aws_schemas_registry.this.name == "financas"
+    error_message = "O registry deve ter o nome do bus (financas)."
+  }
+
+  assert {
+    condition = toset(keys(aws_schemas_schema.this)) == toset([
+      "limite-alterado.v1", "reserva-capturada.v1", "reserva-expirada.v1", "transacao-autorizada.v1",
+      "transacao-compensada.v1", "transacao-em-reconciliacao-manual.v1", "transacao-estornada.v1", "transacao-recusada.v1",
+    ])
+    error_message = "O registry deve publicar exatamente os 8 contratos de contracts/events/*.schema.json."
+  }
+
+  assert {
+    condition = alltrue([
+      for k, s in aws_schemas_schema.this :
+      s.content == file("../../../../contracts/events/${k}.schema.json")
+      && s.type == "JSONSchemaDraft4"
+      && s.registry_name == "financas"
+    ])
+    error_message = "Cada schema deve ter o conteúdo exato do arquivo do repositório, tipo JSONSchemaDraft4 e ficar no registry financas."
+  }
+
+  assert {
+    condition = (
+      aws_schemas_schema.this["transacao-autorizada.v1"].name == "example.financas.autorizacao.TransacaoAutorizada.v1"
+      && aws_schemas_schema.this["limite-alterado.v1"].name == "example.financas.limites.LimiteAlterado.v1"
+    )
+    error_message = "O nome do schema deve ser o atributo `type` do CloudEvent do contrato."
+  }
+
+  # A regra da data platform (criada fora do módulo) também grava na DLQ de entrega.
+  assert {
+    condition = (
+      contains(
+        jsondecode(aws_sqs_queue_policy.entrega_dlq.policy).Statement[0].Condition.ArnEquals["aws:SourceArn"],
+        "arn:aws:events:sa-east-1:123456789012:rule/financas/para-plataforma-de-dados"
+      )
+      && length(jsondecode(aws_sqs_queue_policy.entrega_dlq.policy).Statement[0].Condition.ArnEquals["aws:SourceArn"]) == 5
+    )
+    error_message = "A policy da DLQ de entrega deve aceitar as 4 regras do módulo e a regra externa da data platform."
+  }
+}
+
+# --- Data platform: regra do bus -> Firehose (Direct PUT) -> S3 endurecido; roles de menor privilégio ----------------
+run "plataforma_de_dados_firehose_para_s3" {
+  command = plan
+
+  module {
+    source = "../../modules/plataforma_de_dados"
+  }
+
+  variables {
+    account_id               = "123456789012"
+    limite_de_permissoes_arn = "arn:aws:iam::123456789012:policy/desafio-zup-limite-de-permissoes"
+    bus_nome                 = "financas"
+    dlq_de_entrega_arn       = "arn:aws:sqs:sa-east-1:123456789012:financas-entrega-dlq"
+    acoes_alarme             = ["arn:aws:sns:sa-east-1:123456789012:desafio-autorizacao-alarmes"]
+  }
+
+  override_resource {
+    target          = aws_s3_bucket.this
+    override_during = plan
+    values = {
+      arn = "arn:aws:s3:::desafio-zup-plataforma-de-dados-123456789012"
+    }
+  }
+
+  override_resource {
+    target          = aws_cloudwatch_log_group.firehose
+    override_during = plan
+    values = {
+      arn = "arn:aws:logs:sa-east-1:123456789012:log-group:/aws/kinesisfirehose/financas-plataforma-de-dados"
+    }
+  }
+
+  override_resource {
+    target          = aws_kinesis_firehose_delivery_stream.this
+    override_during = plan
+    values = {
+      arn = "arn:aws:firehose:sa-east-1:123456789012:deliverystream/financas-plataforma-de-dados"
+    }
+  }
+
+  override_resource {
+    target          = aws_cloudwatch_event_rule.this
+    override_during = plan
+    values = {
+      arn = "arn:aws:events:sa-east-1:123456789012:rule/financas/para-plataforma-de-dados"
+    }
+  }
+
+  override_resource {
+    target          = aws_iam_role.eventbridge
+    override_during = plan
+    values = {
+      arn = "arn:aws:iam::123456789012:role/desafio-eventbridge-financas-plataforma-de-dados"
+    }
+  }
+
+  # Bucket: SSE-KMS com bucket key, versionado, Block Public Access, ACLs desligadas, lifecycle de 30 dias, só TLS.
+  assert {
+    condition = (
+      aws_s3_bucket.this.bucket == "desafio-zup-plataforma-de-dados-123456789012"
+      && one(aws_s3_bucket_server_side_encryption_configuration.this.rule).apply_server_side_encryption_by_default[0].sse_algorithm == "aws:kms"
+      && one(aws_s3_bucket_server_side_encryption_configuration.this.rule).bucket_key_enabled == true
+      && aws_s3_bucket_versioning.this.versioning_configuration[0].status == "Enabled"
+      && aws_s3_bucket_ownership_controls.this.rule[0].object_ownership == "BucketOwnerEnforced"
+    )
+    error_message = "O bucket deve ter SSE-KMS com bucket key, versionamento e ACLs desligadas."
+  }
+
+  assert {
+    condition = alltrue([
+      aws_s3_bucket_public_access_block.this.block_public_acls,
+      aws_s3_bucket_public_access_block.this.block_public_policy,
+      aws_s3_bucket_public_access_block.this.ignore_public_acls,
+      aws_s3_bucket_public_access_block.this.restrict_public_buckets,
+    ])
+    error_message = "O bucket deve ter o Block Public Access completo."
+  }
+
+  assert {
+    condition = (
+      aws_s3_bucket_lifecycle_configuration.this.rule[0].status == "Enabled"
+      && aws_s3_bucket_lifecycle_configuration.this.rule[0].expiration[0].days == 30
+      && aws_s3_bucket_lifecycle_configuration.this.rule[0].noncurrent_version_expiration[0].noncurrent_days == 1
+      && aws_s3_bucket_lifecycle_configuration.this.rule[0].abort_incomplete_multipart_upload[0].days_after_initiation == 1
+    )
+    error_message = "O lifecycle do sandbox deve expirar objetos em 30 dias, versões antigas em 1 e multipart abandonado em 1."
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_s3_bucket_policy.this.policy).Statement[0].Effect == "Deny"
+      && jsondecode(aws_s3_bucket_policy.this.policy).Statement[0].Action == "s3:*"
+      && jsondecode(aws_s3_bucket_policy.this.policy).Statement[0].Condition.Bool["aws:SecureTransport"] == "false"
+      && toset(jsondecode(aws_s3_bucket_policy.this.policy).Statement[0].Resource) == toset([
+        "arn:aws:s3:::desafio-zup-plataforma-de-dados-123456789012",
+        "arn:aws:s3:::desafio-zup-plataforma-de-dados-123456789012/*",
+      ])
+    )
+    error_message = "A bucket policy deve negar tudo sem TLS, no bucket e nos objetos."
+  }
+
+  # Firehose Direct PUT (sem fonte Kinesis/MSK), buffer de 60 s, partição por tipo e data, NDJSON em GZIP, log de erro.
+  assert {
+    condition = (
+      aws_kinesis_firehose_delivery_stream.this.destination == "extended_s3"
+      && length(aws_kinesis_firehose_delivery_stream.this.kinesis_source_configuration) == 0
+      && length(aws_kinesis_firehose_delivery_stream.this.msk_source_configuration) == 0
+      && aws_kinesis_firehose_delivery_stream.this.server_side_encryption[0].enabled == true
+    )
+    error_message = "O Firehose deve ser Direct PUT para S3, com o buffer cifrado."
+  }
+
+  assert {
+    condition = (
+      aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].bucket_arn == "arn:aws:s3:::desafio-zup-plataforma-de-dados-123456789012"
+      && aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].buffering_interval == 60
+      && aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].buffering_size == 64
+      && aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].compression_format == "GZIP"
+      && aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].prefix == "eventos/tipo=!{partitionKeyFromQuery:tipo}/ano=!{timestamp:yyyy}/mes=!{timestamp:MM}/dia=!{timestamp:dd}/"
+      && startswith(aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].error_output_prefix, "erros/!{firehose:error-output-type}/")
+      && aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].dynamic_partitioning_configuration[0].enabled == true
+    )
+    error_message = "O Firehose deve gravar no bucket com buffer de 60 s, GZIP e prefixo particionado por tipo e data (dynamic partitioning)."
+  }
+
+  assert {
+    condition = (
+      contains([
+        for p in aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].processing_configuration[0].processors :
+        p.type == "MetadataExtraction" && contains([for x in p.parameters : "${x.parameter_name}=${x.parameter_value}"], "MetadataExtractionQuery={tipo: .[\"detail-type\"]}")
+      ], true)
+      && contains([for p in aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].processing_configuration[0].processors : p.type], "AppendDelimiterToRecord")
+      && aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].cloudwatch_logging_options[0].enabled == true
+      && aws_kinesis_firehose_delivery_stream.this.extended_s3_configuration[0].cloudwatch_logging_options[0].log_stream_name == "DestinationDelivery"
+    )
+    error_message = "A chave `tipo` deve vir do detail-type (JQ), um evento por linha, e as falhas de entrega devem ir para o log."
+  }
+
+  # Role do Firehose: trust com sts:ExternalId; só PutObject nos dois prefixos e PutLogEvents no stream de erro.
+  assert {
+    condition = (
+      jsondecode(aws_iam_role.firehose.assume_role_policy).Statement[0].Principal.Service == "firehose.amazonaws.com"
+      && jsondecode(aws_iam_role.firehose.assume_role_policy).Statement[0].Condition.StringEquals["sts:ExternalId"] == "123456789012"
+      && aws_iam_role.firehose.permissions_boundary == "arn:aws:iam::123456789012:policy/desafio-zup-limite-de-permissoes"
+    )
+    error_message = "A role do Firehose deve exigir sts:ExternalId da conta e carregar o permissions boundary."
+  }
+
+  assert {
+    condition = (
+      toset(flatten([for s in jsondecode(aws_iam_role_policy.firehose.policy).Statement : s.Action])) == toset(["s3:PutObject", "logs:PutLogEvents", "kms:GenerateDataKey", "kms:Decrypt"])
+      && toset(flatten([for s in jsondecode(aws_iam_role_policy.firehose.policy).Statement : s.Resource if s.Resource != "*"])) == toset([
+        "arn:aws:s3:::desafio-zup-plataforma-de-dados-123456789012/eventos/*",
+        "arn:aws:s3:::desafio-zup-plataforma-de-dados-123456789012/erros/*",
+        "arn:aws:logs:sa-east-1:123456789012:log-group:/aws/kinesisfirehose/financas-plataforma-de-dados:log-stream:DestinationDelivery",
+      ])
+      # A chave aws/s3 só serve via S3 na região: o "*" do KMS vem sempre amarrado a kms:ViaService.
+      && length([for s in jsondecode(aws_iam_role_policy.firehose.policy).Statement : s if s.Resource == "*"]) == 1
+      && alltrue([
+        for s in jsondecode(aws_iam_role_policy.firehose.policy).Statement :
+        toset(s.Action) == toset(["kms:GenerateDataKey", "kms:Decrypt"])
+        && s.Condition.StringEquals["kms:ViaService"] == "s3.sa-east-1.amazonaws.com"
+        if s.Resource == "*"
+      ])
+    )
+    error_message = "A role do Firehose só pode gravar objetos nos prefixos eventos/ e erros/, logar no stream de erro e usar KMS via S3."
+  }
+
+  # Assinatura: todos os eventos dos dois sources do bus, entregues com role própria, retry e DLQ de entrega.
+  assert {
+    condition = (
+      aws_cloudwatch_event_rule.this.event_bus_name == "financas"
+      && aws_cloudwatch_event_rule.this.state == "ENABLED"
+      && jsondecode(aws_cloudwatch_event_rule.this.event_pattern) == { source = ["financas.autorizacao", "financas.limites"] }
+    )
+    error_message = "A regra deve casar todo evento de financas.autorizacao e financas.limites no bus financas."
+  }
+
+  assert {
+    condition = (
+      aws_cloudwatch_event_target.this.arn == "arn:aws:firehose:sa-east-1:123456789012:deliverystream/financas-plataforma-de-dados"
+      && aws_cloudwatch_event_target.this.role_arn == "arn:aws:iam::123456789012:role/desafio-eventbridge-financas-plataforma-de-dados"
+      && aws_cloudwatch_event_target.this.dead_letter_config[0].arn == "arn:aws:sqs:sa-east-1:123456789012:financas-entrega-dlq"
+      && aws_cloudwatch_event_target.this.retry_policy[0].maximum_event_age_in_seconds == 3600
+      && aws_cloudwatch_event_target.this.retry_policy[0].maximum_retry_attempts == 185
+    )
+    error_message = "O target deve entregar no Firehose pela role própria, com retry de 1 h/185 tentativas e a DLQ de entrega."
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_iam_role.eventbridge.assume_role_policy).Statement[0].Principal.Service == "events.amazonaws.com"
+      && jsondecode(aws_iam_role.eventbridge.assume_role_policy).Statement[0].Condition.ArnEquals["aws:SourceArn"] == "arn:aws:events:sa-east-1:123456789012:rule/financas/para-plataforma-de-dados"
+      && jsondecode(aws_iam_role.eventbridge.assume_role_policy).Statement[0].Condition.StringEquals["aws:SourceAccount"] == "123456789012"
+      && aws_iam_role.eventbridge.permissions_boundary == "arn:aws:iam::123456789012:policy/desafio-zup-limite-de-permissoes"
+      && toset(flatten([for s in jsondecode(aws_iam_role_policy.eventbridge.policy).Statement : s.Action])) == toset(["firehose:PutRecord", "firehose:PutRecordBatch"])
+      && toset(flatten([for s in jsondecode(aws_iam_role_policy.eventbridge.policy).Statement : s.Resource])) == toset(["arn:aws:firehose:sa-east-1:123456789012:deliverystream/financas-plataforma-de-dados"])
+    )
+    error_message = "A role do EventBridge deve ser presa à regra e à conta e só gravar neste stream."
+  }
+
+  assert {
+    condition = (
+      aws_cloudwatch_metric_alarm.defasagem.namespace == "AWS/Firehose"
+      && aws_cloudwatch_metric_alarm.defasagem.metric_name == "DeliveryToS3.DataFreshness"
+      && aws_cloudwatch_metric_alarm.defasagem.dimensions["DeliveryStreamName"] == "financas-plataforma-de-dados"
+      && aws_cloudwatch_metric_alarm.defasagem.threshold == 900
+      && aws_cloudwatch_metric_alarm.defasagem.alarm_actions == toset(["arn:aws:sns:sa-east-1:123456789012:desafio-autorizacao-alarmes"])
+    )
+    error_message = "O alarme de defasagem da entrega no S3 deve notificar o tópico de alarmes."
+  }
+}
+
+# Janela de medição de carga: a regra fica desligada (sem invocation nem Firehose), o resto continua de pé.
+run "plataforma_de_dados_desligada_na_medicao" {
+  command = plan
+
+  module {
+    source = "../../modules/plataforma_de_dados"
+  }
+
+  variables {
+    account_id               = "123456789012"
+    limite_de_permissoes_arn = "arn:aws:iam::123456789012:policy/desafio-zup-limite-de-permissoes"
+    bus_nome                 = "financas"
+    dlq_de_entrega_arn       = "arn:aws:sqs:sa-east-1:123456789012:financas-entrega-dlq"
+    ativa                    = false
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_rule.this.state == "DISABLED"
+    error_message = "Com ativa = false a regra da data platform deve ficar DISABLED."
+  }
+}
+
+# --- Predictive scaling: só previsão (ForecastOnly) junto do target tracking; desligado por padrão --------------------
+run "ecs_servico_com_escala_preditiva" {
+  command = plan
+
+  module {
+    source = "../../modules/ecs_servico"
+  }
+
+  variables {
+    nome                     = "autorizacao"
+    cluster_arn              = "arn:aws:ecs:sa-east-1:123456789012:cluster/desafio"
+    cluster_nome             = "desafio"
+    namespace_arn            = "arn:aws:servicediscovery:sa-east-1:123456789012:namespace/ns-00000000"
+    imagem                   = "123456789012.dkr.ecr.sa-east-1.amazonaws.com/desafio-zup/autorizacao:1.0.0"
+    repositorio_ecr_arn      = "arn:aws:ecr:sa-east-1:123456789012:repository/desafio-zup/autorizacao"
+    task_role_arn            = "arn:aws:iam::123456789012:role/desafio-task-autorizacao"
+    subnet_ids               = ["subnet-00000001"]
+    security_group_ids       = ["sg-00000001"]
+    limite_de_permissoes_arn = "arn:aws:iam::123456789012:policy/desafio-zup-limite-de-permissoes"
+    escala_preditiva         = "ForecastOnly"
+  }
+
+  assert {
+    condition = (
+      length(aws_appautoscaling_policy.previsao) == 1
+      && aws_appautoscaling_policy.previsao[0].policy_type == "PredictiveScaling"
+      && aws_appautoscaling_policy.previsao[0].service_namespace == "ecs"
+      && aws_appautoscaling_policy.previsao[0].scalable_dimension == "ecs:service:DesiredCount"
+      && aws_appautoscaling_policy.previsao[0].resource_id == "service/desafio/autorizacao"
+      && aws_appautoscaling_policy.previsao[0].predictive_scaling_policy_configuration[0].mode == "ForecastOnly"
+    )
+    error_message = "O service deve ter política PredictiveScaling em ForecastOnly no mesmo alvo de autoscaling."
+  }
+
+  assert {
+    condition = (
+      aws_appautoscaling_policy.previsao[0].predictive_scaling_policy_configuration[0].metric_specification[0].predefined_metric_pair_specification[0].predefined_metric_type == "ECSServiceCPUUtilization"
+      && aws_appautoscaling_policy.previsao[0].predictive_scaling_policy_configuration[0].metric_specification[0].target_value == "60"
+      && aws_appautoscaling_policy.cpu.policy_type == "TargetTrackingScaling"
+    )
+    error_message = "A previsão deve usar o par de métricas de CPU do ECS com o alvo do target tracking (60%), que continua existindo."
+  }
+}
+
+run "ecs_servico_sem_escala_preditiva_por_padrao" {
+  command = plan
+
+  module {
+    source = "../../modules/ecs_servico"
+  }
+
+  variables {
+    nome                     = "reconciliador"
+    cluster_arn              = "arn:aws:ecs:sa-east-1:123456789012:cluster/desafio"
+    cluster_nome             = "desafio"
+    namespace_arn            = "arn:aws:servicediscovery:sa-east-1:123456789012:namespace/ns-00000000"
+    imagem                   = "123456789012.dkr.ecr.sa-east-1.amazonaws.com/desafio-zup/autorizacao:1.0.0"
+    repositorio_ecr_arn      = "arn:aws:ecr:sa-east-1:123456789012:repository/desafio-zup/autorizacao"
+    task_role_arn            = "arn:aws:iam::123456789012:role/desafio-task-reconciliador"
+    subnet_ids               = ["subnet-00000001"]
+    security_group_ids       = ["sg-00000001"]
+    limite_de_permissoes_arn = "arn:aws:iam::123456789012:policy/desafio-zup-limite-de-permissoes"
+  }
+
+  assert {
+    condition     = length(aws_appautoscaling_policy.previsao) == 0
+    error_message = "Sem escala_preditiva o service não tem política preditiva."
+  }
+}
+
+# --- Raiz: previsão ligada só em autorizacao e limites; registry e bucket da data platform no ambiente ---------------
+run "raiz_liga_previsao_registry_e_data_platform" {
+  command = plan
+
+  variables {
+    account_id         = "123456789012"
+    zip_relay          = "versions.tf" # os zips reais vêm de `make pacotes`; no plan basta o arquivo existir
+    zip_contabilizacao = "versions.tf"
+    zip_consumidores   = "versions.tf"
+  }
+
+  assert {
+    condition = (
+      module.autorizacao.escala_preditiva_modo == "ForecastOnly"
+      && module.limites.escala_preditiva_modo == "ForecastOnly"
+      && module.limites_acl.escala_preditiva_modo == null
+      && module.reconciliador.escala_preditiva_modo == null
+    )
+    error_message = "A previsão (ForecastOnly) deve estar em autorizacao e limites, e não nos workers de 1 task."
+  }
+
+  assert {
+    condition = (
+      output.schema_registry == "financas"
+      && output.bucket_plataforma_de_dados == "desafio-zup-plataforma-de-dados-123456789012"
+    )
+    error_message = "O ambiente deve publicar o registry financas e o bucket da data platform."
+  }
+}

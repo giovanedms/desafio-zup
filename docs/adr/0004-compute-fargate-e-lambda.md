@@ -27,14 +27,14 @@ Fatos (da documentação oficial da AWS; os links principais estão em Referênc
   - Processo longo, sem cold start, pool de conexões HTTP/DynamoDB quente.
   - Custo previsível em carga sustentada.
   - Na frente: NLB interno com VPC Link (v1) a partir do API Gateway REST; east-west por ECS Service Connect (ADR-0012).
-- **`contabilizacao`, relay do outbox e sweeper: Lambda.** O **reconciliador** não é Lambda: roda como **serviço ECS** (mesma imagem da `autorizacao`), porque precisa do Service Connect para chamar o `limites` e Lambda não participa dele (ADR-0012).
+- **`contabilizacao`, relay do outbox, sweeper e os consumidores de referência de antifraude e notificações (`services/consumidores`): Lambda.** O **reconciliador** não é Lambda: roda como **serviço ECS** (mesma imagem da `autorizacao`), porque precisa do Service Connect para chamar o `limites` e Lambda não participa dele (ADR-0012).
   - SQS/Streams como gatilho, escala a zero, resposta parcial em lote.
   - O mesmo núcleo roda como container *poller* no ambiente local: só o adapter de entrada muda (hexagonal).
 - **Picos (RN-04):**
   - **Previsíveis** (início de mês, pagamentos): o target tracking pediu as tasks extras ~6 min depois do início da sobrecarga (`docs/capacidade.md`, seção 3), então a capacidade sobe **antes** da janela:
     - **scheduled scaling, implementado:** `var.janelas_de_pico` no módulo `ecs_servico` cria um `aws_appautoscaling_scheduled_action` que sobe o mínimo no início da janela e outro que o devolve no fim. O sandbox tem o exemplo do dia 1 de cada mês, 06:30–12:00 de Brasília, mínimo de 4 tasks em `autorizacao` e `limites`;
     - **warm throughput no DynamoDB a 2× o pico, implementado e desligado no sandbox:** `var.warm_throughput` no módulo `dados` (tabela e GSI). Aumentar é cobrado e não pode ser desfeito; os valores de produção estão no ADR-0013;
-    - **predictive scaling, só desenhado:** precisa de histórico de carga que o sandbox não tem.
+    - **predictive scaling em `ForecastOnly`, implementado:** `var.modo_escala_preditiva` em `autorizacao` e `limites` (ADR-0013). Só gera previsão, sem agir; precisa de pelo menos 24 h de métrica, que o sandbox efêmero quase nunca tem.
   - **Imprevisíveis** (campanha, Black Friday): mínimo de tasks dimensionado para 60% de utilização no pico esperado, ou seja, 1,6× de folga para atravessar os ~109 s do reativo.
   - **Proteção:** load shedding por concorrência máxima por task (503 + `Retry-After`) e WAF rate-based.
 
@@ -46,6 +46,7 @@ Fatos (da documentação oficial da AWS; os links principais estão em Referênc
   - Dois modelos de deploy (ECS e Lambda).
   - O escalonamento do Fargate não reage em segundos.
   - **O p99 de 150 ms não foi atingido nesta stack:** 164 ms no gateway a 33% de CPU (`docs/capacidade.md`, seção 3). A distância é Python mais a transação de ~21 ms (`TransactWriteItems` da autorização com o outbox), que pesariam igual em Lambda: não é a escolha entre Fargate e Lambda. O caminho está na alavanca 1 de `docs/capacidade.md`, seção 5, e no runtime compilado do ADR-0003.
+  - **Frente ao throughput medido (21/10, `docs/capacidade.md` §3.1):** 60 tasks Fargate de 1 vCPU por serviço receberam 5.000 rps oferecidos por 8 min e aceitaram 96,2%; o excesso saiu como 503 rápido do load shedding, sem 500. O que faltou foi CPU, não o modelo de compute: ~10 ms de CPU por requisição em cada serviço (derivado) levam a ~150–160 vCPU para aceitar tudo, acima da quota de 140, que precisa de aumento (R3). O mesmo volume em Lambda pediria ≥ 500 de concorrência por função (Contexto) e não mudaria a CPU por requisição. No assíncrono, o consumidor contábil com teto de 200 no ESM não acompanhou ~4.770 eventos/s: a escolha de Lambda ali se mantém; o teto de concorrência (ou o lote) precisa subir.
 
 ## Quando esta decisão deixa de ser boa
 

@@ -49,6 +49,7 @@ services/
   autorizacao/      BC Autorização — API pública, idempotência, decisão, reconciliador de órfãs e expirador de reservas
   limites/          BC Limites — saldo por contrato (escrita condicional atômica), ACL do core legado
   contabilizacao/   BC Contabilização — partidas dobradas, inbox (dedup)
+  consumidores/     consumidores de referência de antifraude e notificações (Lambda: schema, inbox, uma linha por evento)
 relay/              outbox → EventBridge (Lambda na AWS, container local; mesmo código) + CDC de LimiteAlterado
 legado-mock/        simula o core legado (registros de tamanho fixo)
 libs/plataforma/    problem+json, contexto de observabilidade
@@ -70,14 +71,15 @@ docs/
 2. `docs/adr/0005` (concorrência) e `0006` (idempotência): onde está o problema difícil.
 3. `services/limites/tests/contract/test_porta_repositorio.py`: a mesma suíte rodando em memória e no DynamoDB, com a corrida de 100 reservas em 32 threads.
 4. `docs/cobertura-requisitos.md`: cada requisito do enunciado → onde está → nível de evidência.
+5. `docs/capacidade.md` §3.1: o teste de 5.000 rps na AWS, com os gargalos.
 
 ## Limitações que pesam
 
 A lista completa está em `docs/cobertura-requisitos.md` (Limitações declaradas). Estas quatro mudam a leitura do resto:
 
-- **p99 ≤ 150 ms não atingido:** o melhor degrau medido na AWS deu 164 ms no gateway, a 150 rps e 33% de CPU; os 5.000 TPS são extrapolados do maior degrau medido, ~570 rps aceitos de 600 oferecidos, com 4,4% de 503 (`docs/capacidade.md`, seção 3).
-- **Trilha de 10 anos só desenhada** (Firehose → S3 Object Lock, ADR-0017): no sandbox, o único armazenamento durável dos eventos é o archive de 30 dias do bus.
-- **2 de 8 tipos de evento sem assinante:** `TransacaoCompensada` e `TransacaoEmReconciliacaoManual` ficam só no archive.
+- **5.000 TPS medidos com ~96% aceitos, não 100%, e p99 ≤ 150 ms não atingido:** na AWS, 5.000 rps oferecidos por 8 min (21/10) deram 96,2% de 201 e 3,8% de 503 com 60 tasks de 1 vCPU por serviço a ~85% de CPU, p99 de gateway de ~1,1–1,2 s no patamar; aceitar tudo pede ~150–160 vCPU, acima da quota de 140, e o consumidor contábil ficou até 335 s atrasado (drenou depois, sem perda). O melhor p99 medido foi 164 ms no gateway, a 150 rps e 33% de CPU (`docs/capacidade.md`, seção 3 e 3.1).
+- **Trilha de 10 anos sem Object Lock** (ADR-0017): o caminho Firehose → S3 existe na IaC (data platform, módulo `plataforma_de_dados`), mas no sandbox os objetos expiram em 30 dias e não há Object Lock; os 10 anos em `COMPLIANCE` são desenho.
+- **2 de 8 tipos de evento sem fila de consumidor:** `TransacaoCompensada` e `TransacaoEmReconciliacaoManual` chegam só ao archive e à data platform.
 - **Sem saldo credor:** o limite não guarda crédito a favor do cliente. CREDITO ou estorno de débito maior que o utilizado é recusado.
 
 ## AWS
@@ -86,7 +88,7 @@ A lista completa está em `docs/cobertura-requisitos.md` (Limitações declarada
 
 **Local:** `make deploy EXPECTED_ACCOUNT_ID=<conta> CONFIRMO="CONFIRMO: deploy na conta desafio-zup" [TAG=1.0.4] [ARQ=amd64|arm64]` (pacotes das Lambdas, repositórios ECR, build e push das imagens e apply, nessa ordem; runbook R6).
 
-O que existe na conta (209 recursos do sandbox, ambiente `esteira`, bootstrap), configuração, custo e desvios: `docs/operacao/infraestrutura.md`.
+O que existe na conta (251 recursos do sandbox, ambiente `esteira`, bootstrap), configuração, custo e desvios: `docs/operacao/infraestrutura.md`.
 
 - O deploy exige a frase de confirmação e confere a conta.
 - O state fica em S3 com KMS.

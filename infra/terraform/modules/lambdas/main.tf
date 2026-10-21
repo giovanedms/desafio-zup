@@ -5,6 +5,8 @@ locals {
     cdc_limites    = "${var.prefixo}-relay-cdc-limites"
     contabilizacao = "${var.prefixo}-contabilizacao"
   }
+  # Consumidores de referência: um nome de função por fila em var.consumidores.
+  nomes_consumidores = { for c in keys(var.consumidores) : c => "${var.prefixo}-consumidor-${c}" }
 
   assume_lambda = jsonencode({
     Version = "2012-10-17"
@@ -483,4 +485,153 @@ resource "aws_lambda_event_source_mapping" "contabilizacao" {
   }
 
   depends_on = [aws_iam_role_policy.contabilizacao]
+}
+
+# ---------------------------------------------------------------- consumidores de referência (antifraude, notificações)
+# Um por fila em var.consumidores, mesmo pacote (consumidores.zip): valida o CloudEvent contra o schema do tipo,
+# deduplica por (source, id) numa inbox própria e emite uma linha estruturada por evento (services/consumidores).
+
+# Log group de cada consumidor, com a mesma retenção dos outros (a role escreve só no dela).
+resource "aws_cloudwatch_log_group" "consumidor" {
+  #checkov:skip=CKV_AWS_338:Retenção de 7 dias é desvio consciente do sandbox (custo); produção >= 365 dias.
+  #checkov:skip=CKV_AWS_158:Sandbox usa a criptografia padrão do CloudWatch Logs; produção usa CMK.
+  for_each = local.nomes_consumidores
+
+  name              = "/aws/lambda/${each.value}"
+  retention_in_days = var.retencao_logs_dias
+}
+
+# Inbox de cada consumidor: reivindicação com prazo e conclusão por (source, id). TTL no atributo `ttl`, que o código
+# grava com 30 dias (consumidores/inbox_dynamodb.py).
+resource "aws_dynamodb_table" "inbox_consumidor" {
+  #checkov:skip=CKV_AWS_119:Sandbox usa a chave gerenciada pela AWS (SSE padrão); produção usa CMK dedicada por BC.
+  for_each = var.consumidores
+
+  name         = "${local.nomes_consumidores[each.key]}-inbox"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  deletion_protection_enabled = var.deletion_protection
+}
+
+# Role de cada consumidor (uma por função: um não toca a fila nem a inbox do outro).
+resource "aws_iam_role" "consumidor" {
+  for_each = var.consumidores
+
+  name                 = "${local.nomes_consumidores[each.key]}-role"
+  assume_role_policy   = local.assume_lambda
+  permissions_boundary = var.limite_de_permissoes_arn
+}
+
+# Permissões mínimas: consumir a SUA fila, reivindicar e concluir na SUA inbox, o SEU log group e X-Ray.
+resource "aws_iam_role_policy" "consumidor" {
+  for_each = var.consumidores
+
+  name = "consumidor-${each.key}"
+  role = aws_iam_role.consumidor[each.key].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ConsumirFila"
+        Effect   = "Allow"
+        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+        Resource = [each.value]
+      },
+      {
+        # PutItem condicional (reivindicar) e UpdateItem (concluir). A falha da condição devolve o item na resposta
+        # (ReturnValuesOnConditionCheckFailure), sem GetItem.
+        Sid      = "Inbox"
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Resource = [aws_dynamodb_table.inbox_consumidor[each.key].arn]
+      },
+      {
+        Sid      = "Logs"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = ["${aws_cloudwatch_log_group.consumidor[each.key].arn}:*"]
+      },
+      {
+        # X-Ray não aceita restrição de recurso.
+        Sid      = "XRay"
+        Effect   = "Allow"
+        Action   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords"]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+# Função de cada consumidor: mesmo handler; CONSUMIDOR e TABELA_INBOX dizem qual é.
+resource "aws_lambda_function" "consumidor" {
+  #checkov:skip=CKV_AWS_117:Funções fora da VPC de propósito: sandbox sem NAT, e só falam com APIs AWS públicas.
+  #checkov:skip=CKV_AWS_116:Falhas voltam à fila e vão para a DLQ pelo redrive (maxReceiveCount 5).
+  #checkov:skip=CKV_AWS_115:Sem concorrência reservada: a conta tem 1.000 (em vigor, ADR-0004) compartilhadas e a reserva tiraria do pool das outras funções; o ESM limita a concorrência (maximum_concurrency).
+  #checkov:skip=CKV_AWS_173:Variáveis de ambiente não são sensíveis; criptografia padrão basta no sandbox.
+  #checkov:skip=CKV_AWS_272:Assinatura de código fora do escopo do sandbox.
+  for_each = var.consumidores
+
+  function_name    = local.nomes_consumidores[each.key]
+  role             = aws_iam_role.consumidor[each.key].arn
+  runtime          = "python3.13"
+  architectures    = ["arm64"]
+  handler          = "consumidores.lambda_sqs.handler"
+  filename         = var.zip_consumidores
+  source_code_hash = filebase64sha256(var.zip_consumidores)
+  memory_size      = var.memoria_mb
+  timeout          = var.timeout_segundos
+
+  environment {
+    variables = {
+      CONSUMIDOR   = each.key
+      TABELA_INBOX = aws_dynamodb_table.inbox_consumidor[each.key].name
+    }
+  }
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  logging_config {
+    log_format = "Text"
+    log_group  = aws_cloudwatch_log_group.consumidor[each.key].name
+  }
+
+  depends_on = [aws_iam_role_policy.consumidor]
+}
+
+# Liga cada fila à sua função, com resposta parcial de lote: só a mensagem que falhou volta (e vai para a DLQ da fila
+# depois de 5 recebimentos); o resto do lote sai da fila.
+resource "aws_lambda_event_source_mapping" "consumidor" {
+  for_each = var.consumidores
+
+  event_source_arn        = each.value
+  function_name           = aws_lambda_function.consumidor[each.key].arn
+  batch_size              = 10
+  function_response_types = ["ReportBatchItemFailures"]
+
+  scaling_config {
+    maximum_concurrency = var.concorrencia_maxima_consumidores
+  }
+
+  depends_on = [aws_iam_role_policy.consumidor]
 }

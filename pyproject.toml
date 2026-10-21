@@ -8,6 +8,7 @@ members = [
   "services/autorizacao",
   "services/limites",
   "services/contabilizacao",
+  "services/consumidores",
   "libs/plataforma",
   "relay",
   "legado-mock",
@@ -79,10 +80,17 @@ mypy_path = [
   "services/autorizacao/src",
   "services/limites/src",
   "services/contabilizacao/src",
+  "services/consumidores/src",
   "libs/plataforma/src",
   "relay/src",
   "legado-mock/src",
 ]
+
+# O jsonschema não publica tipos (sem py.typed) e o types-jsonschema não está no lock. Só o adapter de schemas dos
+# consumidores (services/consumidores/src/consumidores/esquemas.py) o importa; lá ele entra como Any.
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = [
@@ -90,6 +98,7 @@ testpaths = [
   "services/autorizacao/tests",
   "services/limites/tests",
   "services/contabilizacao/tests",
+  "services/consumidores/tests",
   "libs/plataforma/tests",
   "relay/tests",
   "legado-mock/tests",

@@ -82,8 +82,9 @@ resource "aws_cloudwatch_event_target" "this" {
 # ---------------------------------------------------------------- DLQ de entrega dos targets (regra -> fila)
 
 # DLQ dos targets do EventBridge. Sem ela, uma entrega que esgota as tentativas (ou que falha por permissão, que o
-# EventBridge nem tenta de novo) é DESCARTADA depois que o outbox já apagou o item. Uma fila para os 4 targets: cada
-# mensagem traz os atributos RULE_ARN, TARGET_ARN e ERROR_CODE, e o redrive vai para a fila do TARGET_ARN (runbook R1).
+# EventBridge nem tenta de novo) é DESCARTADA depois que o outbox já apagou o item. Uma fila para os 4 targets daqui e
+# os de regras do bus criadas fora do módulo (data platform, var.regras_externas_na_dlq_de_entrega): cada mensagem traz
+# os atributos RULE_ARN, TARGET_ARN e ERROR_CODE, e o redrive vai para o destino do TARGET_ARN (runbook R1).
 resource "aws_sqs_queue" "entrega_dlq" {
   name                      = "${var.nome_bus}-entrega-dlq"
   message_retention_seconds = 1209600
@@ -107,6 +108,7 @@ resource "aws_sqs_queue_policy" "entrega_dlq" {
           "aws:SourceArn" = concat(
             [for r in aws_cloudwatch_event_rule.this : r.arn],
             [aws_cloudwatch_event_rule.limite_alterado.arn],
+            var.regras_externas_na_dlq_de_entrega,
           )
         }
       }
@@ -198,4 +200,45 @@ resource "aws_sqs_queue_redrive_allow_policy" "legado_dlq" {
     redrivePermission = "byQueue"
     sourceQueueArns   = [aws_sqs_queue.legado.arn]
   })
+}
+
+# ---------------------------------------------------------------- schema registry (catálogo dos contratos)
+
+locals {
+  # Contratos de evento do repositório (ADR-0008). Chave = nome do arquivo sem `.schema.json` (ex.:
+  # transacao-autorizada.v1); o `quebras-aceitas.json` do mesmo diretório não casa com o padrão.
+  diretorio_contratos = coalesce(var.diretorio_contratos, "${path.module}/../../../../contracts/events")
+  contratos = {
+    for f in fileset(local.diretorio_contratos, "*.schema.json") :
+    trimsuffix(f, ".schema.json") => jsondecode(file("${local.diretorio_contratos}/${f}"))
+  }
+}
+
+# Registry dos eventos do bus. NÃO valida evento nem compatibilidade (ADR-0008): quem barra evolução incompatível é o
+# gate `scripts/compat_schemas.py` na CI. Aqui é o catálogo publicado, onde o consumidor descobre o contrato e baixa os
+# code bindings. Sem discoverer: um schema inferido do tráfego concorreria com o contrato versionado no repositório.
+resource "aws_schemas_registry" "this" {
+  name        = var.nome_bus
+  description = "Contratos dos CloudEvents publicados no bus ${var.nome_bus} (fonte: contracts/events do repositorio)."
+}
+
+# Um schema por contrato, com o conteúdo lido do arquivo do repositório (sem cópia). Nome = atributo `type` do
+# CloudEvent (traz o major): o consumidor acha o schema pelo `type` do evento que recebeu. Mudança aditiva no arquivo
+# vira nova versão do mesmo schema no apply; quebra é major novo, ou seja arquivo novo e schema novo.
+resource "aws_schemas_schema" "this" {
+  for_each = local.contratos
+
+  registry_name = aws_schemas_registry.this.name
+  name          = one(each.value.properties.type.enum)
+  type          = "JSONSchemaDraft4"
+  description   = each.value.title
+  content       = file("${local.diretorio_contratos}/${each.key}.schema.json")
+
+  lifecycle {
+    # O tipo do registry é fixo em draft-04: um contrato em outro draft falha o plan em vez de ser publicado errado.
+    precondition {
+      condition     = try(each.value["$schema"], "") == "http://json-schema.org/draft-04/schema#"
+      error_message = "O contrato ${each.key} não declara JSON Schema draft-04 (\"$schema\"); o registry o publicaria como JSONSchemaDraft4."
+    }
+  }
 }

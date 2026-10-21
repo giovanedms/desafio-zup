@@ -26,8 +26,8 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
 ### Trilha de auditoria
 
 - **Todo fato de negócio vira evento imutável**, inclusive a **recusa** (`TransacaoRecusada`).
-- **Produção (desenho; não está na IaC):** archive do EventBridge e Firehose → **S3 com Object Lock (compliance mode) por 10 anos** (Circular 3.978, arts. 28/67). Não há Firehose nem bucket de trilha em `infra/terraform`.
-- **Sandbox: o único armazenamento durável dos eventos é o archive de 30 dias do bus** (`modules/eventos`, `retencao_archive_dias`). `TransacaoCompensada` e `TransacaoEmReconciliacaoManual` não casam com nenhuma regra (`assinaturas` em `modules/eventos/variables.tf`): ficam só no archive e somem depois de 30 dias.
+- **Produção:** archive do EventBridge e Firehose → **S3 com Object Lock (compliance mode) por 10 anos** (Circular 3.978, arts. 28/67). O caminho Firehose → S3 está na IaC (módulo `plataforma_de_dados`, a data platform do ADR-0009); o Object Lock `COMPLIANCE` de 10 anos é desenho: a produção troca a expiração do sandbox por ele no mesmo bucket, e usa CMK em vez da `aws/s3`.
+- **Sandbox: dois armazenamentos duráveis, ambos de 30 dias:** o archive do bus (`modules/eventos`, `retencao_archive_dias`), para replay, e o bucket da data platform (`desafio-zup-plataforma-de-dados-<conta>`, versionado, objetos expiram em 30 dias, sem Object Lock). `TransacaoCompensada` e `TransacaoEmReconciliacaoManual` não casam com nenhuma regra de fila (`assinaturas` em `modules/eventos/variables.tf`): chegam só ao archive e à data platform, que assina todos os tipos.
 - **CloudTrail do sandbox:** o trail (`desafio-zup-trail`) grava num bucket (`desafio-zup-cloudtrail-<conta>`) com Object Lock **GOVERNANCE de 1 dia** e expiração em 30 d, criados no bootstrap da conta, **fora do Terraform deste repositório**. Demonstra o mecanismo, mas não é WORM de verdade: GOVERNANCE é contornável por quem tem `s3:BypassGovernanceRetention`. A role da esteira tem `Deny` explícito dessa ação, que vence o `Allow` da `PowerUserAccess` (`infra/terraform/environments/esteira/main.tf`, `docs/operacao/infraestrutura.md`), mas uma identidade administrativa da conta continua podendo contornar (a SCP só trava região e saída da Organization). E o trail registra eventos de gerenciamento, sem eventos de dados: operação financeira não aparece nele. A trilha do negócio são os eventos.
 - **Imutabilidade contábil:** correção é estorno (outro lançamento), nunca edição.
 
@@ -42,12 +42,12 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
   - tamanho do outbox;
   - IteratorAge do relay;
   - órfãs compensadas por hora.
-- **Alarmes:** 5XX por burn rate em duas janelas sobre o SLO de 99,9% (`docs/operacao/slo.md`), p99 > 400 ms (o SLO de 150 ms não foi atingido; alarmar nele dispararia sempre), qualquer mensagem em DLQ (inclusive a DLQ de entrega dos targets do EventBridge), idade da mensagem mais antiga em cada fila consumidora, `Errors` de cada Lambda, IteratorAge > 60 s do relay e do CDC, motivo de recusa desconhecido vindo do `limites`, varredura do reconciliador com erro, guarda de idempotência acima de 2.000 entradas (`OperacoesNaGuarda`) e reservas ativas no item acima de 2.000 (`ReservasAtivas`, ADR-0016), defasagem do feed do legado acima de 5 min (ADR-0014) e os do reconciliador (`reconciliador-encaminhadas`, `reconciliador-falhas`, `reconciliador-hold_perdido`). Órfãs compensadas por hora é consulta de log (runbook R4), sem alarme.
+- **Alarmes:** 5XX por burn rate em duas janelas sobre o SLO de 99,9% (`docs/operacao/slo.md`), p99 > 400 ms (o SLO de 150 ms não foi atingido; alarmar nele dispararia sempre), qualquer mensagem em DLQ (inclusive a DLQ de entrega dos targets do EventBridge), idade da mensagem mais antiga em cada fila consumidora, `Errors` de cada Lambda (inclusive os consumidores de referência), defasagem da entrega da data platform no S3 acima de 15 min (`plataforma-de-dados-defasagem`, runbook R15), IteratorAge > 60 s do relay e do CDC, motivo de recusa desconhecido vindo do `limites`, varredura do reconciliador com erro, guarda de idempotência acima de 2.000 entradas (`OperacoesNaGuarda`) e reservas ativas no item acima de 2.000 (`ReservasAtivas`, ADR-0016), defasagem do feed do legado acima de 5 min (ADR-0014) e os do reconciliador (`reconciliador-encaminhadas`, `reconciliador-falhas`, `reconciliador-hold_perdido`). Órfãs compensadas por hora é consulta de log (runbook R4), sem alarme.
 - **Ação dos alarmes:** todos notificam (ALARM e OK) o tópico SNS `desafio-autorizacao-alarmes`, criptografado com chave KMS gerenciada pelo cliente e rotação ligada. Não é a `alias/aws/sns`: com ela o CloudWatch não consegue publicar. A policy do tópico só aceita o CloudWatch vindo de alarmes da conta (`aws:SourceAccount`, `aws:SourceArn`). No sandbox não há assinatura por padrão (`var.email_alarmes`); na produção o plantão assina.
 
 ### Segurança
 
-- **IAM:** uma task role por serviço, ações mínimas e recursos por ARN, verificado por `terraform test` e Checkov na CI. As trust policies das task roles e da role do EventBridge Scheduler têm `aws:SourceAccount` e `aws:SourceArn` (anti-confused-deputy), só onde a AWS documenta o suporte (detalhe em `docs/operacao/infraestrutura.md`, seção 4.9).
+- **IAM:** uma task role por serviço, ações mínimas e recursos por ARN, verificado por `terraform test` e Checkov na CI. As trust policies das task roles e da role do EventBridge Scheduler têm `aws:SourceAccount` e `aws:SourceArn` (anti-confused-deputy), só onde a AWS documenta o suporte; a role do Firehose exige `sts:ExternalId` (documentado pelo Firehose) e a role do EventBridge da data platform tem `aws:SourceArn` (a regra) e `aws:SourceAccount`, como a página de confused deputy do EventBridge documenta para role de target (detalhe em `docs/operacao/infraestrutura.md`, seção 4.9).
 - **Rede:**
   - tasks sem ingress da internet (só NLB e Service Connect, a partir da VPC);
   - na produção, subnets privadas + endpoints;
@@ -67,7 +67,7 @@ O caso é regulado: o banco é S1 e segue as Resoluções CMN 4.893/2021 (altera
   - A observabilidade separa erro técnico de recusa de negócio.
 - **Negativas:**
   - **Custo de armazenamento** da trilha de 10 anos (mitigado por classes frias do S3).
-  - **No sandbox, a trilha durável é de 30 dias** e não é imutável: os 10 anos em compliance mode existem só como desenho.
+  - **No sandbox, a trilha durável é de 30 dias** e não é imutável: o caminho até o S3 existe, mas os 10 anos em compliance mode existem só como desenho.
   - **Sem OpenTelemetry completo no prazo:** o trace técnico depende do X-Ray na borda e dos IDs propagados.
 
 ## Quando esta decisão deixa de ser boa

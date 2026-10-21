@@ -30,6 +30,8 @@ O enunciado traz volumetria (~80 M contas, 3–5 contratos/conta, pico ~5.000 TP
 | WRU no `limites` | 1 `UpdateItem` por operação; medido: 1,09 WRU no DEBITO | ~6 k/s |
 | WRU no `autorizacao` | Tabela `autorizacoes`: `PutItem` condicional (1) + `Put` na transação (2), medido 3,06. Tabela `autorizacoes-outbox`, por evento: `Put` na transação de um item de 1–2 KB (4) + delete do relay (2), medido 6,12. A captura publica 2 eventos | `autorizacoes` ~17–27 k/s; `autorizacoes-outbox` ~34 k/s só com DEBITO e ~49–64 k/s com captura, **acima da quota padrão de 40 k por tabela** |
 | Eventos | ~5.000 aprovações + ~500 recusas/s; a captura publica 2 eventos | 5,5 k a 10,5 k entradas de PutEvents/s: **a quota aprovada (6.000) não basta**, pedir 12.000 |
+| Invocations | Regras casadas por evento, mais 1 da data platform (todo evento) | 21,5 k a 31,5 k/s: **acima dos 20.000 aprovados já no DEBITO**, pedir ~37.000 |
+| Pico medido | 5.000 rps oferecidos por 8 min na AWS (21/10, `docs/capacidade.md` §3.1), 60 tasks de 1 vCPU por serviço, DEBITO | 96,2% de 201 e 3,8% de 503 com a CPU a ~85%; p99 de gateway de ~1,1–1,2 s; ~150–160 vCPU para aceitar tudo (quota da conta: 140) |
 
 ## Consequências
 

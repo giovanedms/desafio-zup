@@ -67,3 +67,13 @@ output "entrega_dlq_arn" {
   description = "ARN da DLQ de entrega dos targets do EventBridge."
   value       = aws_sqs_queue.entrega_dlq.arn
 }
+
+output "sources" {
+  description = "Valores de `source` publicados no bus (relay do outbox e CDC de limites)."
+  value       = [var.source_eventos, var.source_limites]
+}
+
+output "schema_registry_nome" {
+  description = "Nome do schema registry com os contratos dos eventos do bus."
+  value       = aws_schemas_registry.this.name
+}

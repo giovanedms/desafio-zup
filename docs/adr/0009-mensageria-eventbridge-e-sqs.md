@@ -37,14 +37,16 @@ Fatos em sa-east-1 (da documentação oficial da AWS; os links principais estão
     | Contabilização | Autorizada, Estornada, ReservaExpirada, ReservaCapturada |
     | Antifraude | Autorizada, Recusada |
     | Notificações | Autorizada, Recusada, Estornada, LimiteAlterado |
+    | Data platform | Todos os eventos dos dois sources, via Firehose → S3 |
 
   - **Archive no bus**, para replay.
 - **Uma fila SQS Standard por consumidor**, com DLQ (`maxReceiveCount` 5, retenção de 14 dias). A fila é o **amortecedor**: o consumidor parado ou lento não afeta o produtor nem os outros consumidores.
 - **Entrega regra → fila sem perda silenciosa:** todo target tem `retry_policy` explícita (até 1 h ou 185 tentativas) e `dead_letter_config` para a DLQ de entrega `financas-entrega-dlq` (SSE, alarme). Sem isso, a entrega que esgota as tentativas, ou que falha por permissão (o EventBridge nem tenta de novo), seria descartada depois que o outbox já apagou o item. A queue policy da DLQ só aceita `events.amazonaws.com` vindo das regras do bus (`aws:SourceArn`). Cada mensagem traz `RULE_ARN`, `TARGET_ARN` e `ERROR_CODE`, e o redrive vai para a fila do `TARGET_ARN` (runbook R1).
 - **Ordem e duplicata ficam com o consumidor:**
-  - idempotente por `(source, id)` do CloudEvent, com inbox na mesma escrita do efeito;
-  - tolera reordenação, por construção (contabilização: lançamentos autocontidos, saldo comutativo, ver property test) ou por versão (`versao_limite` por contrato, ADR-0008).
-- **Data platform:** archive mais Firehose → S3 na produção. No sandbox, só o archive.
+  - idempotente por `(source, id)` do CloudEvent. Se o efeito é escrita no banco (contabilização), a inbox vai na mesma escrita. Se não cabe numa escrita atômica (antifraude e notificações: o efeito sai do processo), a inbox reivindica o evento com prazo antes do efeito e o conclui depois. A duplicata de evento concluído é descartada, a concorrente volta para a fila, e a invocação que morre no meio deixa o evento sair de novo depois do prazo (at-least-once; a linha leva o `id`). É o padrão do utilitário de idempotência do Powertools for AWS Lambda;
+  - tolera reordenação, por construção (contabilização: lançamentos autocontidos e saldo comutativo; consumidores de referência: cada evento é um fato emitido sozinho, nada é descartado por chegar fora de ordem; ver os property tests) ou por versão (`versao_limite` por contrato, ADR-0008).
+- **Consumidores de referência de antifraude e notificações** (`services/consumidores`, uma Lambda por fila): validam envelope e `data` contra o schema publicado do tipo (copiado de `contracts/events` para o zip), deduplicam numa inbox própria (TTL de 30 dias) e registram uma linha por evento, com tipo, id e identificadores pseudonimizados. O inválido volta como falha do lote e vai para a DLQ da fila. Em produção, cada sistema a jusante tem o seu; estes mostram o contrato a cumprir e mantêm as filas drenadas.
+- **Data platform:** regra `para-plataforma-de-dados` (sem filtro de `detail-type`) → Firehose Direct PUT → S3 `desafio-zup-plataforma-de-dados-<conta>`, em `eventos/tipo=/ano=/mes=/dia=` por dynamic partitioning, NDJSON em GZIP, buffer de 60 s (módulo `plataforma_de_dados`). O target tem o mesmo retry e a mesma DLQ de entrega dos outros; a role do EventBridge só faz `PutRecord` e `PutRecordBatch` no stream, e a do Firehose só `s3:PutObject` nos prefixos. O bucket tem SSE-KMS `aws/s3`, versionamento, Block Public Access, policy só TLS e expiração em 30 dias no sandbox; na produção é a trilha de 10 anos com Object Lock `COMPLIANCE` (ADR-0017). A entrega é at-least-once: quem lê o S3 deduplica por `(source, id)`. Alarme de defasagem (runbook R15). O archive continua para replay.
 
 ## Avaliação das alternativas para alta volumetria e ordem
 
@@ -69,10 +71,12 @@ O padrão alternativo é uma regra por evento entregando num tópico SNS, com um
 
 ## Consequências
 
-- **Positivas:** acoplamento mínimo (o produtor não conhece consumidores), roteamento declarativo, isolamento de falha por fila e custo zero ocioso.
+- **Positivas:** acoplamento mínimo (o produtor não conhece consumidores), roteamento declarativo, isolamento de falha por fila e custo zero ocioso. Medido a 5.000 rps oferecidos (21/10, `docs/capacidade.md` §3.1): as 3 regras entregaram 2.784.648 eventos cada, com 0 falhas e 0 estrangulados e nenhuma mensagem em DLQ. A fila contábil chegou a 335 s de atraso e drenou depois, enquanto o relay seguia com `IteratorAge` de 1,3–1,7 s: o consumidor lento não segurou o produtor.
 - **Negativas:**
   - Sem ordem nativa: todo consumidor precisa ser idempotente e tolerante a reordenação. É exatamente o que o enunciado pede, então é requisito e não defeito.
   - A captura publica **2** eventos (`TransacaoAutorizada` + `ReservaCapturada`) e casa 4 regras. No pior mix do pico isso dá ~10.500 entradas de PutEvents/s e ~21.000 invocations/s, acima das quotas aprovadas (6.000 e 20.000): é preciso pedir 12.000 e 25.000 antes do pico (conta em `docs/capacidade.md`, seção 1.1).
+  - A data platform é o consumidor novo de todo evento que a seção acima previa: +1 invocation por evento, 21.500 + 10.000·*f* invocations/s no pico (*f* = fração de capturas). Passa dos 20.000 aprovados já no mix só de DEBITO e chega a 31.500 no pior caso: com ela, pedir ~37.000. O Firehose Direct PUT tem quota própria por stream: 1.000 requisições/s e 1 MiB/s por padrão em sa-east-1, abaixo dos ≥ ~6 MB/s do pico (estimativa em `docs/capacidade.md` §1.1); pedir aumento. Por isso a regra pode ser desligada na janela de medição (`plataforma_de_dados_ativa = false`) e religada depois, com replay do archive só para ela.
+  - Deduplicar efeito que não está no banco custa 2 WRU por evento novo por consumidor de referência e 1 WRU por duplicata: ~22.000 WRU/s no pico (~5.500 eventos/s em cada fila), ~US$ 74/h em sa-east-1, +14% a +25% sobre a escrita de pico do DynamoDB (`docs/capacidade.md` §4). Para um consumidor só de registro, logar duas vezes seria inofensivo e custaria 0. O desenho fica porque é o que notificação ao cliente e feature de velocidade do antifraude exigem.
 
 ## Quando esta decisão deixa de ser boa
 
@@ -81,6 +85,7 @@ O padrão alternativo é uma regra por evento entregando num tópico SNS, com um
 | Consumidor exige **ordem estrita por contrato** e não consegue usar a versão | Pipe ou relay publicando em SQS FIFO ou Kinesis com `partitionkey` = `id_contrato` (o CloudEvent já carrega a extensão) |
 | Volume passa de ~10 k eventos/s sustentados, ou o banco padroniza Kafka | MSK como backbone, com EventBridge Pipes ou o relay publicando lá |
 | Novo Custom Event Bus chega a sa-east-1 | Reavaliar: FIFO por `EventGroupId` e dedup nativos simplificariam os consumidores |
+| Data platform no pico de produção | SNS de fan-out largo (seção acima) ou entrada fora do bus (relay em lote, ou Kinesis na frente do Firehose) |
 
 ## Referências
 

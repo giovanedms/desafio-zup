@@ -23,8 +23,8 @@ As premissas estão no ADR-0001 (99,9%/mês; p99 ≤ 150 ms no gateway). Aqui fi
 ## SLO e error budget
 
 - **Disponibilidade: 99,9% por mês** (janela móvel de 30 dias). Budget: 0,1% das requisições, ~43 min de indisponibilidade total.
-- **Latência: 99% das requisições sem erro em até 150 ms** no gateway, o p99 do ADR-0001. **Alvo não atingido:** o melhor degrau medido teve p99 de 164 ms no gateway (150 rps, 33% de CPU); 526 ms a 300 rps; 874 ms a 600 rps (`docs/capacidade.md`, seção 3). O caminho está na seção 5 do mesmo documento.
-- **Ordem de grandeza:** o degrau de 600 rps com 6 tasks teve 4,4% de 503, 44× a taxa do budget. Sustentado, gastaria o mês em ~16 h.
+- **Latência: 99% das requisições sem erro em até 150 ms** no gateway, o p99 do ADR-0001. **Alvo não atingido:** o melhor degrau medido teve p99 de 164 ms no gateway (150 rps, 33% de CPU); 526 ms a 300 rps; 874 ms a 600 rps (`docs/capacidade.md`, seção 3); ~1,1–1,2 s no patamar de 5.000 rps, com 60 tasks de 1 vCPU por serviço a ~85% de CPU (seção 3.1). O caminho está na seção 5 do mesmo documento.
+- **Ordem de grandeza:** o degrau de 600 rps com 6 tasks teve 4,4% de 503, 44× a taxa do budget. Sustentado, gastaria o mês em ~16 h. O teste de 5.000 rps teve 3,8% de 503 no total (até 9,2% num minuto), 38× a taxa do budget, acima dos limiares dos dois alarmes de burn rate (1,44% e 0,6%): sustentado, gastaria o mês em ~19 h (derivado).
 
 ## Política de burn-rate (implementada na IaC)
 

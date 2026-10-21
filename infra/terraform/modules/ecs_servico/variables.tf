@@ -202,3 +202,14 @@ variable "fuso_horario" {
   type        = string
   default     = "America/Sao_Paulo"
 }
+
+variable "escala_preditiva" {
+  description = "Modo da política de predictive scaling na CPU (alvo = alvo_cpu_percent): ForecastOnly (só previsão, sem agir) ou ForecastAndScale. null = sem política preditiva (workers de 1 task)."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = contains(["ForecastOnly", "ForecastAndScale"], coalesce(var.escala_preditiva, "ForecastOnly"))
+    error_message = "escala_preditiva deve ser null, ForecastOnly ou ForecastAndScale."
+  }
+}

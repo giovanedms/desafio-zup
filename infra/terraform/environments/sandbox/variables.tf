@@ -108,6 +108,12 @@ variable "zip_contabilizacao" {
   default     = null
 }
 
+variable "zip_consumidores" {
+  description = "Zip do pacote consumidores. null = infra/terraform/build/consumidores.zip (make pacotes)."
+  type        = string
+  default     = null
+}
+
 variable "arquitetura_cpu" {
   description = "Arquitetura das tasks ECS. ARM64 em produção; o sandbox pode usar X86_64 se as imagens forem construídas em máquina x86 sem emulação."
   type        = string
@@ -165,4 +171,16 @@ variable "email_alarmes" {
   description = "E-mail assinado no tópico SNS de alarmes. Vazio (padrão) = sem assinatura."
   type        = string
   default     = ""
+}
+
+variable "plataforma_de_dados_ativa" {
+  description = "Regra do bus para a data platform ligada. false na janela de medição de carga (+1 invocation por evento e quota do Firehose Direct PUT). Para ter esses eventos no S3, religar e fazer replay do archive só para a regra para-plataforma-de-dados."
+  type        = bool
+  default     = true
+}
+
+variable "modo_escala_preditiva" {
+  description = "Predictive scaling de autorizacao e limites: ForecastOnly (padrão: só previsão, para comparar com o pico real), ForecastAndScale (age) ou null (sem política)."
+  type        = string
+  default     = "ForecastOnly"
 }

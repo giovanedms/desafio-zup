@@ -21,6 +21,17 @@ const CONTRATO = __ENV.CONTRATO || "";
 // PREFIXO + número com PAD dígitos. Concentrar em poucos contratos mede o teto do contrato quente (ADR-0016).
 const N_CONTRATOS = parseInt(__ENV.N_CONTRATOS || "20", 10);
 const PREFIXO = __ENV.PREFIXO || "CTR-CARGA-";
+// A conta tem de ser a titular do contrato: o limites confere e recusa com CONTA_DIVERGENTE. ID_CONTA força
+// uma conta; sem ele, a conta sai do contrato, com as mesmas regras de quem os cria: CTR-DEMO-n e CTR-CARGA-n do
+// bootstrap local (infra/local/bootstrap.py) e os contratos de carga da AWS (tests/e2e/aws.py contratos).
+const ID_CONTA = __ENV.ID_CONTA || "";
+function contaDe(contrato) {
+  if (ID_CONTA) return ID_CONTA;
+  const n = parseInt(contrato.replace(/^.*-/, ""), 10);
+  if (contrato.startsWith("CTR-DEMO-")) return `0001-${String(n).padStart(8, "0")}-${n}`;
+  if (contrato.startsWith("CTR-CARGA-")) return `0001-${String(n + 8).padStart(8, "0")}-9`;
+  return "0001-77777777-7";
+}
 const PAD = parseInt(__ENV.PAD || "4", 10);
 function contratosPadrao() {
   const lista = [];
@@ -119,7 +130,7 @@ function cabecalhos(dados) {
 
 function autorizar(contrato, tipo, valor, dados, params) {
   const corpo = JSON.stringify({
-    id_conta: "0001-99999999-9",
+    id_conta: contaDe(contrato),
     valor,
     moeda: "BRL",
     tipo_operacao: tipo,

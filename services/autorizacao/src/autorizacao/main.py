@@ -6,9 +6,11 @@ factory, então importar este módulo nunca abre conexão nem lê credencial.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 import boto3
 import httpx
@@ -45,18 +47,44 @@ class Nucleo:
     autorizar: AutorizarTransacao
 
 
-def _construir_nucleo(config: Configuracao) -> Nucleo:
-    dynamodb = boto3.client(
-        "dynamodb",
-        region_name=config.regiao,
-        endpoint_url=config.endpoint_aws,
-        config=Config(
-            max_pool_connections=64,
-            retries={"mode": "standard", "max_attempts": 3},
-            connect_timeout=1,
-            read_timeout=2,
-        ),
+# Endpoint local por allowlist exata, sem parser de URL: urlparse e o urllib3 do botocore discordam em casos como
+# `http://exemplo.com\@localhost/`, que um leria como local e o outro discaria para fora. Porta de 1 a 65535;
+# ASCII para o K de Kelvin não casar com `k` no IGNORECASE. A mesma regex em todo guard do repositório
+# (tests/contract/test_guards_de_endpoint.py).
+ENDPOINT_LOCAL = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost|localstack)"
+    r"(?::(?:6553[0-5]|655[0-2]\d|65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3}))?/?",
+    re.IGNORECASE | re.ASCII,
+)
+
+
+def cliente_dynamodb(config: Configuracao) -> Any:
+    """Na AWS: credenciais do papel da task. Com endpoint: SÓ local, credenciais fictícias explícitas
+    (o shell de quem desenvolve pode exportar credenciais reais; o cliente não as leva a um endpoint remoto)."""
+    opcoes = Config(  # type: ignore[call-arg]  # os stubs do botocore não declaram o parâmetro (existe desde o 1.31)
+        max_pool_connections=64,
+        retries={"mode": "standard", "max_attempts": 3},
+        connect_timeout=1,
+        read_timeout=2,
+        # Endpoint só o explícito: `AWS_ENDPOINT_URL_DYNAMODB` ou o `~/.aws/config` não desviam o cliente.
+        ignore_configured_endpoint_urls=True,
     )
+    if config.endpoint_aws is None:
+        return boto3.client("dynamodb", region_name=config.regiao, config=opcoes)
+    if not ENDPOINT_LOCAL.fullmatch(config.endpoint_aws):
+        raise ValueError(f"endpoint não é local: {config.endpoint_aws!r}")
+    return boto3.client(
+        "dynamodb",
+        endpoint_url=config.endpoint_aws,
+        region_name=config.regiao,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        config=opcoes,
+    )
+
+
+def _construir_nucleo(config: Configuracao) -> Nucleo:
+    dynamodb = cliente_dynamodb(config)
     http_limites = httpx.Client(
         base_url=config.url_limites,
         timeout=httpx.Timeout(connect=0.5, read=1.5, write=0.5, pool=0.5),

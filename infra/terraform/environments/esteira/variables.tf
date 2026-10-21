@@ -24,7 +24,7 @@ variable "id_dono_github" {
 variable "id_repositorio_github" {
   description = "ID numérico (imutável) do repositório no GitHub: `gh api repos/<dono>/<repo> --jq .id`."
   type        = string
-  default     = "1427358154"
+  default     = "1428559478"
 }
 
 variable "branch_de_deploy" {

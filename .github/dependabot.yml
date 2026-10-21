@@ -37,7 +37,7 @@ updates:
     commit-message:
       prefix: "deps(actions)"
 
-  # Imagens base dos 4 Dockerfiles (python:3.13-slim e uv:0.12 por digest).
+  # Imagens base dos 4 Dockerfiles (python:3.13-slim e uv, por digest).
   - package-ecosystem: "docker"
     directories:
       - "/services/autorizacao"

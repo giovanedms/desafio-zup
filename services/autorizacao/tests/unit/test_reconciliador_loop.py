@@ -51,6 +51,8 @@ def test_composition_monta_o_reconciliador_sem_abrir_conexao(
 ) -> None:
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    # O guard recusaria um endpoint remoto exportado no shell de quem roda o teste.
+    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
 
     reconciliador, expirador = construir_reconciliador(Configuracao.do_ambiente())
 

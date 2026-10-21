@@ -8,12 +8,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config
@@ -35,7 +35,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("relay.local")
 
-HOSTS_LOCAIS = {"127.0.0.1", "localhost", "localstack"}
+# Endpoint local por allowlist exata, sem parser de URL: urlparse e o urllib3 do botocore discordam em casos como
+# `http://exemplo.com\@localhost/`, que um leria como local e o outro discaria para fora. Porta de 1 a 65535;
+# ASCII para o K de Kelvin não casar com `k` no IGNORECASE. A mesma regex em todo guard do repositório
+# (tests/contract/test_guards_de_endpoint.py).
+ENDPOINT_LOCAL = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost|localstack)"
+    r"(?::(?:6553[0-5]|655[0-2]\d|65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3}))?/?",
+    re.IGNORECASE | re.ASCII,
+)
 INTERVALO_S = 0.5
 VARREDURA_S = 60.0
 REDESCOBERTA_DE_SHARDS_S = 5.0
@@ -45,7 +53,7 @@ REGIAO_PADRAO = "sa-east-1"
 
 def cliente_local(servico: str, endpoint: str, regiao: str = REGIAO_PADRAO) -> Any:
     """Endpoint e credenciais EXPLÍCITOS; recusa endpoint que não seja local."""
-    if urlparse(endpoint).hostname not in HOSTS_LOCAIS:
+    if not ENDPOINT_LOCAL.fullmatch(endpoint):
         raise ValueError(f"endpoint não é local: {endpoint!r}")
     return boto3.client(  # type: ignore[call-overload]
         servico,
@@ -53,7 +61,10 @@ def cliente_local(servico: str, endpoint: str, regiao: str = REGIAO_PADRAO) -> A
         region_name=regiao,
         aws_access_key_id="test",
         aws_secret_access_key="test",
-        config=Config(retries={"mode": "standard"}),
+        config=Config(  # type: ignore[call-arg]  # os stubs do botocore não declaram o parâmetro (existe desde o 1.31)
+            retries={"mode": "standard"},
+            ignore_configured_endpoint_urls=True,
+        ),
     )
 
 

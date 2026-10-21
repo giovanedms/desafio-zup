@@ -1,6 +1,6 @@
 # Infraestrutura na AWS — inventário, bootstrap e esteira
 
-> **Fonte de verdade:** o state do Terraform. Este inventário foi conferido em **20/10/2026** contra `terraform state list`, `terraform show -json` e as APIs da AWS, e recontado em **21/10/2026** depois do deploy do commit `dd59a8f` (run `39598144818`, correções do sexto painel de revisão: 39 recursos adicionados, 15 alterados e 10 destruídos, entre eles o security group único das tasks, trocado por um por serviço). Um push que só muda código troca a tag das imagens (`git-<sha12>`), as revisões das task definitions e republica as 4 Lambdas; um push que muda a IaC aplica a diferença, que aparece no resumo do plano de cada execução. As referências a arquivos valem para a versão do repositório que contém este documento.
+> **Fonte de verdade:** o state do Terraform. Este inventário foi conferido em **20/10/2026** contra `terraform state list`, `terraform show -json` e as APIs da AWS, e recontado em **21/10/2026** depois do deploy do commit `3598e74` (correções do sexto painel de revisão: 39 recursos adicionados, 15 alterados e 10 destruídos, entre eles o security group único das tasks, trocado por um por serviço). Um push que só muda código troca a tag das imagens (`git-<sha12>`), as revisões das task definitions e republica as 4 Lambdas; um push que muda a IaC aplica a diferença, que aparece no resumo do plano de cada execução. As referências a arquivos valem para a versão do repositório que contém este documento.
 > **Convenção:** ID de conta, ARNs com conta e segredos não aparecem aqui. Onde o nome real contém a conta, está escrito `<conta>`.
 > Decisões e porquês ficam nos ADRs; este documento diz **o que existe, onde e com que configuração**.
 
@@ -60,7 +60,7 @@ Feito à mão em 19/10/2026. Configuração conferida pela API em 20/10/2026.
 | Recurso Terraform | Nome na AWS | Configuração |
 |---|---|---|
 | `aws_iam_openid_connect_provider.github` | `token.actions.githubusercontent.com` | Audiência `sts.amazonaws.com`. O STS valida a assinatura pelo JWKS do emissor |
-| `aws_iam_role.esteira` | `desafio-zup-esteira` | Só `sts:AssumeRoleWithWebIdentity`, com `aud = sts.amazonaws.com` e `sub` **exato** `repo:giovanedms@194153057/desafio-zup@1427358154:ref:refs/heads/main`. Sessão de até 1 h |
+| `aws_iam_role.esteira` | `desafio-zup-esteira` | Só `sts:AssumeRoleWithWebIdentity`, com `aud = sts.amazonaws.com` e `sub` **exato** `repo:giovanedms@194153057/desafio-zup@1428559478:ref:refs/heads/main`. Sessão de até 1 h |
 | `aws_iam_role_policy_attachment.power_user` | — | `PowerUserAccess` (versão v12, de 12/02/2026): tudo menos IAM, Organizations e Account, **exceto 9 ações liberadas dentro deles**: `iam:CreateServiceLinkedRole`, `iam:DeleteServiceLinkedRole`, `iam:ListRoles`, `organizations:DescribeOrganization`, `organizations:DescribeEffectivePolicy`, `account:GetAccountInformation`, `account:GetGovCloudAccountInformation`, `account:GetPrimaryEmail` e `account:ListRegions`. Service-linked roles (seção 5) ficam fora do boundary. Desvio consciente, ver seção 9 |
 | `aws_iam_role_policy.iam_delegada` | `iam-com-boundary-obrigatorio` | IAM delegada (ver lista abaixo) |
 | `aws_iam_policy.limite` | `desafio-zup-limite-de-permissoes` | **Permissions boundary** de toda role criada pela stack (ver lista abaixo) |
@@ -117,7 +117,7 @@ As variáveis `repositorio_github`, `id_dono_github`, `id_repositorio_github` e 
 | `eventos` | 27 | Bus, archive, 4 regras, 4 targets (com retry explícito e DLQ de entrega), 9 filas SQS (inclui a `financas-entrega-dlq`), 4 queue policies, 4 redrive-allow |
 | `lambdas` | 22 | 4 funções, 3 event source mappings, 1 schedule, 4 roles e 4 políticas, 2 DLQs, 4 log groups |
 | `observabilidade` | 47 | 30 alarmes e 2 compostos, 9 metric filters, 1 dashboard, 1 regra de Contributor Insights, tópico SNS de alarmes e a policy dele, chave KMS do tópico e o alias. Com `email_alarmes`, mais 1 assinatura. Painel 6: o alarme de 5XX virou burn rate (4 janelas + 2 alarmes compostos), e entraram idade das filas, Errors das 4 Lambdas, IteratorAge do CDC e 2 sinais de log (seção 4.8) |
-| **Total** | **203** | `terraform state list` mostra 204 linhas: a 204ª é o data source `module.api.data.aws_region.atual`. Contado em 21/10/2026, depois do deploy do commit `dd59a8f` |
+| **Total** | **203** | `terraform state list` mostra 204 linhas: a 204ª é o data source `module.api.data.aws_region.atual`. Contado em 21/10/2026, depois do deploy do commit `3598e74` |
 
 **Tags.** O `default_tags` do provider aplica `environment=sandbox`, `team=plataforma-financas`, `managed-by=terraform` e `project=desafio-autorizacao`. Ficam **sem tag 66 recursos de 25 tipos**, todos de tipos que não têm argumento de tags no provider. Pelo state:
 - **IAM:** `aws_iam_role_policy` (12), `aws_iam_role_policy_attachment` (1).
@@ -141,7 +141,7 @@ Os outros 137 têm as 4 tags (conferido pelo `tags_all` no state). O ambiente `e
 | Security groups por serviço `desafio-<serviço>-<sufixo>` (tag `Name` = `desafio-<serviço>`; o nome usa `name_prefix`) | **`autorizacao`:** entrada TCP 8080 de `10.40.0.0/16` (o NLB, ver abaixo); saída 443 para `0.0.0.0/0` e 8080 **só para o SG do `limites`**. **`limites`:** entrada TCP 8080 **só dos SGs do `autorizacao` e do `reconciliador`** (`referenced_security_group_id`); saída 443. **`limites-acl`:** sem entrada; saída 443. **`reconciliador`:** sem entrada; saída 443 e 8080 só para o SG do `limites` |
 | VPC endpoints **gateway** `com.amazonaws.sa-east-1.dynamodb` e `com.amazonaws.sa-east-1.s3` | Na route table pública, com a política padrão (acesso total) |
 
-**Segmentação leste-oeste (painel 6, G3).** Até o commit `5309e09` as 4 tasks dividiam um SG que abria a 8080 para a VPC inteira: o `limites-acl`, ou qualquer coisa rodando na VPC, chamava a API interna que move o limite. Agora a 8080 do `limites` só aceita os dois clientes reais, por referência de SG. Isso funciona com o Service Connect porque o proxy roda dentro da task cliente e a conexão sai da ENI dela para a `containerPort` do servidor ([ECS, Service Connect: networking](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect-concepts-deploy.html#service-connect-concepts-network)). O `autorizacao` ainda aceita o CIDR da VPC porque o NLB foi criado sem SG, e a AWS não deixa associar SG a um NLB depois de criado ([NLB security groups](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-security-groups.html)): ligar agora recriaria NLB, VPC Link e integração. O `run "rede_leste_oeste"` do `terraform test` reprova se o `limites` aceitar CIDR ou outro SG, se um worker ganhar entrada ou se a saída 8080 apontar para outro lugar.
+**Segmentação leste-oeste (painel 6, G3).** Até o commit `9a2b918` as 4 tasks dividiam um SG que abria a 8080 para a VPC inteira: o `limites-acl`, ou qualquer coisa rodando na VPC, chamava a API interna que move o limite. Agora a 8080 do `limites` só aceita os dois clientes reais, por referência de SG. Isso funciona com o Service Connect porque o proxy roda dentro da task cliente e a conexão sai da ENI dela para a `containerPort` do servidor ([ECS, Service Connect: networking](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect-concepts-deploy.html#service-connect-concepts-network)). O `autorizacao` ainda aceita o CIDR da VPC porque o NLB foi criado sem SG, e a AWS não deixa associar SG a um NLB depois de criado ([NLB security groups](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-security-groups.html)): ligar agora recriaria NLB, VPC Link e integração. O `run "rede_leste_oeste"` do `terraform test` reprova se o `limites` aceitar CIDR ou outro SG, se um worker ganhar entrada ou se a saída 8080 apontar para outro lugar.
 
 **Caminho do tráfego.** DynamoDB e S3 saem pelos endpoints gateway e não passam pela internet. As camadas das imagens do ECR são servidas pelo S3. As demais APIs (ECR API, CloudWatch Logs, SQS do `limites-acl`) saem pelo internet gateway na porta 443, com o IP público da task. **Não há NAT gateway.**
 
@@ -357,7 +357,7 @@ As 13 têm o permissions boundary `desafio-zup-limite-de-permissoes` (conferido 
 - Todo `push` e `pull_request` roda o CI.
 - O **deploy** roda só na `main`: em `push`, ou em `workflow_dispatch` com `acao=deploy`.
 - O **destroy** roda só em `workflow_dispatch` na `main`, com `acao=destroy` e `confirmacao` exatamente igual a `CONFIRMO: destroy na conta desafio-zup`.
-- Não há filtro de caminho: **todo commit na `main` faz deploy**, até um que só muda documentação. Como a tag da imagem é o commit, cada push gera imagens novas, novas revisões das task definitions e um rolling deploy dos 4 services. As 4 Lambdas também são republicadas: o `make pacotes` refaz os zips, e o hash muda. Medido no push de `e028986`, só com documentação: `4 added, 8 changed, 4 destroyed`. Foram 4 task definitions substituídas, 4 services e 4 funções.
+- Não há filtro de caminho: **todo commit na `main` faz deploy**, até um que só muda documentação. Como a tag da imagem é o commit, cada push gera imagens novas, novas revisões das task definitions e um rolling deploy dos 4 services. As 4 Lambdas também são republicadas: o `make pacotes` refaz os zips, e o hash muda. Medido no push de `2e28a6a`, só com documentação: `4 added, 8 changed, 4 destroyed`. Foram 4 task definitions substituídas, 4 services e 4 funções.
 
 | Job | O que barra | Ferramentas |
 |---|---|---|
@@ -371,13 +371,13 @@ As 13 têm o permissions boundary `desafio-zup-limite-de-permissoes` (conferido 
 | `smoke` | Borda do gateway (201, replay idêntico, 401 `problem+json`, 422 do serviço com `valor: 0`, 429 `problem+json` com `Retry-After` numa rajada concorrente pelo `canal-app`) e corrida de 100 reservas no DynamoDB real, que também exige um lançamento em `contabilizacao-lancamentos` para cada reserva aprovada (outbox → relay → bus → fila → Lambda) | `tests/e2e/aws.py borda` e `corrida` |
 | `destroy` | Só manual, com a frase | `terraform destroy` |
 
-**Smoke observado na AWS** (20/10/2026, runs `39503847338` e `39503881655`, commits `c431a6f` e `2043556`):
+**Smoke observado na AWS** (20/10/2026, commits `48bae9b` e `077cb90`):
 - borda: 201, replay 200 com corpo idêntico, 401 `application/problem+json` sem token;
 - `valor: 0` → **422** `application/problem+json` (`VALIDACAO_DE_DOMINIO`) vindo do serviço, através do gateway;
 - rajadas de 40 chamadas simultâneas pelo `canal-app`: `{201: 68, 503: 1, 429: 11}` e `{201: 67, 503: 3, 429: 10}`, todo 429 em problem+json com `Retry-After` (o `THROTTLED` do usage plan; o 503 é o load shedding da task);
 - corrida de 100 reservas de R$ 100 em R$ 1.000: `{201: 10, 402: 90}`, disponível 0, versão 11.
 
-**Smoke observado na AWS** (21/10/2026, run `39598144818`, commit `dd59a8f`, primeiro com um security group por serviço):
+**Smoke observado na AWS** (21/10/2026, commit `3598e74`, primeiro com um security group por serviço):
 - borda: 201, replay 200 idêntico, 401 e 422 em `application/problem+json`; rajadas pelo `canal-app`: `{201: 67, 503: 2, 429: 11}`, os 11 com `Retry-After`;
 - corrida: `{201: 10, 402: 90}`, disponível 0, reservado 1.000, versão 11; 35 tentativas repetidas pelo canal com a mesma chave depois de 503 do load shedding;
 - contabilização: 10 lançamentos para as 10 aprovadas, nenhuma aprovada sem lançamento;
@@ -398,7 +398,7 @@ As 13 têm o permissions boundary `desafio-zup-limite-de-permissoes` (conferido 
 
 **Garantias da esteira:**
 - Actions fixadas por SHA de commit, com a tag no comentário. Ferramentas baixadas na hora com versão exata (Spectral, `openapi-spec-validator`, `jsonschema`, Trivy) e imagens base por digest.
-- **Dependabot** (`.github/dependabot.yml`): PRs semanais para o `uv.lock`, as actions e as imagens base, com cooldown de 7 dias. As versões dos comandos `npx`/`uvx` e do Trivy sobem à mão.
+- **Dependabot** (`.github/dependabot.yml`): PRs semanais para o `uv.lock`, as actions e as imagens base, com cooldown de 7 dias. Os dois PRs de 21/10 (`uv` 0.12 → 0.13 no estágio de build das 4 imagens e `aquasecurity/setup-trivy` v0.2.6 → v0.3.1) passaram nos 6 jobs de CI do PR e foram mesclados na `main`; o `setup-trivy` só roda no job `deploy`, que o PR não executa, então a versão nova só é exercitada no deploy da `main`. As versões dos comandos `npx`/`uvx` e do Trivy sobem à mão.
 - `permissions: contents: read` por padrão; `id-token: write` só em `deploy`, `smoke` e `destroy`.
 - Grupo de concorrência `aws-sandbox` sem cancelamento: um apply nunca é interrompido no meio.
 - Fora da `main`, execuções antigas do mesmo ref são canceladas.

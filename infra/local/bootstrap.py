@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from decimal import Decimal
 from typing import Any
-from urllib.parse import urlparse
 
 import boto3
 from autorizacao.adapters.outbound.dynamodb import definicoes_das_tabelas
@@ -30,6 +30,12 @@ from limites.application.portas import ContratoJaExiste
 from limites.domain.limite import Limite, StatusContrato, TipoProduto
 
 ENDPOINT = os.environ.get("LOCALSTACK_ENDPOINT", "http://127.0.0.1:4566")
+# Só LocalStack: allowlist exata, sem parser de URL (tests/contract/test_guards_de_endpoint.py).
+ENDPOINT_PERMITIDO = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost|localstack)"
+    r"(?::(?:6553[0-5]|655[0-2]\d|65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3}))?/?",
+    re.IGNORECASE | re.ASCII,
+)
 REGIAO = "sa-east-1"
 BUS = "financas"
 SOURCE_DO_BUS = "financas.autorizacao"
@@ -72,7 +78,7 @@ CONTRATOS_DE_DEMO = [
 
 
 def cliente(servico: str) -> Any:
-    if urlparse(ENDPOINT).hostname not in {"127.0.0.1", "localhost", "localstack"}:
+    if not ENDPOINT_PERMITIDO.fullmatch(ENDPOINT):
         sys.exit(f"recusado: endpoint não é local ({ENDPOINT})")
     return boto3.client(
         servico,
@@ -80,7 +86,10 @@ def cliente(servico: str) -> Any:
         region_name=REGIAO,
         aws_access_key_id="test",
         aws_secret_access_key="test",
-        config=Config(retries={"mode": "standard"}),
+        config=Config(
+            retries={"mode": "standard"},
+            ignore_configured_endpoint_urls=True,  # endpoint só o explícito, como nos guards
+        ),
     )
 
 

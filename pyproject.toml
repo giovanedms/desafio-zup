@@ -47,6 +47,7 @@ ignore = [
 # Credenciais fictícias "test" da LocalStack. Só são usadas DEPOIS do guard que recusa endpoint fora de
 # 127.0.0.1/localhost/localstack (raise ou sys.exit): esse guard é o controle, e é o que torna o S106 inofensivo.
 "services/limites/src/limites/main.py" = ["S106"]
+"services/autorizacao/src/autorizacao/main.py" = ["S106"]
 "services/contabilizacao/src/contabilizacao/main.py" = ["S106"]
 "relay/src/relay/local.py" = ["S106", "S108"]
 "legado-mock/src/legado_mock/__main__.py" = ["S106"]

@@ -7,10 +7,10 @@ Execução: `uvicorn limites.main:app_factory --factory`. O cliente boto3 nasce 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config
@@ -25,16 +25,30 @@ from limites.application.casos_de_uso import (
 )
 from limites.config import Configuracao
 
-HOSTS_LOCAIS = {"127.0.0.1", "localhost", "localstack"}
+# Endpoint local por allowlist exata, sem parser de URL: urlparse e o urllib3 do botocore discordam em casos como
+# `http://exemplo.com\@localhost/`, que um leria como local e o outro discaria para fora. Porta de 1 a 65535;
+# ASCII para o K de Kelvin não casar com `k` no IGNORECASE. A mesma regex em todo guard do repositório
+# (tests/contract/test_guards_de_endpoint.py).
+ENDPOINT_LOCAL = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost|localstack)"
+    r"(?::(?:6553[0-5]|655[0-2]\d|65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3}))?/?",
+    re.IGNORECASE | re.ASCII,
+)
 
 
-def cliente_aws(servico: str, config: Configuracao) -> Any:
+def cliente_aws(servico: str, config: Configuracao, opcoes: Config | None = None) -> Any:
     """Na AWS: credenciais do papel de execução. Com endpoint: SÓ local, credenciais fictícias explícitas
-    (o shell do operador exporta credenciais reais; nada aqui confia no ambiente)."""
-    opcoes = Config(retries={"mode": "standard"})
+    (o shell do operador exporta credenciais reais; nada aqui confia no ambiente). Todo cliente boto3 do
+    serviço nasce aqui, inclusive o do caminho quente, que soma os próprios timeouts em `opcoes` aos padrões:
+    retry standard e endpoint só o explícito (nunca `AWS_ENDPOINT_URL_<SERVIÇO>` nem o do `~/.aws/config`)."""
+    padrao = Config(retries={"mode": "standard"})
+    # A trava entra por último: nem `opcoes` a desliga. Os stubs do botocore não declaram o parâmetro
+    # (existe desde o 1.31).
+    trava = Config(ignore_configured_endpoint_urls=True)  # type: ignore[call-arg]
+    opcoes = (padrao if opcoes is None else padrao.merge(opcoes)).merge(trava)
     if config.endpoint_aws is None:
         return boto3.client(servico, region_name=config.regiao, config=opcoes)  # type: ignore[call-overload]
-    if urlparse(config.endpoint_aws).hostname not in HOSTS_LOCAIS:
+    if not ENDPOINT_LOCAL.fullmatch(config.endpoint_aws):
         raise ValueError(f"endpoint não é local: {config.endpoint_aws!r}")
     return boto3.client(  # type: ignore[call-overload]
         servico,
@@ -66,11 +80,10 @@ def configurar_log_da_guarda() -> None:
 
 def construir_app(config: Configuracao) -> FastAPI:
     configurar_log_da_guarda()
-    cliente = boto3.client(
+    cliente = cliente_aws(
         "dynamodb",
-        region_name=config.regiao,
-        endpoint_url=config.endpoint_aws,
-        config=Config(
+        config,
+        Config(
             max_pool_connections=64,
             retries={"mode": "standard", "max_attempts": 3},
             connect_timeout=1,

@@ -11,33 +11,45 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from collections.abc import Callable, Sequence
 from decimal import Decimal
 from typing import Any
-from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config
 
 from legado_mock.registro import RegistroLC, formatar
 
-HOSTS_LOCAIS = {"127.0.0.1", "localhost", "localstack"}
+# Endpoint local por allowlist exata, sem parser de URL: urlparse e o urllib3 do botocore discordam em casos como
+# `http://exemplo.com\@localhost/`, que um leria como local e o outro discaria para fora. Porta de 1 a 65535;
+# ASCII para o K de Kelvin não casar com `k` no IGNORECASE. A mesma regex em todo guard do repositório
+# (tests/contract/test_guards_de_endpoint.py).
+ENDPOINT_LOCAL = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost|localstack)"
+    r"(?::(?:6553[0-5]|655[0-2]\d|65[0-4]\d{2}|6[0-4]\d{3}|[1-5]\d{4}|[1-9]\d{0,3}))?/?",
+    re.IGNORECASE | re.ASCII,
+)
 FILA_PADRAO = "legado-contratos"
 CONTRATO_DE_DEMO = ("CTR-DEMO-0001", "0001-00000001-1", "01")
 
 
 def cliente_sqs() -> Any:
     endpoint = os.environ.get("AWS_ENDPOINT_URL") or "http://127.0.0.1:4566"
-    if urlparse(endpoint).hostname not in HOSTS_LOCAIS:
+    if not ENDPOINT_LOCAL.fullmatch(endpoint):
         sys.exit(f"recusado: endpoint não é local ({endpoint})")
+    opcoes = Config(  # type: ignore[call-arg]  # os stubs do botocore não declaram o parâmetro (existe desde o 1.31)
+        retries={"mode": "standard"},
+        ignore_configured_endpoint_urls=True,
+    )
     return boto3.client(
         "sqs",
         endpoint_url=endpoint,
         region_name="sa-east-1",
         aws_access_key_id="test",
         aws_secret_access_key="test",
-        config=Config(retries={"mode": "standard"}),
+        config=opcoes,
     )
 
 

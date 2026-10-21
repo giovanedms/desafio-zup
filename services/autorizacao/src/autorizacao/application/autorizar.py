@@ -17,6 +17,8 @@ mesma chave retoma depois do lease (até o PRAZO_DE_REAPLICACAO); sem retry, o r
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -48,6 +50,7 @@ from autorizacao.domain.idempotencia import (
 )
 from autorizacao.domain.pedido import PedidoDeAutorizacao, TipoOperacao
 
+_log = logging.getLogger(__name__)
 _MOTIVOS_DO_LIMITE = {m.value: m for m in MotivoRecusa}
 _ESTORNAVEIS = (TipoOperacao.RESERVA, TipoOperacao.DEBITO)
 _JA_ENCERRADAS = (
@@ -183,9 +186,18 @@ class AutorizarTransacao:
         if resultado.desfecho in (DesfechoNoLimite.APLICADA, DesfechoNoLimite.JA_APLICADA):
             aprovada = autorizacao.aprovar(resultado.saldos, agora, self.ids.novo_id(), original)
             return self._concluir(autorizacao, aprovada, _encerrar(autorizacao, original, agora))
-        # Motivo que este BC ainda não conhece (o limites evoluiu antes): recusa genérica, nunca 500.
-        motivo = _MOTIVOS_DO_LIMITE.get(resultado.motivo or "", MotivoRecusa.RECUSA_DO_LIMITE)
-        recusada = autorizacao.recusar(motivo, resultado.saldos, agora, self.ids.novo_id())
+        # Motivo que este BC ainda não conhece (o limites evoluiu antes): recusa genérica, nunca 500, e uma
+        # linha JSON com o valor cru (metric filter + alarme: a degradação não fica silenciosa).
+        motivo = _MOTIVOS_DO_LIMITE.get(resultado.motivo or "")
+        if motivo is None:
+            _log.warning(
+                json.dumps({"evento": "motivo_desconhecido_do_limite", "motivo": resultado.motivo})
+            )
+            motivo = MotivoRecusa.RECUSA_DO_LIMITE
+        # Conta que não é a titular: o canal não pode ver o saldo de um contrato alheio (nem no GET, que mostra
+        # os saldos gravados, nem no TransacaoRecusada). A recusa fica registrada sem saldos.
+        saldos = None if motivo is MotivoRecusa.CONTA_DIVERGENTE else resultado.saldos
+        recusada = autorizacao.recusar(motivo, saldos, agora, self.ids.novo_id())
         return self._concluir(autorizacao, recusada, None)
 
     def _marcar_estorno(self, original: Autorizacao, estorno: Autorizacao) -> MotivoRecusa | None:
@@ -243,11 +255,12 @@ def _encerrar(
 
 
 def _operacao_no_limite(autorizacao: Autorizacao, original: Autorizacao | None) -> OperacaoNoLimite:
-    """Traduz o pedido para a linguagem do BC Limites (Customer/Supplier)."""
-    valor, id_aut = autorizacao.valor, autorizacao.id_autorizacao
+    """Traduz o pedido para a linguagem do BC Limites (Customer/Supplier). Toda operação PEDIDA PELO CANAL leva o
+    `id_conta` declarado: o limite o confere contra a titular do contrato (BOLA na escrita)."""
+    valor, id_aut, conta = autorizacao.valor, autorizacao.id_autorizacao, autorizacao.id_conta
     match autorizacao.tipo:
         case TipoOperacao.RESERVA:
-            return OperacaoNoLimite(TipoNoLimite.RESERVAR, id_aut, valor)
+            return OperacaoNoLimite(TipoNoLimite.RESERVAR, id_aut, valor, id_conta=conta)
         case TipoOperacao.DEBITO if original is not None:
             # Captura: id PRÓPRIO (capturas diferentes do mesmo hold disputam; o limite decide quem leva).
             return OperacaoNoLimite(
@@ -256,17 +269,22 @@ def _operacao_no_limite(autorizacao: Autorizacao, original: Autorizacao | None) 
                 valor,
                 original.id_autorizacao,
                 valor_reservado=original.valor,
+                id_conta=conta,
             )
         case TipoOperacao.DEBITO:
-            return OperacaoNoLimite(TipoNoLimite.DEBITAR, id_aut, valor)
+            return OperacaoNoLimite(TipoNoLimite.DEBITAR, id_aut, valor, id_conta=conta)
         case TipoOperacao.CREDITO:
-            return OperacaoNoLimite(TipoNoLimite.CREDITAR, id_aut, valor)
+            return OperacaoNoLimite(TipoNoLimite.CREDITAR, id_aut, valor, id_conta=conta)
         case TipoOperacao.ESTORNO:
             assert original is not None
             # Id derivado da ORIGINAL: estornos concorrentes da mesma autorização viram UMA operação.
             id_estorno = id_operacao_de_estorno(original.id_autorizacao)
             if original.tipo is TipoOperacao.RESERVA:
                 return OperacaoNoLimite(
-                    TipoNoLimite.LIBERAR_RESERVA, id_estorno, valor, original.id_autorizacao
+                    TipoNoLimite.LIBERAR_RESERVA,
+                    id_estorno,
+                    valor,
+                    original.id_autorizacao,
+                    id_conta=conta,
                 )
-            return OperacaoNoLimite(TipoNoLimite.ESTORNAR_DEBITO, id_estorno, valor)
+            return OperacaoNoLimite(TipoNoLimite.ESTORNAR_DEBITO, id_estorno, valor, id_conta=conta)

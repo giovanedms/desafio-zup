@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -406,6 +408,7 @@ def test_captura_parcial_liquida_o_hold_e_marca_a_reserva(
         Decimal("250.00"),
         reserva.id_autorizacao,
         valor_reservado=Decimal("400.00"),
+        id_conta="0001-1",
     )
     autorizada, capturada = repositorio.outbox[-2:]
     assert isinstance(autorizada, TransacaoAutorizada)
@@ -572,3 +575,52 @@ def test_motivo_novo_do_limite_vira_recusa_generica_e_nao_500(
     recusada = caso_de_uso.executar(pedido(TipoOperacao.DEBITO), escopo("k"), CTX).autorizacao
 
     assert recusada.motivo_recusa is MotivoRecusa.RECUSA_DO_LIMITE
+
+
+def test_motivo_desconhecido_vira_linha_json_para_o_alarme(
+    caso_de_uso: AutorizarTransacao, limites: LimitesFalso, caplog: pytest.LogCaptureFixture
+) -> None:
+    def recusa_com_motivo_novo(id_contrato: str, operacao: OperacaoNoLimite) -> ResultadoNoLimite:
+        return ResultadoNoLimite(DesfechoNoLimite.RECUSADA, limites._saldos(), "MOTIVO_DO_FUTURO")
+
+    limites.aplicar = recusa_com_motivo_novo  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING, logger="autorizacao.application.autorizar"):
+        caso_de_uso.executar(pedido(TipoOperacao.DEBITO), escopo("k"), CTX)
+
+    (linha,) = [r.getMessage() for r in caplog.records if "motivo_desconhecido" in r.getMessage()]
+    assert json.loads(linha) == {
+        "evento": "motivo_desconhecido_do_limite",
+        "motivo": "MOTIVO_DO_FUTURO",
+    }
+
+
+def test_conta_divergente_e_mapeada_e_a_recusa_nao_guarda_saldos(
+    caso_de_uso: AutorizarTransacao, limites: LimitesFalso, caplog: pytest.LogCaptureFixture
+) -> None:
+    def conta_errada(id_contrato: str, operacao: OperacaoNoLimite) -> ResultadoNoLimite:
+        return ResultadoNoLimite(DesfechoNoLimite.RECUSADA, limites._saldos(), "CONTA_DIVERGENTE")
+
+    limites.aplicar = conta_errada  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING, logger="autorizacao.application.autorizar"):
+        recusada = caso_de_uso.executar(pedido(), escopo("k"), CTX).autorizacao
+
+    assert recusada.motivo_recusa is MotivoRecusa.CONTA_DIVERGENTE  # não o 422 genérico
+    assert recusada.saldos is None  # o canal não vê o saldo de um contrato que não é dele
+    assert "motivo_desconhecido" not in caplog.text
+
+
+def test_operacoes_do_canal_levam_o_id_conta(
+    caso_de_uso: AutorizarTransacao, limites: LimitesFalso
+) -> None:
+    reserva = caso_de_uso.executar(pedido(), escopo("k-r"), CTX).autorizacao
+    caso_de_uso.executar(pedido(TipoOperacao.DEBITO), escopo("k-d"), CTX)
+    caso_de_uso.executar(pedido(TipoOperacao.CREDITO), escopo("k-c"), CTX)
+    caso_de_uso.executar(
+        pedido(TipoOperacao.ESTORNO, id_autorizacao_original=reserva.id_autorizacao),
+        escopo("k-e"),
+        CTX,
+    )
+
+    assert [op.id_conta for op in limites.chamadas] == ["0001-1"] * 4

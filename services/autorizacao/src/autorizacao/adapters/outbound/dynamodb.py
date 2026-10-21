@@ -2,9 +2,11 @@
 
 Tabelas:
   - `autorizacoes`: um item `AUT#<id>` por autorização (o id é determinístico: é também o registro
-    de idempotência). TTL de retenção quente (30 dias); a trilha de 10 anos vem dos eventos (S3).
+    de idempotência). TTL de retenção quente (30 dias). A trilha de 10 anos é desenho (ADR-0017); no
+    sandbox o durável é o archive de 30 dias do barramento.
   - `autorizacoes-outbox`: um item `OUTBOX#<id_evento>` por evento pendente. O relay publica no
-    EventBridge e APAGA o item; por isso a tabela fica pequena e o sweeper pode varrê-la barato.
+    EventBridge e APAGA o item; por isso a tabela fica pequena e o sweeper pode varrê-la barato. O item NÃO
+    tem TTL: um evento não publicado sai do outbox publicado, nunca por idade.
 
 GSI esparso `gsi_orfas` (ADR-0006): só itens EM_PROCESSAMENTO carregam `orfa_shard` (EP#0..EP#N-1, hash do id)
 e `orfa_lease_ms`; concluir substitui o item (Put) e os atributos somem, tirando-o do índice. O reconciliador
@@ -33,13 +35,18 @@ sem migrar.
 Aqui TransactWriteItems é a escolha certa (diferente do item quente de Limite): os itens tocados são
 desta autorização (e da original, no estorno) — não há contenção — e o estado final precisa sair
 junto com os eventos (sem dual-write). `ClientRequestToken` torna o commit incerto idempotente (10 min).
+
+Falhas transitórias (estrangulamento, timeout, conflito com outra transação), depois dos retries do SDK, viram
+`ArmazenamentoIndisponivel` → 503 com Retry-After: repetir com a mesma Idempotency-Key é seguro. O cancelamento
+de uma transação é classificado por (índice do item, código), nunca pela posição de um único motivo.
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -47,9 +54,20 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 
 from autorizacao.adapters.outbound.cloudevents import nome_curto, para_cloudevent, serializar
-from autorizacao.application.portas import LeasePerdido, OriginalJaEncerrada
+from autorizacao.application.portas import (
+    ArmazenamentoIndisponivel,
+    LeasePerdido,
+    OriginalJaEncerrada,
+)
 from autorizacao.domain.autorizacao import (
     EM_CURSO,
     Autorizacao,
@@ -72,7 +90,23 @@ SHARDS_DE_ORFAS = (
 )
 SHARDS_DE_VENCIMENTOS = 64
 RETENCAO_QUENTE = timedelta(days=30)
-RETENCAO_DO_OUTBOX = timedelta(days=7)  # rede de segurança; o normal é o relay apagar em segundos
+# Falhas em que o SDK já esgotou os retries e repetir mais tarde é seguro → 503, não 500 (como no `limites`).
+_CODIGOS_TRANSITORIOS = frozenset(
+    {
+        "ProvisionedThroughputExceededException",
+        "ThrottlingException",
+        "RequestLimitExceeded",
+        "InternalServerError",
+        "ServiceUnavailable",
+        "TransactionConflictException",  # escrita simples num item que está numa transação em curso
+        "TransactionInProgressException",  # mesmo ClientRequestToken ainda em execução
+    }
+)
+# Motivos de cancelamento de TransactWriteItems que não dizem nada sobre o estado: outra transação no mesmo
+# item ou estrangulamento. Repetir é seguro (o token torna o mesmo pedido idempotente).
+_CANCELAMENTOS_TRANSITORIOS = frozenset(
+    {"TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded"}
+)
 _serializar = TypeSerializer().serialize
 _desserializar = TypeDeserializer().deserialize
 
@@ -129,6 +163,49 @@ def chave(id_autorizacao: str) -> dict[str, Any]:
     return {"pk": {"S": f"AUT#{id_autorizacao}"}}
 
 
+def _falhas_transitorias[**P, T](metodo: Callable[P, T]) -> Callable[P, T]:
+    """Estrangulamento, timeout e conflito que escapam do método viram `ArmazenamentoIndisponivel`; o resto
+    (inclusive o que o próprio método já classificou) passa intacto."""
+
+    @functools.wraps(metodo)
+    def envolvido(*args: P.args, **kwargs: P.kwargs) -> T:
+        try:
+            return metodo(*args, **kwargs)
+        except ClientError as erro:
+            if erro.response.get("Error", {}).get("Code") in _CODIGOS_TRANSITORIOS:
+                raise ArmazenamentoIndisponivel(metodo.__name__) from erro
+            raise
+        except (
+            ConnectTimeoutError,
+            ReadTimeoutError,
+            EndpointConnectionError,
+            ConnectionClosedError,
+        ) as erro:
+            raise ArmazenamentoIndisponivel(metodo.__name__) from erro
+
+    return envolvido
+
+
+def _cancelamento(
+    erro: ClientError, alvo: str, condicoes: Mapping[int, Exception]
+) -> Exception | None:
+    """Classifica um TransactionCanceledException por (índice do item, código).
+
+    `condicoes` liga o índice de um item à exceção de domínio da condição dele (na ordem de prioridade).
+    ConditionalCheckFailed num desses itens → a exceção dele; conflito ou estrangulamento em qualquer item →
+    `ArmazenamentoIndisponivel`; o resto (ex.: id de evento repetido no outbox, ValidationError) → None, e o
+    chamador relança o erro original: é defeito, não estado a tratar.
+    """
+    resposta = cast("Mapping[str, Any]", erro.response)
+    motivos = [str(m.get("Code") or "None") for m in resposta.get("CancellationReasons", [])]
+    for indice, excecao in condicoes.items():
+        if indice < len(motivos) and motivos[indice] == "ConditionalCheckFailed":
+            return excecao
+    if _CANCELAMENTOS_TRANSITORIOS.intersection(motivos):
+        return ArmazenamentoIndisponivel(alvo)
+    return None
+
+
 class RepositorioDeAutorizacoesDynamoDB:
     def __init__(
         self,
@@ -144,12 +221,14 @@ class RepositorioDeAutorizacoesDynamoDB:
         self._outbox = tabela_outbox
         self._orfas, self._vencimentos = _indices(shards_de_orfas, shards_de_vencimentos)
 
+    @_falhas_transitorias
     def obter(self, id_autorizacao: str) -> Autorizacao | None:
         item = self._cliente.get_item(
             TableName=self._tabela, Key=chave(id_autorizacao), ConsistentRead=True
         ).get("Item")
         return _de_item(item) if item else None
 
+    @_falhas_transitorias
     def registrar(self, autorizacao: Autorizacao) -> Autorizacao | None:
         try:
             self._cliente.put_item(
@@ -166,6 +245,7 @@ class RepositorioDeAutorizacoesDynamoDB:
                 raise
             return existente
 
+    @_falhas_transitorias
     def assumir(self, autorizacao: Autorizacao, lease_anterior: datetime) -> bool:
         try:
             self._cliente.update_item(
@@ -190,6 +270,7 @@ class RepositorioDeAutorizacoesDynamoDB:
         except self._cliente.exceptions.ConditionalCheckFailedException:
             return False
 
+    @_falhas_transitorias
     def regravar(self, autorizacao: Autorizacao, lease_anterior: datetime) -> bool:
         try:
             self._cliente.put_item(
@@ -206,6 +287,7 @@ class RepositorioDeAutorizacoesDynamoDB:
         except self._cliente.exceptions.ConditionalCheckFailedException:
             return False
 
+    @_falhas_transitorias
     def encaminhar_reserva(self, encaminhada: Autorizacao) -> None:
         assert encaminhada.motivo_da_reconciliacao is not None  # garantido pelo agregado
         itens: list[Any] = [
@@ -239,11 +321,17 @@ class RepositorioDeAutorizacoesDynamoDB:
         try:
             self._transacionar(itens)
         except self._cliente.exceptions.TransactionCanceledException as erro:
-            motivos = [m.get("Code") for m in erro.response.get("CancellationReasons", [])]
-            if motivos and motivos[0] == "ConditionalCheckFailed":
-                raise OriginalJaEncerrada(encaminhada.id_autorizacao) from erro
-            raise
+            # Item 0: a reserva (ainda APROVADA?). Os demais: outbox.
+            classificada = _cancelamento(
+                erro,
+                encaminhada.id_autorizacao,
+                {0: OriginalJaEncerrada(encaminhada.id_autorizacao)},
+            )
+            if classificada is None:
+                raise
+            raise classificada from erro
 
+    @_falhas_transitorias
     def marcar_estorno(
         self, id_original: str, id_estorno: str, substituir: str | None = None
     ) -> str | None:
@@ -272,6 +360,7 @@ class RepositorioDeAutorizacoesDynamoDB:
                 return ""
             return str(antigo.get("estorno_em_curso", {}).get("S", ""))
 
+    @_falhas_transitorias
     def listar_orfas(self, lease_vencido_antes_de: datetime, limite: int) -> list[Autorizacao]:
         """EM_PROCESSAMENTO com lease vencido antes do instante dado, mais antigas primeiro.
 
@@ -281,6 +370,7 @@ class RepositorioDeAutorizacoesDynamoDB:
         orfas = self._consultar_shards(self._orfas, lease_vencido_antes_de, limite)
         return sorted(orfas, key=lambda a: a.lease_ate)[:limite]
 
+    @_falhas_transitorias
     def listar_reservas_vencidas(
         self, vencidas_antes_de: datetime, limite: int
     ) -> list[Autorizacao]:
@@ -316,6 +406,7 @@ class RepositorioDeAutorizacoesDynamoDB:
                 argumentos["ExclusiveStartKey"] = ultima
         return encontradas
 
+    @_falhas_transitorias
     def registrar_expiracao(self, expirada: Autorizacao) -> None:
         itens: list[Any] = [
             _encerrar_original(self._tabela, expirada),
@@ -324,10 +415,13 @@ class RepositorioDeAutorizacoesDynamoDB:
         try:
             self._transacionar(itens)
         except self._cliente.exceptions.TransactionCanceledException as erro:
-            motivos = [m.get("Code") for m in erro.response.get("CancellationReasons", [])]
-            if motivos and motivos[0] == "ConditionalCheckFailed":
-                raise OriginalJaEncerrada(expirada.id_autorizacao) from erro
-            raise
+            # Item 0: a reserva (ainda APROVADA?). Os demais: outbox.
+            classificada = _cancelamento(
+                erro, expirada.id_autorizacao, {0: OriginalJaEncerrada(expirada.id_autorizacao)}
+            )
+            if classificada is None:
+                raise
+            raise classificada from erro
 
     def _item(self, autorizacao: Autorizacao) -> dict[str, Any]:
         return _para_item(autorizacao, self._orfas.shards, self._vencimentos.shards)
@@ -348,6 +442,7 @@ class RepositorioDeAutorizacoesDynamoDB:
         token = hashlib.sha256(json.dumps(itens, sort_keys=True).encode()).hexdigest()[:36]
         self._cliente.transact_write_items(TransactItems=itens, ClientRequestToken=token)
 
+    @_falhas_transitorias
     def concluir(self, autorizacao: Autorizacao, original_encerrada: Autorizacao | None) -> None:
         itens: list[Any] = [
             {
@@ -369,16 +464,15 @@ class RepositorioDeAutorizacoesDynamoDB:
         try:
             self._transacionar(itens)
         except self._cliente.exceptions.TransactionCanceledException as erro:
-            motivos = [m.get("Code") for m in erro.response.get("CancellationReasons", [])]
-            if motivos and motivos[0] == "ConditionalCheckFailed":
-                raise LeasePerdido(autorizacao.id_autorizacao) from erro
-            if (
-                original_encerrada is not None
-                and len(motivos) > 1
-                and motivos[1] == "ConditionalCheckFailed"
-            ):
-                raise OriginalJaEncerrada(original_encerrada.id_autorizacao) from erro
-            raise
+            # Item 0: esta autorização (dono do lease). Item 1, se houver original: ela (ainda APROVADA?).
+            # Os demais: outbox.
+            condicoes: dict[int, Exception] = {0: LeasePerdido(autorizacao.id_autorizacao)}
+            if original_encerrada is not None:
+                condicoes[1] = OriginalJaEncerrada(original_encerrada.id_autorizacao)
+            classificada = _cancelamento(erro, autorizacao.id_autorizacao, condicoes)
+            if classificada is None:
+                raise
+            raise classificada from erro
 
 
 def _encerrar_original(tabela: str, original: Autorizacao) -> dict[str, Any]:
@@ -462,7 +556,6 @@ def _item_do_outbox(evento: EventoDeDominio) -> dict[str, Any]:
         "cloudevent": serializar(para_cloudevent(evento)),
         "id_contrato": evento.id_contrato,
         "criado_em_ms": _ms(evento.ocorrido_em),
-        "ttl": int((evento.ocorrido_em + RETENCAO_DO_OUTBOX).timestamp()),
     }
     return {k: _serializar(v) for k, v in bruto.items()}
 
@@ -523,7 +616,7 @@ def _para_item(
         "venc_ms": _ms(a.expira_em) if a.reserva_pendente and a.expira_em else None,
         "correlation_id": a.correlation_id,
         "traceparent": a.traceparent,
-        # Na fila humana não há TTL: o caso fica até alguém resolver (e o evento é a trilha de 10 anos).
+        # Na fila humana não há TTL: o caso fica até alguém resolver (o evento vai para o archive do barramento).
         "ttl": None if na_fila_humana else int((a.criada_em + RETENCAO_QUENTE).timestamp()),
     }
     return {k: _serializar(v) for k, v in bruto.items() if v is not None}

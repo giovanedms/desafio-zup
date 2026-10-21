@@ -3,7 +3,9 @@
 Contrato: contracts/events/*.v1.schema.json (verificado por teste de contrato).
 - `id` = id_evento gerado no outbox: estável entre reentregas (o `id` do envelope do EventBridge muda).
 - `type` com major (`.v1`), `dataschema` com a versão completa, `subject`/`partitionkey` = id_contrato.
-- Extensões: `traceparent` (W3C), `correlationid` (nome de atributo CE não aceita `_`).
+- Extensões: `traceparent` (W3C), `correlationid` (nome de atributo CE não aceita `_`). O traceparent gravado
+  é revalidado aqui (defesa em profundidade: itens antigos podem guardar o header cru do cliente); fora do
+  formato W3C, o evento sai sem `traceparent` e sem `trace_id`, nunca com lixo dentro do contrato.
 - Os campos do enunciado (event_id, event_type, event_version, occurred_at, correlation_id, trace_id)
   são espelhados em `data` para aderir literalmente ao contrato pedido.
 Dinheiro sai como número JSON exato (simplejson + Decimal), nunca float.
@@ -16,6 +18,7 @@ from decimal import Decimal
 from typing import Any
 
 import simplejson
+from plataforma.observabilidade import trace_id_de, traceparent_valido
 
 from autorizacao.domain.eventos import (
     EventoDeDominio,
@@ -52,7 +55,8 @@ def para_cloudevent(evento: EventoDeDominio) -> dict[str, Any]:
     instante = (
         evento.ocorrido_em.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     )
-    trace_id = evento.traceparent.split("-")[1] if evento.traceparent else None
+    traceparent = traceparent_valido(evento.traceparent)
+    trace_id = trace_id_de(traceparent)
     data: dict[str, Any] = {
         "event_id": evento.id_evento,
         "event_type": nome,
@@ -76,8 +80,8 @@ def para_cloudevent(evento: EventoDeDominio) -> dict[str, Any]:
         "partitionkey": evento.id_contrato,
         "data": data,
     }
-    if evento.traceparent:
-        envelope["traceparent"] = evento.traceparent
+    if traceparent:
+        envelope["traceparent"] = traceparent
     return envelope
 
 
@@ -118,6 +122,7 @@ def _dados_do_negocio(evento: EventoDeDominio) -> dict[str, Any]:
                     "id_conta": evento.id_conta,
                     "id_estabelecimento": evento.id_estabelecimento,
                     "id_autorizacao_original": evento.id_autorizacao_original,
+                    "canal": evento.canal,
                     **_saldos(evento.saldos),
                 }
             )
@@ -130,6 +135,7 @@ def _dados_do_negocio(evento: EventoDeDominio) -> dict[str, Any]:
                 "moeda": evento.moeda,
                 "id_conta": evento.id_conta,
                 "id_estabelecimento": evento.id_estabelecimento,
+                "canal": evento.canal,
             }
             if evento.saldos is not None:
                 dados["limite_disponivel"] = evento.saldos.limite_disponivel

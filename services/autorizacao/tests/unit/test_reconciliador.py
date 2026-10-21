@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,7 @@ from autorizacao.application.expirar import (
     ResultadoDaExpiracao,
 )
 from autorizacao.application.portas import (
+    ArmazenamentoIndisponivel,
     ConflitoDeEstado,
     ContratoInexistente,
     DesfechoNoLimite,
@@ -84,11 +86,13 @@ class LimiteFalso:
     fora: bool = False
     fora_para: set[TipoNoLimite] = field(default_factory=set)  # falha só nestes tipos
     chamadas: int = 0  # escritas (aplicar)
+    operacoes: list[OperacaoNoLimite] = field(default_factory=list)  # o que foi pedido, na ordem
     consultas: int = 0  # leituras (consultar_operacao)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def aplicar(self, id_contrato: str, op: OperacaoNoLimite) -> ResultadoNoLimite:
         self.chamadas += 1
+        self.operacoes.append(op)
         if self.fora or op.tipo in self.fora_para:
             raise LimitesIndisponivel("fora")
         if id_contrato != "CTR-1":
@@ -362,8 +366,8 @@ def test_expirador_que_cai_no_meio_repete_a_mesma_liberacao(ambiente: tuple) -> 
         raise RuntimeError("processo morreu depois de liberar no limite")
 
     repo.registrar_expiracao = morre  # type: ignore[method-assign]
-    with pytest.raises(RuntimeError):
-        _expirador(ambiente).executar()
+    # Falha inesperada no item não derruba o lote: conta como FALHOU e volta na próxima rodada.
+    assert _expirador(ambiente).executar() == {ResultadoDaExpiracao.FALHOU: 1}
     repo.registrar_expiracao = registrar  # type: ignore[method-assign]
 
     assert _expirador(ambiente).executar() == {ResultadoDaExpiracao.EXPIRADA: 1}
@@ -626,8 +630,7 @@ def test_reversao_de_reserva_ja_liberada_conclui(ambiente: tuple) -> None:  # ty
     relogio.instante += DEPOIS_DA_GRACA
     concluir = repo.concluir
     repo.concluir = lambda *_: (_ for _ in ()).throw(RuntimeError("morreu"))  # type: ignore[method-assign]
-    with pytest.raises(RuntimeError):
-        reconciliador.executar()
+    assert reconciliador.executar() == {ResultadoDaReconciliacao.FALHOU: 1}
     repo.concluir = concluir  # type: ignore[method-assign]
     limite.esquecer_guarda()  # a guarda já esqueceu o id da reversão
     relogio.instante += DEPOIS_DA_GRACA
@@ -697,3 +700,109 @@ def test_reserva_em_reconciliacao_manual_nao_e_estornada_nem_capturada(ambiente:
         autorizar.executar(
             pedido(TipoOperacao.ESTORNO, "400.00", original=id_reserva), estorno, Contexto("c")
         )
+
+
+# --- painel 6: uma órfã/reserva envenenada não para o lote; operações automáticas sem id_conta ----------
+
+
+def _orfa_direta(repo: RepositorioDeAutorizacoesEmMemoria, id_autorizacao: str) -> None:
+    """Órfã de RESERVA que nunca chegou ao limite (processo morreu logo depois de registrar)."""
+    repo.registrar(
+        Autorizacao.iniciar(
+            pedido(TipoOperacao.RESERVA),
+            id_autorizacao=id_autorizacao,
+            impressao_digital="imp",
+            client_id="canal",
+            agora=INICIO,
+            correlation_id="corr",
+            traceparent=None,
+        )
+    )
+
+
+def test_orfa_envenenada_conta_como_falhou_e_as_outras_seguem(
+    ambiente: tuple,  # type: ignore[type-arg]
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repo, limite, relogio, _, reconciliador = ambiente
+    _orfa_direta(repo, "aut-envenenada")
+    _orfa_direta(repo, "aut-sadia")
+    relogio.instante += DEPOIS_DA_GRACA
+    consultar = limite.consultar_operacao
+
+    def envenenada(id_contrato: str, id_operacao: str) -> EstadoNoLimite:
+        if id_operacao == "aut-envenenada":
+            raise IndexError("list index out of range")  # o que o traceparent "X" fazia
+        return consultar(id_contrato, id_operacao)
+
+    limite.consultar_operacao = envenenada  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.ERROR, logger="autorizacao.application.reconciliar"):
+        contagem = reconciliador.executar()
+
+    assert contagem == {ResultadoDaReconciliacao.FALHOU: 1, ResultadoDaReconciliacao.COMPENSADA: 1}
+    assert "aut-envenenada" in caplog.text
+    sadia = repo.obter("aut-sadia")
+    assert sadia is not None and sadia.status is StatusAutorizacao.COMPENSADA
+
+
+def test_banco_indisponivel_na_orfa_e_falhou_sem_traceback(
+    ambiente: tuple,  # type: ignore[type-arg]
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repo, _, relogio, _, reconciliador = ambiente
+    _orfa_direta(repo, "aut-1")
+    relogio.instante += DEPOIS_DA_GRACA
+
+    def estrangulado(*_: object) -> bool:
+        raise ArmazenamentoIndisponivel("regravar")
+
+    repo.regravar = estrangulado  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.ERROR, logger="autorizacao.application.reconciliar"):
+        assert reconciliador.executar() == {ResultadoDaReconciliacao.FALHOU: 1}
+    assert caplog.records == []  # falha esperada: entra na contagem FALHOU, não no log de erro
+
+
+def test_reserva_envenenada_conta_como_falhou_e_as_outras_expiram(
+    ambiente: tuple,  # type: ignore[type-arg]
+) -> None:
+    repo, _, relogio, autorizar, _ = ambiente
+    envenenada = _reserva_aprovada(ambiente, "100.00")
+    outra = EscopoDeIdempotencia("canal", "POST", "/v1/contratos/CTR-1/autorizacoes", "k-2")
+    autorizar.executar(pedido(TipoOperacao.RESERVA, "200.00"), outra, Contexto("corr"))
+    relogio.instante = INICIO + VALIDADE_DA_RESERVA + timedelta(seconds=1)
+    registrar = repo.registrar_expiracao
+
+    def morre_so_numa(expirada: Autorizacao) -> None:
+        if expirada.id_autorizacao == envenenada:
+            raise RuntimeError("item envenenado")
+        registrar(expirada)
+
+    repo.registrar_expiracao = morre_so_numa  # type: ignore[method-assign]
+
+    assert _expirador(ambiente).executar() == {
+        ResultadoDaExpiracao.FALHOU: 1,
+        ResultadoDaExpiracao.EXPIRADA: 1,
+    }
+
+
+def test_compensacao_e_expiracao_nao_levam_id_conta(ambiente: tuple) -> None:  # type: ignore[type-arg]
+    """Só o pedido do canal leva a conta ao limite: desfazer/expirar não pode ser barrado por uma conta que
+    mudou depois (portabilidade), senão o hold fica preso."""
+    repo, limite, relogio, autorizar, reconciliador = ambiente
+    orfa(repo, autorizar, TipoOperacao.RESERVA, chegou_no_limite=True)
+    relogio.instante += DEPOIS_DA_GRACA
+    assert reconciliador.executar() == {ResultadoDaReconciliacao.COMPENSADA: 1}
+    outra = EscopoDeIdempotencia("canal", "POST", "/v1/contratos/CTR-1/autorizacoes", "k-2")
+    autorizar.executar(pedido(TipoOperacao.RESERVA, "100.00"), outra, Contexto("corr"))
+    relogio.instante += VALIDADE_DA_RESERVA + timedelta(seconds=1)
+    assert _expirador(ambiente).executar() == {ResultadoDaExpiracao.EXPIRADA: 1}
+
+    contas = [(op.tipo, op.id_conta) for op in limite.operacoes]
+    assert contas == [
+        (TipoNoLimite.RESERVAR, "0001-1"),  # canal
+        (TipoNoLimite.LIBERAR_RESERVA, None),  # compensação
+        (TipoNoLimite.RESERVAR, "0001-1"),  # canal
+        (TipoNoLimite.LIBERAR_RESERVA, None),  # expiração
+    ]

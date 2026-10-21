@@ -47,6 +47,12 @@ class LimitesIndisponivel(Exception):
     """Timeout, circuit breaker aberto ou erro 5xx no BC Limites → 503 (retomável pela mesma chave)."""
 
 
+class ArmazenamentoIndisponivel(Exception):
+    """O DynamoDB da autorização estrangulou, não respondeu ou cancelou a transação por conflito, depois dos
+    retries do SDK → 503 com Retry-After. Repetir com a mesma Idempotency-Key é seguro: o id é determinístico,
+    toda escrita é condicional e o commit incerto do TransactWriteItems é idempotente pelo ClientRequestToken."""
+
+
 class LeasePerdido(Exception):
     """Outra execução assumiu (ou o reconciliador compensou) antes desta concluir."""
 
@@ -74,6 +80,10 @@ class OperacaoNoLimite:
     valor: Decimal
     id_reserva: str | None = None
     valor_reservado: Decimal | None = None  # só na captura: o limite confere contra o hold gravado
+    # Conta declarada pelo canal: o limite confere contra a titular do contrato (≠ → CONTA_DIVERGENTE). Só nas
+    # operações pedidas pelo canal; as automáticas (expiração, compensação) não levam: com a portabilidade a conta
+    # da réplica muda, e uma liberação com a conta antiga seria recusada e prenderia o hold.
+    id_conta: str | None = None
 
 
 class DesfechoNoLimite(StrEnum):

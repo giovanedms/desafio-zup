@@ -12,16 +12,20 @@ reserva original, em segundos. Se a reserva continua APROVADA e sem hold 10 min 
 vencedor não vai aparecer (expiração interrompida por mais que a guarda, ou captura/estorno em reconciliação
 manual): a reserva passa a RECONCILIACAO_MANUAL (sai do índice de vencimentos, entra na fila humana, com
 evento), em vez de sangrar uma chamada ao limite a cada rodada.
+
+Como no reconciliador, uma reserva que falha de forma inesperada conta como FALHOU (id no log) e o lote segue.
 """
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
 
 from autorizacao.application.portas import (
+    ArmazenamentoIndisponivel,
     ContratoInexistente,
     DesfechoNoLimite,
     ExpiracaoDeReservas,
@@ -36,6 +40,8 @@ from autorizacao.application.portas import (
 from autorizacao.domain.autorizacao import Autorizacao
 from autorizacao.domain.idempotencia import id_operacao_de_expiracao
 
+_log = logging.getLogger(__name__)
+
 # Disputa normal pelo hold se resolve em segundos; o vencedor mais lento (captura/estorno órfão) se resolve
 # em até ~4 min (prazo de reaplicação) ou vai para a fila humana. 10 min sem vencedor é anomalia.
 TOLERANCIA_DA_DISPUTA = timedelta(minutes=10)
@@ -46,7 +52,7 @@ class ResultadoDaExpiracao(StrEnum):
     PERDEU_O_HOLD = "PERDEU_O_HOLD"  # captura/estorno levou o hold antes (normal em corrida)
     ENCAMINHADA = "ENCAMINHADA"  # sem hold e sem vencedor há mais que a tolerância: fila humana
     IGNORADA = "IGNORADA"  # índice atrasado, ainda não venceu, ou outro expirador gravou primeiro
-    FALHOU = "FALHOU"  # Limites fora, contrato sumiu ou hold divergente: volta na próxima rodada + alarme
+    FALHOU = "FALHOU"  # Limites/banco fora, contrato sumiu, hold divergente ou falha inesperada: + alarme
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +65,17 @@ class ExpirarReservas:
     def executar(self, limite: int = 100) -> Counter[ResultadoDaExpiracao]:
         contagem: Counter[ResultadoDaExpiracao] = Counter()
         for reserva in self.repositorio.listar_reservas_vencidas(self.relogio.agora(), limite):
-            contagem[self.expirar(reserva)] += 1
+            try:
+                resultado = self.expirar(reserva)
+            except ArmazenamentoIndisponivel:
+                resultado = ResultadoDaExpiracao.FALHOU
+            except Exception:
+                _log.exception(
+                    "reserva %s: falha inesperada; fica para a próxima rodada",
+                    reserva.id_autorizacao,
+                )
+                resultado = ResultadoDaExpiracao.FALHOU
+            contagem[resultado] += 1
         return contagem
 
     def expirar(self, reserva: Autorizacao) -> ResultadoDaExpiracao:
@@ -71,7 +87,7 @@ class ExpirarReservas:
             id_operacao_de_expiracao(reserva.id_autorizacao),
             reserva.valor,
             reserva.id_autorizacao,
-        )
+        )  # sem id_conta: a conta pode ter mudado em 7 dias (portabilidade) e o hold não pode ficar preso
         try:
             resultado = self.limites.aplicar(reserva.id_contrato, liberacao)
         except (LimitesIndisponivel, ContratoInexistente):

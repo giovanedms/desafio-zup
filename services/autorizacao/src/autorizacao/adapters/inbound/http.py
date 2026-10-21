@@ -11,8 +11,12 @@ Dinheiro sem float: o corpo é lido cru e parseado com `parse_float=Decimal`; a 
 `RespostaJsonExata` (Decimal como número JSON). Chamadas ao caso de uso são bloqueantes (boto3/httpx)
 e vão para o threadpool.
 
-Replay: o corpo da aprovação é montado SÓ com campos gravados na autorização (inclusive o
-correlation_id original), então o replay é idêntico byte a byte ao da primeira resposta.
+Replay: o corpo da decisão (aprovação ou recusa) é montado SÓ com campos gravados na autorização (inclusive o
+correlation_id e o trace_id da execução original), então o replay é idêntico byte a byte ao da primeira
+resposta; o header X-Correlation-Id é sempre o desta requisição.
+
+Headers do cliente só entram em log, contexto, evento ou chamada a outro serviço depois de validados por
+formato (X-Correlation-Id, traceparent, X-Gateway-Request-Id, X-Client-Id): valor hostil é ignorado ou recusado.
 """
 
 from __future__ import annotations
@@ -30,17 +34,26 @@ from uuid import UUID, uuid4
 
 import simplejson
 from fastapi import FastAPI, Path, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
-from plataforma.observabilidade import contexto_de_log, definir_contexto, limpar_contexto
+from plataforma.observabilidade import (
+    contexto_de_log,
+    definir_contexto,
+    limpar_contexto,
+    trace_id_de,
+    traceparent_valido,
+)
 from plataforma.problemas import MEDIA_TYPE, Problema
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import JSONResponse, Response
 
 from autorizacao.application.autorizar import AutorizarTransacao, Contexto, Desfecho
 from autorizacao.application.consultar import AutorizacaoNaoEncontrada, ConsultarAutorizacao
 from autorizacao.application.portas import (
+    ArmazenamentoIndisponivel,
     AutorizacaoOriginalInvalida,
     ChaveReutilizada,
     ConflitoDeEstado,
@@ -57,14 +70,20 @@ from autorizacao.domain.pedido import PedidoDeAutorizacao, PedidoInvalido, TipoO
 _log = logging.getLogger(__name__)
 
 _DUAS_CASAS = Decimal("0.01")
-_TRACEPARENT = re.compile(r"^[0-9a-f]{2}-(?P<trace_id>[0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
 _ID_FORMA_LIVRE = r"^[A-Za-z0-9._:-]+$"
 _UUID_REGEX = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 # `$context.requestId` que o API Gateway injeta em X-Gateway-Request-Id (junção borda × serviço). Valor
 # fora deste formato é ignorado, como o X-Correlation-Id (proteção contra log injection).
 _GATEWAY_REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+# Identidade do canal: na AWS, o client_id do token Cognito (alfanumérico) que o gateway injeta. Vira escopo
+# de idempotência e é gravado no item: fora deste formato, 401 (nunca persistido nem logado).
+_CLIENT_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# Teto de `erros[]` no 422: um corpo com milhares de campos extras não pode virar resposta maior que ele.
+MAX_ERROS_POR_PROBLEMA = 20
 
 IdContrato = Annotated[str, Path(pattern=r"^[A-Za-z0-9-]{1,20}$")]  # NUM-CONTRATO do legado (ACL)
+# `format: uuid` do contrato: sem o pattern, um id de 2 KB chegava à chave do DynamoDB e virava 500.
+IdAutorizacao = Annotated[str, Path(pattern=_UUID_REGEX)]
 
 # codigo -> (slug do `type`, title, status HTTP); espelha contracts/problem-types/catalogo.md.
 _PROBLEMAS: Mapping[str, tuple[str, str, int]] = {
@@ -80,6 +99,8 @@ _PROBLEMAS: Mapping[str, tuple[str, str, int]] = {
     ),
     "REQUISICAO_EM_ANDAMENTO": ("requisicao-em-andamento", "Requisição em andamento", 409),
     "CONFLITO_DE_ESTADO": ("conflito-de-estado", "Conflito de estado", 409),
+    "RECURSO_NAO_ENCONTRADO": ("recurso-nao-encontrado", "Recurso não encontrado", 404),
+    "METODO_NAO_PERMITIDO": ("metodo-nao-permitido", "Método não permitido", 405),
     "TIPO_DE_MIDIA_NAO_SUPORTADO": (
         "tipo-de-midia-nao-suportado",
         "Tipo de mídia não suportado",
@@ -92,7 +113,8 @@ _PROBLEMAS: Mapping[str, tuple[str, str, int]] = {
         422,
     ),
     "CONTRATO_INATIVO": ("contrato-inativo", "Contrato inativo", 422),
-    "CREDITO_EXCEDE_UTILIZADO": ("credito-excede-utilizado", "Crédito excede o utilizado", 422),
+    "CREDITO_EXCEDE_UTILIZADO": ("credito-excede-utilizado", "Devolução excede o utilizado", 422),
+    "CONTA_DIVERGENTE": ("conta-divergente", "Conta divergente", 422),
     "AUTORIZACAO_ORIGINAL_INVALIDA": (
         "autorizacao-original-invalida",
         "Autorização original inválida",
@@ -113,12 +135,19 @@ _CODIGO_DA_RECUSA: Mapping[MotivoRecusa, str] = {
     MotivoRecusa.RESERVA_NAO_ENCONTRADA: "CONFLITO_DE_ESTADO",
     MotivoRecusa.ESTORNO_EM_ANDAMENTO: "CONFLITO_DE_ESTADO",
     MotivoRecusa.RECUSA_DO_LIMITE: "VALIDACAO_DE_DOMINIO",
+    MotivoRecusa.CONTA_DIVERGENTE: "CONTA_DIVERGENTE",
 }
+# Só se um motivo novo escapar do mapa (há teste de exaustividade): recusa genérica, nunca KeyError/500.
+_CODIGO_DE_RECUSA_DESCONHECIDA = "VALIDACAO_DE_DOMINIO"
 
 _DETALHE_DA_RECUSA: Mapping[str, str] = {
     "LIMITE_INSUFICIENTE": "O limite disponível do contrato não cobre o valor solicitado.",
     "CONTRATO_INATIVO": "O contrato não está ativo.",
-    "CREDITO_EXCEDE_UTILIZADO": "O crédito é maior que o limite utilizado.",
+    "CREDITO_EXCEDE_UTILIZADO": (
+        "O valor a devolver (CREDITO ou ESTORNO de débito) é maior que o utilizado; "
+        "o modelo não tem saldo credor."
+    ),
+    "CONTA_DIVERGENTE": "A conta informada não é a titular do contrato.",
     "CONTRATO_NAO_ENCONTRADO": "Contrato inexistente.",
     "CONFLITO_DE_ESTADO": "A autorização original já foi encerrada.",
 }
@@ -128,6 +157,7 @@ _DETALHE_DO_MOTIVO: Mapping[MotivoRecusa, str] = {
     MotivoRecusa.ESTORNO_EM_ANDAMENTO: "Outro estorno desta autorização está em andamento.",
     MotivoRecusa.RECUSA_DO_LIMITE: "O limite do contrato recusou a operação.",
 }
+_DETALHE_DE_RECUSA_DESCONHECIDA = "O limite do contrato recusou a operação."
 
 
 class RespostaJsonExata(JSONResponse):
@@ -217,11 +247,6 @@ def _uuid_canonico(valor: str | None) -> str | None:
     return canonico if canonico == valor.lower() else None
 
 
-def _trace_id(traceparent: str | None) -> str | None:
-    correspondencia = _TRACEPARENT.match(traceparent) if traceparent else None
-    return correspondencia["trace_id"] if correspondencia else None
-
-
 def _gateway_request_id(valor: str | None) -> str | None:
     return valor if valor and _GATEWAY_REQUEST_ID.match(valor) else None
 
@@ -288,7 +313,11 @@ def _problema(
     detail: str | None = None,
     extras: Mapping[str, object] | None = None,
     headers: Mapping[str, str] | None = None,
+    *,
+    origem: Autorizacao | None = None,
 ) -> RespostaJsonExata:
+    """Problem+json. Com `origem` (recusa registrada), a correlação é a GRAVADA na autorização, como no
+    corpo da aprovação: o replay sai idêntico ao original. Sem ela, a desta requisição."""
     slug, title, status = _PROBLEMAS[codigo]
     problema = Problema(
         type_slug=slug,
@@ -296,8 +325,8 @@ def _problema(
         status=status,
         codigo=codigo,
         detail=detail,
-        correlation_id=request.state.correlation_id,
-        trace_id=request.state.trace_id,
+        correlation_id=origem.correlation_id if origem else request.state.correlation_id,
+        trace_id=trace_id_de(origem.traceparent) if origem else request.state.trace_id,
         extras=extras or {},
     )
     return RespostaJsonExata(
@@ -310,8 +339,8 @@ def _exigir_client_id(request: Request) -> str:
     # alcançável pelo VPC Link, então o header não é forjável por quem está fora. Localmente o
     # header faz as vezes do token.
     client_id = (request.headers.get("x-client-id") or "").strip()
-    if not client_id:
-        raise _Rejeicao("NAO_AUTENTICADO", "Identificação do cliente ausente.")
+    if not _CLIENT_ID.fullmatch(client_id):
+        raise _Rejeicao("NAO_AUTENTICADO", "Identificação do cliente ausente ou fora do formato.")
     return client_id
 
 
@@ -327,10 +356,23 @@ def _chave_de_idempotencia(request: Request) -> str:
     return bruta
 
 
+def _lista_de_erros(erros: list[dict[str, str]]) -> dict[str, object]:
+    """`erros[]` com no máximo MAX_ERROS_POR_PROBLEMA itens; `erros_omitidos` diz quantos ficaram de fora."""
+    extras: dict[str, object] = {"erros": erros[:MAX_ERROS_POR_PROBLEMA]}
+    if len(erros) > MAX_ERROS_POR_PROBLEMA:
+        extras["erros_omitidos"] = len(erros) - MAX_ERROS_POR_PROBLEMA
+    return extras
+
+
+def _constante_nao_json(nome: str) -> object:
+    """NaN, Infinity e -Infinity não são JSON (RFC 8259 §6), embora o `json` do Python os aceite."""
+    raise ValueError(f"{nome} não é um número JSON")
+
+
 def _ler_pedido(corpo: bytes, id_contrato: str) -> PedidoDeAutorizacao:
     """JSON cru -> pedido de domínio. `_Rejeicao` 400 (sintaxe) ou 422 (validação)."""
     try:
-        bruto = json.loads(corpo, parse_float=Decimal)
+        bruto = json.loads(corpo, parse_float=Decimal, parse_constant=_constante_nao_json)
     except (ValueError, RecursionError) as erro:
         raise _Rejeicao("REQUISICAO_MAL_FORMADA", "O corpo não é um JSON válido.") from erro
     try:
@@ -340,7 +382,9 @@ def _ler_pedido(corpo: bytes, id_contrato: str) -> PedidoDeAutorizacao:
             _erro_de_campo(".".join(str(parte) for parte in e["loc"]) or "corpo", e["msg"])
             for e in erro.errors(include_url=False, include_context=False, include_input=False)
         ]
-        raise _Rejeicao("VALIDACAO_DE_DOMINIO", "Pedido inválido.", {"erros": erros}) from erro
+        raise _Rejeicao(
+            "VALIDACAO_DE_DOMINIO", "Pedido inválido.", _lista_de_erros(erros)
+        ) from erro
     if r.id_contrato is not None and r.id_contrato != id_contrato:
         raise _rejeicao_de_dominio("id_contrato", "diferente do id_contrato do path")
     try:
@@ -366,19 +410,25 @@ def _responder_desfecho(request: Request, desfecho: Desfecho) -> Response:
     a = desfecho.autorizacao
     cabecalhos = {"Idempotent-Replayed": "true"} if desfecho.replay else {}
     if a.resultado is Resultado.APROVADA:
-        cabecalhos["Location"] = f"/v1/contratos/{a.id_contrato}/autorizacoes/{a.id_autorizacao}"
+        # Referência RELATIVA (RFC 3986 §4.2), resolvida contra a URI do POST (.../contratos/{id}/autorizacoes):
+        # dá .../autorizacoes/{id} com ou sem o prefixo do stage do gateway na frente.
+        cabecalhos["Location"] = f"autorizacoes/{a.id_autorizacao}"
         return RespostaJsonExata(
             _aprovada_json(a), status_code=200 if desfecho.replay else 201, headers=cabecalhos
         )
     assert a.motivo_recusa is not None  # recusada sempre tem motivo
-    codigo = _CODIGO_DA_RECUSA[a.motivo_recusa]
+    codigo = _CODIGO_DA_RECUSA.get(a.motivo_recusa, _CODIGO_DE_RECUSA_DESCONHECIDA)
     extras: dict[str, object] = {}
     if codigo == "LIMITE_INSUFICIENTE":
         extras["id_autorizacao"] = a.id_autorizacao
         if a.saldos is not None:
             extras["limite_disponivel"] = _dinheiro_json(a.saldos.limite_disponivel)
-    detalhe = _DETALHE_DO_MOTIVO.get(a.motivo_recusa) or _DETALHE_DA_RECUSA[codigo]
-    return _problema(request, codigo, detalhe, extras, cabecalhos)
+    detalhe = (
+        _DETALHE_DO_MOTIVO.get(a.motivo_recusa)
+        or _DETALHE_DA_RECUSA.get(codigo)
+        or _DETALHE_DE_RECUSA_DESCONHECIDA
+    )
+    return _problema(request, codigo, detalhe, extras, cabecalhos, origem=a)
 
 
 def _traduzir_excecao(request: Request, erro: Exception) -> Response:
@@ -418,6 +468,16 @@ def _traduzir_excecao(request: Request, erro: Exception) -> Response:
     return _problema(request, "ERRO_INTERNO", "Falha inesperada. Informe o correlation_id.")
 
 
+def _armazenamento_indisponivel(request: Request, erro: ArmazenamentoIndisponivel) -> Response:
+    _log.warning("ArmazenamentoIndisponivel em %s", erro, extra=contexto_de_log())
+    return _problema(
+        request,
+        "SERVICO_INDISPONIVEL",
+        "Banco de autorizações sobrecarregado; repita com a mesma Idempotency-Key.",
+        headers={"Retry-After": "1"},
+    )
+
+
 # --- App -----------------------------------------------------------------------------------------
 
 
@@ -441,10 +501,12 @@ def criar_app(  # noqa: PLR0915 - rotas registradas em closure, como no serviço
         """Correlação em TODA resposta, contexto de observabilidade e load shedding."""
         nonlocal em_voo
         correlation_id = _uuid_canonico(request.headers.get("x-correlation-id")) or str(uuid4())
-        traceparent = request.headers.get("traceparent")
+        # Fora do formato W3C → None: não chega ao caso de uso, ao item gravado, ao evento nem ao limites.
+        traceparent = traceparent_valido(request.headers.get("traceparent"))
         gateway_request_id = _gateway_request_id(request.headers.get("x-gateway-request-id"))
         request.state.correlation_id = correlation_id
-        request.state.trace_id = _trace_id(traceparent)
+        request.state.traceparent = traceparent
+        request.state.trace_id = trace_id_de(traceparent)
         with trava:
             em_voo += 1
             sobrecarregado = em_voo > max_em_voo and request.url.path != "/saude"
@@ -478,7 +540,25 @@ def criar_app(  # noqa: PLR0915 - rotas registradas em closure, como no serviço
             _erro_de_campo(".".join(str(parte) for parte in e["loc"][1:]) or "requisicao", e["msg"])
             for e in erro.errors()
         ]
-        return _problema(request, "VALIDACAO_DE_DOMINIO", "Parâmetro inválido.", {"erros": erros})
+        return _problema(
+            request, "VALIDACAO_DE_DOMINIO", "Parâmetro inválido.", _lista_de_erros(erros)
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def erro_de_roteamento(request: Request, erro: StarletteHTTPException) -> Response:
+        """Rota inexistente (404) e método não suportado (405) também saem em problem+json do catálogo.
+        Na AWS o gateway responde os dois antes (403 `SEM_PERMISSAO`); aqui é o acesso direto ao serviço."""
+        if erro.status_code == 405:
+            permitidos = (erro.headers or {}).get("Allow", "")
+            return _problema(
+                request,
+                "METODO_NAO_PERMITIDO",
+                f"Método {request.method} não suportado neste recurso. Permitidos: {permitidos}.",
+                headers={"Allow": permitidos},
+            )
+        if erro.status_code == 404:
+            return _problema(request, "RECURSO_NAO_ENCONTRADO", "Recurso inexistente.")
+        return await http_exception_handler(request, erro)
 
     @app.get("/saude")
     async def saude() -> dict[str, str]:
@@ -501,16 +581,18 @@ def criar_app(  # noqa: PLR0915 - rotas registradas em closure, como no serviço
                 request, rejeicao.codigo, rejeicao.detail, rejeicao.extras, rejeicao.headers
             )
         escopo = EscopoDeIdempotencia(client_id, "POST", request.url.path, chave)
-        contexto = Contexto(request.state.correlation_id, request.headers.get("traceparent"))
+        contexto = Contexto(request.state.correlation_id, request.state.traceparent)
         try:
             desfecho = await run_in_threadpool(autorizar.executar, pedido, escopo, contexto)
+        except ArmazenamentoIndisponivel as erro:
+            return _armazenamento_indisponivel(request, erro)
         except Exception as erro:
             return _traduzir_excecao(request, erro)
         return _responder_desfecho(request, desfecho)
 
     @app.get("/v1/contratos/{id_contrato}/autorizacoes/{id_autorizacao}")
     async def consultar_autorizacao(
-        request: Request, id_contrato: IdContrato, id_autorizacao: str
+        request: Request, id_contrato: IdContrato, id_autorizacao: IdAutorizacao
     ) -> Response:
         try:
             client_id = _exigir_client_id(request)
@@ -518,12 +600,14 @@ def criar_app(  # noqa: PLR0915 - rotas registradas em closure, como no serviço
             return _problema(request, rejeicao.codigo, rejeicao.detail)
         try:
             autorizacao = await run_in_threadpool(
-                consultar.executar, id_contrato, id_autorizacao, client_id
+                consultar.executar, id_contrato, id_autorizacao.lower(), client_id
             )
         except AutorizacaoNaoEncontrada:
             return _problema(
                 request, "AUTORIZACAO_NAO_ENCONTRADA", "Autorização inexistente neste contrato."
             )
+        except ArmazenamentoIndisponivel as erro:
+            return _armazenamento_indisponivel(request, erro)
         return RespostaJsonExata(_autorizacao_json(autorizacao))
 
     return app

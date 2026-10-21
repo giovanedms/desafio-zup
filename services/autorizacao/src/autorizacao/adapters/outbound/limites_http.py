@@ -68,6 +68,10 @@ class GatewayDeLimitesHttp:
             corpo["id_reserva"] = operacao.id_reserva
         if operacao.valor_reservado is not None:
             corpo["valor_reservado"] = operacao.valor_reservado
+        if operacao.id_conta is not None:
+            corpo["id_conta"] = (
+                operacao.id_conta
+            )  # conferida contra a titular do contrato no limites
         conteudo = simplejson.dumps(corpo, use_decimal=True).encode()
         resposta = self._chamar(
             lambda headers: self._cliente.post(

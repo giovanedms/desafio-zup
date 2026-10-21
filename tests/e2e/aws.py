@@ -1,15 +1,22 @@
-"""Verificação da janela na AWS (sandbox): carga de contratos pela ACL, borda do API Gateway e corrida.
+"""Verificação da janela na AWS (sandbox): carga de contratos pela ACL, borda do API Gateway, corrida e contabilização.
 
 Uso (depois do `make deploy`):
     AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py contratos [N] [PREFIXO]   # legado → SQS → limites-acl
     AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py borda       # 201, replay, 401, 422 (valor 0), 429 (rajada)
-    AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py corrida     # 100 reservas paralelas no DynamoDB real
+    AWS_PROFILE=desafio-zup uv run python tests/e2e/aws.py corrida     # 100 reservas paralelas + lançamentos contábeis
 
 `borda` sai com 1 se qualquer item divergir: 1ª autorização 201; replay 200 com corpo idêntico; sem token 401
 application/problem+json (gateway); `valor: 0` 422 application/problem+json com `codigo` VALIDACAO_DE_DOMINIO (o serviço
 é a autoridade do corpo, o gateway não o valida); rajada de 40 chamadas SIMULTÂNEAS pelo `canal-app` (plano-restrito:
 5 rps, burst 10) com ao menos um 429 application/problem+json com `Retry-After` (até 3 rajadas: o throttle do
 gateway é melhor-esforço).
+
+`corrida` sai com 1 se: os status não forem exatamente {201: 10, 402: 90}; o item do contrato no DynamoDB não terminar
+com disponível 0; ou, em até 120 s, as 10 reservas aprovadas não tiverem cada uma UM lançamento na tabela
+`contabilizacao-lancamentos` (outbox → Stream → relay → bus → regra → fila → Lambda de contabilização, na conta real).
+É o mesmo oráculo da seção 6 da demo local, agora na AWS.
+
+Todo pedido usa a conta do contrato carregado pelo legado (`CONTA`): conta divergente é recusada (CONTA_DIVERGENTE).
 
 Segredos (client secrets do Cognito, API keys) vêm de `terraform output -json` e NUNCA são impressos.
 Local: o profile precisa ser explícito (o shell do operador exporta credenciais de OUTRA conta, que são removidas).
@@ -25,6 +32,7 @@ import sys
 import time
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -39,6 +47,9 @@ from limites.domain.limite import StatusContrato, TipoProduto
 AMBIENTE = "infra/terraform/environments/sandbox"
 PROBLEM_JSON = "application/problem+json"
 RAJADA = 40  # simultâneas no plano-restrito (5 rps, burst 10): bem acima do balde, o gateway estrangula com 429
+CONTA = "0001-77777777-7"  # conta dos contratos que o smoke carrega pelo legado
+TABELA_LANCAMENTOS = "contabilizacao-lancamentos"
+PRAZO_CONTABILIZACAO_S = 120.0  # pipeline assíncrono inteiro, com folga para cold start das Lambdas
 
 
 def ambiente_aws() -> dict[str, str]:
@@ -106,7 +117,7 @@ def registro(id_contrato: str, concedido: str, versao: int = 1) -> str:
     return formatar(
         AtualizacaoDoLegado(
             id_contrato,
-            "0001-77777777-7",
+            CONTA,
             TipoProduto.CREDITO,
             Decimal(concedido),
             StatusContrato.ATIVO,
@@ -189,7 +200,7 @@ def borda() -> None:
     contrato = f"CTR-AWS-{uuid.uuid4().hex[:6].upper()}"
     enviar_ao_legado([registro(contrato, "1000.00")])
     esperar_contrato(contrato)
-    corpo = {"id_conta": "0001-1", "valor": 150.00, "moeda": "BRL", "tipo_operacao": "RESERVA"}
+    corpo = {"id_conta": CONTA, "valor": 150.00, "moeda": "BRL", "tipo_operacao": "RESERVA"}
     with httpx.Client(timeout=15) as http:
         hdr = cabecalhos(s, "canal-pos", token(s, "canal-pos"))
         chave = str(uuid.uuid4())
@@ -274,12 +285,56 @@ def autorizar_como_um_canal_correto(
     return resposta, vistos
 
 
+def lancamentos_do_contrato(dynamodb: Any, contrato: str) -> list[dict[str, Any]]:
+    """Lançamentos do contrato (único por corrida) no razão. Scan paginado: só o smoke faz isto, nunca o serviço."""
+    argumentos: dict[str, Any] = {
+        "TableName": TABELA_LANCAMENTOS,
+        "FilterExpression": "id_contrato = :c",
+        "ExpressionAttributeValues": {":c": {"S": contrato}},
+        "ProjectionExpression": "id_evento_origem, tipo_evento_origem, historico",
+        "ConsistentRead": True,
+    }
+    itens: list[dict[str, Any]] = []
+    while True:
+        pagina = dynamodb.scan(**argumentos)
+        itens += pagina.get("Items", [])
+        if not pagina.get("LastEvaluatedKey"):
+            return itens
+        argumentos["ExclusiveStartKey"] = pagina["LastEvaluatedKey"]
+
+
+def faltam_contabilizar(aprovadas: set[str], lancamentos: list[dict[str, Any]]) -> set[str]:
+    """Autorizações aprovadas sem lançamento. O histórico da reserva traz o id ("Reserva de limite <id>")."""
+    historicos = [str(item.get("historico", {}).get("S", "")) for item in lancamentos]
+    return {aut for aut in aprovadas if not any(aut in h for h in historicos)}
+
+
+def esperar_contabilizacao(
+    dynamodb: Any,
+    contrato: str,
+    aprovadas: set[str],
+    *,
+    prazo_s: float | None = None,
+    intervalo_s: float = 5.0,
+    relogio: Callable[[], float] = time.monotonic,
+    dormir: Callable[[float], None] = time.sleep,
+) -> tuple[set[str], list[dict[str, Any]]]:
+    """Espera (com prazo) cada aprovada virar lançamento. Devolve as que faltaram e os lançamentos lidos."""
+    fim = relogio() + (PRAZO_CONTABILIZACAO_S if prazo_s is None else prazo_s)
+    while True:
+        lancamentos = lancamentos_do_contrato(dynamodb, contrato)
+        faltam = faltam_contabilizar(aprovadas, lancamentos)
+        if not faltam or relogio() >= fim:
+            return faltam, lancamentos
+        dormir(intervalo_s)
+
+
 def corrida() -> None:
     s = saidas()
     contrato = f"CTR-AWS-{uuid.uuid4().hex[:6].upper()}"
     enviar_ao_legado([registro(contrato, "1000.00")])
     esperar_contrato(contrato)
-    corpo = {"id_conta": "0001-1", "valor": 100.00, "moeda": "BRL", "tipo_operacao": "RESERVA"}
+    corpo = {"id_conta": CONTA, "valor": 100.00, "moeda": "BRL", "tipo_operacao": "RESERVA"}
     with httpx.Client(timeout=30, limits=httpx.Limits(max_connections=100)) as http:
         hdr = cabecalhos(s, "canal-carga", token(s, "canal-carga"))
         with ThreadPoolExecutor(max_workers=100) as pool:
@@ -294,21 +349,32 @@ def corrida() -> None:
     if repetidas:
         print(f"repetidas pelo canal (load shedding/cota, mesma chave): {dict(repetidas)}")
     status = Counter(r.status_code for r in respostas)
-    item = (
-        sessao()
-        .client("dynamodb")
-        .get_item(TableName="limites", Key={"id_contrato": {"S": contrato}}, ConsistentRead=True)[
-            "Item"
-        ]
-    )
+    dynamodb = sessao().client("dynamodb")
+    item = dynamodb.get_item(
+        TableName="limites", Key={"id_contrato": {"S": contrato}}, ConsistentRead=True
+    )["Item"]
     print(f"AWS — 100 reservas paralelas de R$ 100 em R$ 1.000: {dict(sorted(status.items()))}")
     print(
         f"DynamoDB real: disponivel={item['disponivel']['N']} "
         f"reservado={item['reservado']['N']} versao={item['versao']['N']}"
     )
-    ok = status == {201: 10, 402: 90} and item["disponivel"]["N"] == "0"
-    print("✅ invariante preservada" if ok else "❌ DIVERGÊNCIA")
-    if not ok:
+    invariante = status == {201: 10, 402: 90} and item["disponivel"]["N"] == "0"
+    print("✅ invariante preservada" if invariante else "❌ DIVERGÊNCIA na invariante")
+
+    # O fato tem de atravessar o pipeline assíncrono na conta real e virar UM lançamento por reserva aprovada.
+    aprovadas = {str(r.json()["id_autorizacao"]) for r in respostas if r.status_code == 201}
+    faltam, lancamentos = esperar_contabilizacao(dynamodb, contrato, aprovadas)
+    contabilizada = bool(aprovadas) and not faltam and len(lancamentos) == len(aprovadas)
+    print(
+        f"contabilização: {len(lancamentos)} lançamento(s) em {TABELA_LANCAMENTOS} para "
+        f"{len(aprovadas)} aprovada(s); sem lançamento: {sorted(faltam) or 'nenhuma'}"
+    )
+    print(
+        "✅ cada reserva aprovada virou um lançamento (outbox → relay → bus → fila → Lambda)"
+        if contabilizada
+        else f"❌ DIVERGÊNCIA na contabilização (prazo {PRAZO_CONTABILIZACAO_S:.0f} s)"
+    )
+    if not (invariante and contabilizada):
         sys.exit(1)
 
 

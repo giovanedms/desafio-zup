@@ -25,6 +25,7 @@
     "moeda": "BRL",
     "id_conta": "0001-12345678-9",
     "id_estabelecimento": "EST-998877",
+    "canal": "POS",
     "limite_disponivel": 850.0,
     "limite_utilizado": 0.0,
     "versao_limite": 42

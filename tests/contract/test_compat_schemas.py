@@ -200,6 +200,40 @@ APERTOS = [
     pytest.param("codigo", {"maxLength": 5}, ".codigo: maxLength", id="maxLength-desceu"),
     pytest.param("valor", {"maxLength": 36}, ".valor: maxLength", id="maxLength-novo"),
     pytest.param("codigo", {"minLength": 3}, ".codigo: minLength", id="minLength-subiu"),
+    # B-2 (painel 6): enum/const criado onde não havia fecha o domínio do campo.
+    pytest.param("valor", {"enum": ["CTR-1", "CTR-2"]}, ".valor: enum/const novo", id="enum-novo"),
+    pytest.param("valor", {"const": "BRL"}, ".valor: enum/const novo", id="const-novo"),
+    pytest.param("taxa", {"enum": [1, 2]}, ".taxa: enum/const novo", id="enum-novo-numero"),
+    pytest.param(
+        "data",
+        {"allOf": [{"required": ["taxa"]}]},
+        "$.data: allOf novo ou alterado",
+        id="allOf-novo",
+    ),
+    pytest.param(
+        "valor", {"anyOf": [{"maxLength": 3}]}, ".valor: anyOf novo ou alterado", id="anyOf-novo"
+    ),
+    pytest.param(
+        "valor", {"oneOf": [{"maxLength": 3}]}, ".valor: oneOf novo ou alterado", id="oneOf-novo"
+    ),
+    pytest.param("valor", {"not": {"enum": ["x"]}}, ".valor: not novo ou alterado", id="not-novo"),
+    pytest.param(
+        "data",
+        {"dependencies": {"taxa": ["quantia"]}},
+        "$.data: dependencies novo ou alterado",
+        id="dependencies-novo",
+    ),
+    pytest.param(
+        "data",
+        {"patternProperties": {"^x_": {"type": "string"}}},
+        "$.data: patternProperties novo ou alterado",
+        id="patternProperties-novo",
+    ),
+    pytest.param(
+        "valor", {"$ref": "#/definitions/codigo"}, ".valor: $ref novo ou alterado", id="ref-novo"
+    ),
+    pytest.param("data", {"maxProperties": 3}, "$.data: maxProperties", id="maxProperties-novo"),
+    pytest.param("data", {"minProperties": 2}, "$.data: minProperties", id="minProperties-novo"),
 ]
 
 AFROUXAMENTOS = [
@@ -251,3 +285,204 @@ def test_main_exit_code(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
 def test_schemas_reais_sao_compativeis_consigo_mesmos() -> None:
     d = RAIZ / "contracts/events"
     assert compat.comparar_diretorios(d, d) == ([], [])
+
+
+def test_remover_combinador_afrouxa_e_e_verde(tmp_path: Path) -> None:
+    com_allof = copy.deepcopy(BASE)
+    com_allof["properties"]["data"]["allOf"] = [{"required": ["taxa"]}]
+    base_dir = _gravar(tmp_path / "base", com_allof)
+    novo_dir = _gravar(tmp_path / "novo", BASE)
+    assert compat.comparar_diretorios(base_dir, novo_dir) == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("depois", "esperado"),
+    [
+        pytest.param({"items": {"type": "string"}}, "[]: type alterado", id="items-novo"),
+        pytest.param({"minItems": 1}, ".tags: minItems", id="minItems-novo"),
+        pytest.param({"maxItems": 5}, ".tags: maxItems", id="maxItems-novo"),
+        pytest.param({"uniqueItems": True}, ".tags: uniqueItems", id="uniqueItems-novo"),
+    ],
+)
+def test_aperto_em_lista_quebra(tmp_path: Path, depois: dict[str, Any], esperado: str) -> None:
+    base = copy.deepcopy(BASE)
+    base["properties"]["data"]["properties"]["tags"] = {"type": "array"}
+    novo = copy.deepcopy(base)
+    novo["properties"]["data"]["properties"]["tags"].update(depois)
+    base_dir = _gravar(tmp_path / "base", base)
+    novo_dir = _gravar(tmp_path / "novo", novo)
+    quebras, _ = compat.comparar_diretorios(base_dir, novo_dir)
+    assert any(esperado in q for q in quebras), quebras
+
+
+# ---------------------------------------------------------------- quebras aceitas (registro explícito)
+
+ACEITA_EXTRA = {
+    "schema": NOME,
+    "caminho": "$.data.extra",
+    "regra": "campo novo em required",
+    "motivo": "antes de qualquer release",
+    "data": "2026-10-21",
+}
+
+
+def _required_extra(s: dict[str, Any]) -> None:
+    s["properties"]["data"]["properties"]["extra"] = {"type": "string"}
+    s["properties"]["data"]["required"].append("extra")
+
+
+def _registro(tmp_path: Path, *entradas: dict[str, str]) -> Path:
+    arquivo = tmp_path / "quebras-aceitas.json"
+    arquivo.write_text(json.dumps({"quebras": list(entradas)}), encoding="utf-8")
+    return arquivo
+
+
+def _main(base: Path, novo: Path, aceitas: Path | None = None) -> int:
+    args = ["--base", str(base), "--novo", str(novo)]
+    return int(compat.main([*args, "--aceitas", str(aceitas)] if aceitas else args))
+
+
+def test_quebra_registrada_passa_e_aparece_como_aceita(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    base_dir = _gravar(tmp_path / "base", BASE)
+    novo_dir = _gravar(tmp_path / "novo", _mutar(_required_extra))
+
+    saida = _main(base_dir, novo_dir, _registro(tmp_path, ACEITA_EXTRA))
+
+    texto = capsys.readouterr().out
+    assert saida == 0
+    assert f"ACEITA {NOME}:$.data.extra: campo novo em required" in texto
+    assert "antes de qualquer release" in texto  # o motivo vai para o log da esteira
+    assert "QUEBRA" not in texto
+
+
+def test_so_a_quebra_exata_e_aceita(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A mesma regra noutro campo continua reprovando."""
+
+    def mut(s: dict[str, Any]) -> None:
+        _required_extra(s)
+        s["properties"]["data"]["required"].append("taxa")  # outra quebra, não registrada
+
+    base_dir = _gravar(tmp_path / "base", BASE)
+    novo_dir = _gravar(tmp_path / "novo", _mutar(mut))
+
+    saida = _main(base_dir, novo_dir, _registro(tmp_path, ACEITA_EXTRA))
+
+    texto = capsys.readouterr().out
+    assert saida == 1
+    assert f"QUEBRA {NOME}:$.data.taxa: campo novo em required" in texto
+    assert texto.count("QUEBRA ") == 1
+    assert texto.count("ACEITA ") == 1
+
+
+def test_sem_o_registro_a_mesma_mudanca_reprova(tmp_path: Path) -> None:
+    base_dir = _gravar(tmp_path / "base", BASE)
+    novo_dir = _gravar(tmp_path / "novo", _mutar(_required_extra))
+    assert _main(base_dir, novo_dir) == 1
+
+
+def test_entrada_sem_efeito_so_avisa(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    base_dir = _gravar(tmp_path / "base", BASE)
+
+    saida = _main(base_dir, base_dir, _registro(tmp_path, ACEITA_EXTRA))
+
+    assert saida == 0
+    assert "sem efeito" in capsys.readouterr().out
+
+
+def _sem(chave: str) -> dict[str, str]:
+    return {k: v for k, v in ACEITA_EXTRA.items() if k != chave}
+
+
+@pytest.mark.parametrize(
+    "conteudo",
+    [
+        pytest.param("[]", id="nao-e-objeto"),
+        pytest.param('{"quebras": {}}', id="quebras-nao-e-lista"),
+        pytest.param("{", id="json-invalido"),
+        pytest.param({**ACEITA_EXTRA, "motivo": " "}, id="motivo-vazio"),
+        pytest.param(_sem("data"), id="sem-data"),
+        pytest.param({**ACEITA_EXTRA, "quem": "x"}, id="campo-extra"),
+        pytest.param({**ACEITA_EXTRA, "data": "21/10/2026"}, id="data-fora-do-iso"),
+        pytest.param({**ACEITA_EXTRA, "schema": "evento-x.json"}, id="schema-sem-sufixo"),
+        pytest.param({**ACEITA_EXTRA, "caminho": "data.x"}, id="caminho-sem-raiz"),
+    ],
+)
+def test_registro_invalido_reprova_fail_closed(
+    tmp_path: Path, conteudo: str | dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    base_dir = _gravar(tmp_path / "base", BASE)
+    aceitas = tmp_path / "quebras-aceitas.json"
+    texto = conteudo if isinstance(conteudo, str) else json.dumps({"quebras": [conteudo]})
+    aceitas.write_text(texto, encoding="utf-8")
+
+    assert _main(base_dir, base_dir, aceitas) == 2
+    assert "ERRO" in capsys.readouterr().out
+
+
+def test_registro_ausente_reprova(tmp_path: Path) -> None:
+    base_dir = _gravar(tmp_path / "base", BASE)
+    assert _main(base_dir, base_dir, tmp_path / "nao-existe.json") == 2
+
+
+# ---------------------------------------------------------------- os contratos reais
+
+EVENTOS = RAIZ / "contracts/events"
+
+
+def _schema_real(slug: str) -> dict[str, Any]:
+    return dict(json.loads((EVENTOS / f"{slug}.v1.schema.json").read_text(encoding="utf-8")))
+
+
+def test_registro_real_casa_com_a_quebra_que_o_gate_produz(tmp_path: Path) -> None:
+    """B-3: a base de antes (tipo_operacao opcional) contra os schemas de hoje dá UMA quebra, a registrada."""
+    aceitas = compat.carregar_aceitas(EVENTOS / "quebras-aceitas.json")
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    for arquivo in EVENTOS.glob("*.schema.json"):
+        schema = json.loads(arquivo.read_text(encoding="utf-8"))
+        if arquivo.name == "transacao-autorizada.v1.schema.json":
+            schema["properties"]["data"]["required"].remove("tipo_operacao")
+        (base_dir / arquivo.name).write_text(json.dumps(schema), encoding="utf-8")
+
+    quebras, _ = compat.comparar_diretorios(base_dir, EVENTOS)
+    restantes, usadas, sem_efeito = compat.separar_aceitas(quebras, aceitas)
+
+    assert quebras == [
+        "transacao-autorizada.v1.schema.json:$.data.tipo_operacao: campo novo em required"
+    ]
+    assert (restantes, len(usadas), sem_efeito) == ([], 1, [])
+
+
+def test_o_que_a_contabilizacao_exige_e_obrigatorio_no_schema() -> None:
+    """B-3: campo que a regra contábil exige para lançar está em `required` (evento válido não vai à DLQ)."""
+    exigidos = {
+        "transacao-autorizada": {"tipo_operacao", "valor"},
+        "transacao-estornada": {"tipo_operacao_original", "valor"},
+        "reserva-capturada": {"valor_reservado"},
+        "reserva-expirada": {"valor"},
+    }
+    for slug, campos in exigidos.items():
+        schema = _schema_real(slug)
+        assert {"id", "source", "time", "data"} <= set(schema["required"]), slug
+        exigidos_em_data = {"event_type", "id_contrato", *campos}
+        assert exigidos_em_data <= set(schema["properties"]["data"]["required"]), slug
+
+
+@pytest.mark.parametrize("slug", ["transacao-autorizada", "transacao-recusada"])
+def test_canal_e_opcional_com_os_cinco_canais(slug: str) -> None:
+    data = _schema_real(slug)["properties"]["data"]
+    assert data["properties"]["canal"]["enum"] == ["APP", "WEB", "POS", "PIX", "BACKOFFICE"]
+    assert "canal" not in data["required"]
+
+
+def test_motivo_da_recusa_cobre_todo_motivo_que_o_produtor_publica() -> None:
+    """O evento carrega `MotivoRecusa.value` da autorização: valor fora do enum seria evento inválido."""
+    from autorizacao.domain.autorizacao import MotivoRecusa  # noqa: PLC0415
+
+    enum = set(
+        _schema_real("transacao-recusada")["properties"]["data"]["properties"]["motivo"]["enum"]
+    )
+    assert {m.value for m in MotivoRecusa} <= enum
+    assert "CONTA_DIVERGENTE" in enum  # G4/X2: motivo novo do BC Limites, exposto pela autorização

@@ -1,0 +1,12 @@
+{
+  "descricao": "Quebras BACKWARD aceitas de propósito pelo gate de compatibilidade (scripts/compat_schemas.py --aceitas; ADR-0008). Cada entrada casa com UMA quebra exata ('<schema>:<caminho>: <regra>'); qualquer outra continua reprovando. Só entra aqui aperto feito antes de qualquer release do major, com motivo e data. Entrada que o gate passa a acusar como 'sem efeito' (a base já contém a mudança) pode sair do arquivo.",
+  "quebras": [
+    {
+      "schema": "transacao-autorizada.v1.schema.json",
+      "caminho": "$.data.tipo_operacao",
+      "regra": "campo novo em required",
+      "motivo": "B-3 (painel 6): a contabilização exige tipo_operacao para lançar; opcional no schema, um evento válido ia para a DLQ do consumidor. O aperto entra antes de qualquer release da v1 (nenhum consumidor externo publicado) e o produtor sempre emitiu o campo.",
+      "data": "2026-10-21"
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 import pytest
@@ -37,8 +37,8 @@ class OutboxFake:
             self.apagados.append(i)
             self.itens.pop(i, None)
 
-    def listar_antigos(self, antes_de_ms: int) -> list[EventoPendente]:
-        return [e for e in self.itens.values() if e.criado_em_ms < antes_de_ms]
+    def paginas_antigas(self, antes_de_ms: int) -> Iterator[list[EventoPendente]]:
+        yield [e for e in self.itens.values() if e.criado_em_ms < antes_de_ms]
 
 
 def test_25_eventos_viram_3_chamadas_de_publicar() -> None:

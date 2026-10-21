@@ -4,6 +4,9 @@ Cada execução cria contratos NOVOS (simulando a carga vinda do legado), então
 Também é o teste ponta a ponta da esteira: cada seção confere o que mostra, e qualquer divergência sai com código 1.
 Fala com as APIs HTTP públicas/internas — não importa nada dos serviços além do bootstrap de dados. O que não
 tem API (o lançamento contábil, as filas sem consumidor local) é lido direto na LocalStack.
+Como um canal correto, a demo repete 503 (load shedding) e 429 com a MESMA Idempotency-Key depois do Retry-After:
+o resultado não depende do teto de requisições em voo (`MAX_EM_VOO`) do ambiente.
+Todo pedido usa a conta do contrato (conta divergente é recusada com CONTA_DIVERGENTE).
 """
 
 from __future__ import annotations
@@ -12,27 +15,34 @@ import json
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
 import httpx
 
 sys.path.insert(0, "infra/local")
-from bootstrap import cliente
+from bootstrap import CONTRATOS_DE_DEMO, cliente
 from limites.adapters.outbound.dynamodb import RepositorioDeLimitesDynamoDB
 from limites.domain.limite import Limite, TipoProduto
 
 AUTORIZACAO = "http://127.0.0.1:18080"
 LIMITES = "http://127.0.0.1:18081"
 CANAL = "canal-demo"
+CONTA = "0001-99999999-9"  # conta dos contratos que a demo cria
+TENTATIVAS = 10  # 503/429 repetidos por pedido antes de desistir (como tests/e2e/aws.py)
+COMPOSE = ["docker", "compose", "-f", "infra/local/docker-compose.yml"]
 
 
 DIVERGENCIAS: list[str] = []
+REPETIDAS: Counter[int] = Counter()  # 503/429 repetidos pelo "canal", por status
+_TRAVA_DAS_REPETIDAS = threading.Lock()
 
 
 def confere(ok: bool, o_que: str) -> None:
@@ -49,20 +59,36 @@ def titulo(texto: str) -> None:
 def novo_contrato(concedido: str) -> str:
     id_contrato = f"CTR-DEMO-{uuid.uuid4().hex[:8].upper()}"
     RepositorioDeLimitesDynamoDB(cliente("dynamodb"), "limites").criar(
-        Limite.novo(id_contrato, "0001-99999999-9", TipoProduto.CREDITO, Decimal(concedido))
+        Limite.novo(id_contrato, CONTA, TipoProduto.CREDITO, Decimal(concedido))
     )
     return id_contrato
+
+
+def _espera(resposta: httpx.Response) -> float:
+    try:
+        return max(0.0, float(resposta.headers.get("Retry-After", "1")))
+    except ValueError:  # Retry-After em data HTTP: espera o mínimo
+        return 1.0
 
 
 def autorizar(
     http: httpx.Client, id_contrato: str, corpo: dict[str, Any], chave: str | None = None
 ) -> tuple[httpx.Response, float]:
+    """POST como um canal correto: 503 (load shedding) e 429 são "tente de novo", com a MESMA Idempotency-Key
+    depois do Retry-After. A latência devolvida inclui as repetições (é o que o canal vive)."""
+    chave = chave or str(uuid.uuid4())
     inicio = time.perf_counter()
-    resposta = http.post(
-        f"{AUTORIZACAO}/v1/contratos/{id_contrato}/autorizacoes",
-        json=corpo,
-        headers={"Idempotency-Key": chave or str(uuid.uuid4()), "X-Client-Id": CANAL},
-    )
+    for _ in range(TENTATIVAS):
+        resposta = http.post(
+            f"{AUTORIZACAO}/v1/contratos/{id_contrato}/autorizacoes",
+            json=corpo,
+            headers={"Idempotency-Key": chave, "X-Client-Id": CANAL},
+        )
+        if resposta.status_code not in (429, 503):
+            break
+        with _TRAVA_DAS_REPETIDAS:
+            REPETIDAS[resposta.status_code] += 1
+        time.sleep(_espera(resposta))
     return resposta, (time.perf_counter() - inicio) * 1000
 
 
@@ -70,9 +96,14 @@ def limite(http: httpx.Client, id_contrato: str) -> dict[str, Any]:
     return dict(http.get(f"{LIMITES}/interno/v1/contratos/{id_contrato}/limite").json())
 
 
-def reserva(valor: str = "100.00") -> dict[str, Any]:
+def conta_semeada(id_contrato: str) -> str:
+    """Conta de um contrato semeado pelo bootstrap (a mesma fonte que o criou)."""
+    return next(conta for contrato, conta, *_ in CONTRATOS_DE_DEMO if contrato == id_contrato)
+
+
+def reserva(valor: str = "100.00", conta: str = CONTA) -> dict[str, Any]:
     return {
-        "id_conta": "0001-99999999-9",
+        "id_conta": conta,
         "valor": float(valor),
         "moeda": "BRL",
         "tipo_operacao": "RESERVA",
@@ -103,8 +134,13 @@ def demo_aprovacao_e_replay(http: httpx.Client) -> None:
 def demo_corrida(http: httpx.Client, n: int = 100) -> None:
     titulo(f"2. Corrida: {n} reservas paralelas de R$ 100 num limite de R$ 1.000")
     id_contrato = novo_contrato("1000.00")
+    antes = Counter(REPETIDAS)
     with ThreadPoolExecutor(max_workers=50) as pool:
         resultados = list(pool.map(lambda _: autorizar(http, id_contrato, reserva()), range(n)))
+    if repetidas := REPETIDAS - antes:
+        print(
+            f"repetidas pelo canal (load shedding/cota, mesma chave): {dict(sorted(repetidas.items()))}"
+        )
     status = Counter(r.status_code for r, _ in resultados)
     latencias = sorted(ms for _, ms in resultados)
     final = limite(http, id_contrato)
@@ -143,7 +179,9 @@ def demo_operacoes(http: httpx.Client) -> None:
         f"DEBITO 200 → {debito2.status_code}; CREDITO 100 (pagamento) → {credito.status_code}  "
         f"disponível={credito.json()['limite_disponivel']}"
     )
-    bloqueado, _ = autorizar(http, "CTR-DEMO-0003", reserva("1.00"))
+    bloqueado, _ = autorizar(
+        http, "CTR-DEMO-0003", reserva("1.00", conta=conta_semeada("CTR-DEMO-0003"))
+    )
     print(f"contrato BLOQUEADO → {bloqueado.status_code}  {bloqueado.json()['codigo']}")
     inexistente, _ = autorizar(http, "CTR-NAO-EXISTE", reserva("1.00"))
     print(f"contrato inexistente → {inexistente.status_code}  {inexistente.json()['codigo']}")
@@ -223,7 +261,7 @@ def demo_validacao(http: httpx.Client) -> None:
     )
     tres_casas = http.post(
         f"{AUTORIZACAO}/v1/contratos/{id_contrato}/autorizacoes",
-        content=b'{"id_conta":"0001-1","valor":10.001,"moeda":"BRL","tipo_operacao":"DEBITO"}',
+        content=f'{{"id_conta":"{CONTA}","valor":10.001,"moeda":"BRL","tipo_operacao":"DEBITO"}}'.encode(),
         headers={
             "Idempotency-Key": str(uuid.uuid4()),
             "X-Client-Id": CANAL,
@@ -234,7 +272,7 @@ def demo_validacao(http: httpx.Client) -> None:
     grande = novo_contrato("99999999.00")  # contrato novo: a demo pode rodar quantas vezes quiser
     exato = http.post(
         f"{AUTORIZACAO}/v1/contratos/{grande}/autorizacoes",
-        content=b'{"id_conta":"0001-1","valor":12345678.91,"moeda":"BRL","tipo_operacao":"DEBITO"}',
+        content=f'{{"id_conta":"{CONTA}","valor":12345678.91,"moeda":"BRL","tipo_operacao":"DEBITO"}}'.encode(),
         headers={
             "Idempotency-Key": str(uuid.uuid4()),
             "X-Client-Id": CANAL,
@@ -350,9 +388,55 @@ def demo_eventos(http: httpx.Client) -> None:
     )
 
 
+def obsoletas_no_log(linhas: str) -> int:
+    """Soma o OBSOLETA das linhas de lote da ACL (`{"msg": "lote", "OBSOLETA": n, ...}`); o resto é ignorado."""
+    total = 0
+    for linha in linhas.splitlines():
+        inicio = linha.find("{")
+        if inicio < 0:
+            continue
+        try:
+            registro = json.loads(linha[inicio:])
+        except ValueError:
+            continue
+        if isinstance(registro, dict) and registro.get("msg") == "lote":
+            total += int(registro.get("OBSOLETA", 0))
+    return total
+
+
+def acl_julgou_obsoleta(desde: float) -> bool:
+    """Sinal POSITIVO de que a ACL comparou as versões: linha de lote com OBSOLETA no log do `limites-acl`,
+    só a partir de `desde` (logs de execuções anteriores não contam)."""
+    marca = (
+        datetime.fromtimestamp(desde, UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    )
+    saida = subprocess.run(
+        [*COMPOSE, "logs", "--no-color", "--since", marca, "limites-acl"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return saida.returncode == 0 and obsoletas_no_log(saida.stdout) >= 1
+
+
+def mensagens_na_fila(nome: str) -> int:
+    """Visíveis + em voo + atrasadas (a DLQ do feed tem de estar vazia de verdade, não só sem visíveis)."""
+    sqs = cliente("sqs")
+    atributos = sqs.get_queue_attributes(
+        QueueUrl=sqs.get_queue_url(QueueName=nome)["QueueUrl"],
+        AttributeNames=[
+            "ApproximateNumberOfMessages",
+            "ApproximateNumberOfMessagesNotVisible",
+            "ApproximateNumberOfMessagesDelayed",
+        ],
+    )["Attributes"]
+    return sum(int(v) for v in atributos.values())
+
+
 def demo_legado(http: httpx.Client) -> None:
     titulo("7. Core legado → ACL → limite atualizado → LimiteAlterado (CDC)")
     id_contrato = f"CTR-LEG-{uuid.uuid4().hex[:6].upper()}"
+    conta_do_legado = "0001-55555555-5"  # a mesma nos três registros e na reserva
     enviar = [
         sys.executable,
         "-m",
@@ -361,7 +445,7 @@ def demo_legado(http: httpx.Client) -> None:
         "--contrato",
         id_contrato,
         "--conta",
-        "0001-55555555-5",
+        conta_do_legado,
         "--produto",
         "01",
         "--situacao",
@@ -374,8 +458,13 @@ def demo_legado(http: httpx.Client) -> None:
         lambda: http.get(f"{LIMITES}/interno/v1/contratos/{id_contrato}/limite").status_code == 200
     )
     print(f"carga inicial (registro v1, R$ 1.500) → contrato criado pela ACL: {bool(criado)}")
-    autorizar(http, id_contrato, {**reserva("400.00"), "tipo_operacao": "RESERVA"})
+    reservada, _ = autorizar(http, id_contrato, reserva("400.00", conta=conta_do_legado))
+    print(f"RESERVA 400 na conta do contrato → {reservada.status_code}")
     confere(bool(criado), "a ACL não criou o contrato a partir do registro do legado")
+    confere(
+        reservada.status_code == 201,
+        "legado: a reserva de 400 no contrato criado pela ACL deveria ser 201",
+    )
 
     def na_versao_3() -> dict[str, Any] | None:
         limite = http.get(f"{LIMITES}/interno/v1/contratos/{id_contrato}/limite").json()
@@ -403,17 +492,28 @@ def demo_legado(http: httpx.Client) -> None:
             a["ApproximateNumberOfMessages"] == a["ApproximateNumberOfMessagesNotVisible"] == "0"
         )
 
+    # Oráculo da v2: "fila vazia" sozinho não prova nada (registro de tipo desconhecido é apagado como IGNORADO;
+    # falha repetida acaba na DLQ e também esvazia a fila). Exige-se, além do estado final: a ACL AVALIOU a v2 e a
+    # julgou OBSOLETA (linha de lote no log dela, só a partir de agora) e nada caiu na DLQ do feed.
+    desde = time.time()
     subprocess.run(
         [*enviar, "--limite", "9999.00", "--versao", "2"], check=True, capture_output=True
     )
     consumida = aguardar(legado_consumido)  # a ACL só apaga a mensagem depois de processar
+    julgada = aguardar(lambda: acl_julgou_obsoleta(desde))
+    na_dlq = mensagens_na_fila("legado-contratos-dlq")
     final = limite(http, id_contrato)
     print(
-        f"v2 FORA DE ORDEM (R$ 9.999) consumida pela ACL: {bool(consumida)} → "
+        f"v2 FORA DE ORDEM (R$ 9.999) consumida pela ACL: {bool(consumida)}  julgada OBSOLETA no log da "
+        f"ACL: {bool(julgada)}  legado-contratos-dlq: {na_dlq} → "
         f"concedido={final.get('limite_concedido')}  versao_legado={final.get('versao_legado')}  "
         f"reservado={final.get('saldo_reservado')}  disponível={final.get('limite_disponivel')}"
     )
     print("   (a ACL só toca concedido/status; a reserva de R$ 400 continua lá)")
+    confere(
+        bool(julgada), "legado: a ACL não registrou a v2 como OBSOLETA (avaliou mesmo a versão?)"
+    )
+    confere(na_dlq == 0, f"legado: {na_dlq} mensagem(ns) na legado-contratos-dlq")
     confere(
         bool(consumida)
         and final.get("versao_legado") == 3

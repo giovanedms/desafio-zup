@@ -23,7 +23,7 @@ Toda autorização concluída precisa virar evento para contabilidade, antifraud
    - publica em lote com `PutEvents` (até 10 por chamada) no bus custom `financas`;
    - **apaga** o item do outbox depois do sucesso.
    - Na AWS roda como **Lambda** com gatilho no Stream (resposta parcial em lote). Localmente, como **container** que faz polling no Stream da LocalStack. **É o mesmo módulo**, e só o adapter de entrada muda.
-3. **Sweeper** periódico. Lê o outbox, que só tem itens pendentes e por isso é pequeno, e republica o que estiver lá há mais de 15 min. Cobre o relay parado e o Stream expirado.
+3. **Sweeper** periódico. Lê o outbox, que só tem itens pendentes e por isso é pequeno, e republica o que estiver lá há mais de 15 min. Cobre o relay parado e o Stream expirado. A drenagem é **incremental**: Scan com `Limit` de 500 itens por página, cada página publicada antes da próxima, e parada em 10.000 itens ou 40 s por rodada (timeout da Lambda: 60 s). Nunca carrega o outbox inteiro na memória; backlog acima de ~10.000 itens a cada 5 min é trabalho do relay relendo o Stream (24 h), não do sweeper (runbook R2).
 4. **At-least-once, sem dedup na publicação.** Um evento pode sair duas vezes (relay e sweeper, ou retry). O `id` do CloudEvent é estável, e os consumidores deduplicam por `(source, id)` (inbox, ADR-0009).
 
 ## Consequências

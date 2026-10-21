@@ -52,7 +52,9 @@ git archive "$REF" contracts | tar -x -C "$BASE_DIR"
 falhou=0
 
 echo "== schemas de evento (${REF} -> working tree) =="
-python3 scripts/compat_schemas.py --base "$BASE_DIR/contracts/events" --novo contracts/events || falhou=1
+# Quebras aceitas: registro explícito e versionado (ADR-0008); arquivo ausente ou inválido reprova.
+python3 scripts/compat_schemas.py --base "$BASE_DIR/contracts/events" --novo contracts/events \
+  --aceitas contracts/events/quebras-aceitas.json || falhou=1
 
 echo "== OpenAPI (oasdiff ${OASDIFF_IMAGE}) =="
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then

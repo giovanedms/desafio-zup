@@ -32,7 +32,8 @@ Fatos (das especificações e da documentação oficial; os links principais est
 4. **Schemas como código** em `contracts/events/*.v1.schema.json` (JSON Schema draft-04, registrável no Schema Registry do EventBridge para descoberta), com exemplos.
 5. **Validação de verdade em três pontos:**
    - teste de contrato no produtor: todo evento gerado valida contra o schema (`autorizacao/tests/contract/test_cloudevents_contrato.py`);
-   - **gate de compatibilidade na CI** (`scripts/compat_contratos.sh`, job `contratos`, do qual o deploy depende): roda em **PR** (contra a base do PR) **e em push** (contra o tip anterior do ref, `github.event.before`; branch nova compara com a `main`). Dentro do major só entram campos opcionais novos (BACKWARD). É quebra: campo novo em `required`, propriedade removida, `type` alterado, valor removido de `enum`, atributo CE fixo alterado e todo **aperto de restrição**, porque o schema novo passaria a recusar evento que a base aceitava: `additionalProperties` fechado, `pattern` ou `format` novo ou alterado, `minimum`/`exclusiveMinimum` subindo, `maximum`/`exclusiveMaximum` descendo, `multipleOf` novo ou mais grosso, `minLength` subindo, `maxLength` descendo. Os OpenAPI passam pelo `oasdiff breaking`. **Fail-closed:** na CI, base inexistente ou docker indisponível reprova (localmente, `make compat` só avisa);
+   - **gate de compatibilidade na CI** (`scripts/compat_contratos.sh`, job `contratos`, do qual o deploy depende): roda em **PR** (contra a base do PR) **e em push** (contra o tip anterior do ref, `github.event.before`; branch nova compara com a `main`). Dentro do major só entram campos opcionais novos (BACKWARD). É quebra: campo novo em `required`, propriedade removida, `type` alterado, valor removido de `enum`, atributo CE fixo alterado e todo **aperto de restrição**, porque o schema novo passaria a recusar evento que a base aceitava: `additionalProperties` fechado, `pattern` ou `format` novo ou alterado, `minimum`/`exclusiveMinimum` subindo, `maximum`/`exclusiveMaximum` descendo, `multipleOf` novo ou mais grosso, `minLength`/`minItems`/`minProperties` subindo, `maxLength`/`maxItems`/`maxProperties` descendo, `uniqueItems` novo, `items` novo, **`enum`/`const` criado onde não havia** e `allOf`/`anyOf`/`oneOf`/`not`/`dependencies`/`patternProperties`/`$ref` novo ou alterado (o gate não decide se o combinador novo aceita tudo o que a base aceitava; remover só afrouxa). Valor **adicionado** a `enum` existente é compatível (só avisa). Os OpenAPI passam pelo `oasdiff breaking`. **Fail-closed:** na CI, base inexistente ou docker indisponível reprova (localmente, `make compat` só avisa);
+   - **quebra aceita, explícita e auditável:** `contracts/events/quebras-aceitas.json` lista as quebras que o gate deixa passar, cada uma com `schema`, `caminho`, `regra`, `motivo` e `data`. O gate (`--aceitas`, passado pelo `compat_contratos.sh` e portanto pelo job `contratos`) ignora **só a quebra exata** (`<schema>:<caminho>: <regra>`) e imprime `ACEITA ... (motivo; data)` no log da esteira; qualquer outra continua reprovando, e registro ausente ou malformado reprova. Entrada que deixou de casar (a base já tem a mudança) vira aviso e pode sair. O arquivo vive no mesmo PR da mudança, então a revisão do PR é a aprovação;
    - consumidor tolerante: `additionalProperties: true`, ignora campo desconhecido.
 6. **Catálogo de eventos:**
 
@@ -46,6 +47,14 @@ Fatos (das especificações e da documentação oficial; os links principais est
    | `TransacaoCompensada` (órfã desfeita pelo reconciliador; `havia_efeito`) | Autorização |
    | `TransacaoEmReconciliacaoManual` (caso encaminhado à fila humana, com o motivo) | Autorização |
    | `LimiteAlterado` (só alteração do limite concedido ou status vinda do core; **não** a cada reserva) | Limites |
+
+7. **Apertos registrados antes da primeira release da v1** (únicas entradas de `quebras-aceitas.json`):
+
+   | Data | Schema | Mudança | Por quê |
+   |---|---|---|---|
+   | 2026-10-21 | `transacao-autorizada.v1` | `data.tipo_operacao` passa a `required` | A contabilização lança por tipo e recusa o evento sem ele: com o campo opcional, um evento **válido pelo schema** ia para a DLQ do consumidor (painel 6, B-3). O produtor sempre emitiu o campo, e nenhum consumidor externo recebeu a v1, então apertar agora não quebra ninguém; **depois de qualquer release, a mesma mudança exige `v2`**. |
+
+   Na mesma data, mudanças **aditivas** (passam no gate sem registro): `canal` opcional (`APP`, `WEB`, `POS`, `PIX`, `BACKOFFICE`) em `TransacaoAutorizada` e `TransacaoRecusada`, para o registro do canal exigido no PLD/FT; e o `enum` de `motivo` da `TransacaoRecusada` alinhado ao `motivo_recusa` da API (inclui o novo `CONTA_DIVERGENTE`).
 
 ## Consequências
 

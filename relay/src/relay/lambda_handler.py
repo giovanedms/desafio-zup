@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -9,7 +10,12 @@ from typing import Any
 
 import boto3
 
-from relay.cdc_limites import SOURCE_NO_BUS, OutboxNoop, de_registro_do_stream_de_limites
+from relay.cdc_limites import (
+    SOURCE_NO_BUS,
+    OutboxNoop,
+    RegistroMalformado,
+    de_registro_do_stream_de_limites,
+)
 from relay.eventbridge import PublicadorEventBridge
 from relay.nucleo import EventoPendente, processar
 from relay.outbox_dynamodb import OutboxDynamoDB, de_registro_do_stream
@@ -90,21 +96,36 @@ def componentes_cdc_limites() -> ComponentesCdcLimites:
 def handler_cdc_limites(
     evento: dict[str, Any], contexto: object
 ) -> dict[str, list[dict[str, str]]]:
-    """Stream da tabela `limites` → LimiteAlterado no bus. Falhou = só o item volta (batchItemFailures)."""
+    """Stream da tabela `limites` → LimiteAlterado no bus. Falhou = só o item volta (batchItemFailures).
+
+    Registro malformado também volta como falha: o ESM tenta de novo e, esgotadas as tentativas, manda o
+    lote para a DLQ on-failure (com alarme). Nunca é descartado em silêncio.
+    """
     c = componentes_cdc_limites()
     pendentes: list[EventoPendente] = []
     sequencia_de: dict[str, str] = {}
+    malformados: list[str] = []
     for registro in evento.get("Records", []):
-        pendente = de_registro_do_stream_de_limites(registro)
+        sequencia = registro["dynamodb"]["SequenceNumber"]
+        try:
+            pendente = de_registro_do_stream_de_limites(registro)
+        except RegistroMalformado as erro:
+            log.error(
+                json.dumps(
+                    {"evento": "cdc_registro_malformado", "sequencia": sequencia, "erro": str(erro)}
+                )
+            )
+            malformados.append(sequencia)
+            continue
         if pendente is not None:
             pendentes.append(pendente)
-            sequencia_de[pendente.id_evento] = registro["dynamodb"]["SequenceNumber"]
+            sequencia_de[pendente.id_evento] = sequencia
     resultado = processar(pendentes, c.publicador, c.outbox)
     log.info(
-        '{"msg":"lote_cdc_limites","publicados":%d,"falhos":%d}',
+        '{"msg":"lote_cdc_limites","publicados":%d,"falhos":%d,"malformados":%d}',
         len(resultado.publicados),
         len(resultado.falhos),
+        len(malformados),
     )
-    return {
-        "batchItemFailures": [{"itemIdentifier": sequencia_de[i]} for i in sorted(resultado.falhos)]
-    }
+    falhas = [sequencia_de[i] for i in sorted(resultado.falhos)] + malformados
+    return {"batchItemFailures": [{"itemIdentifier": s} for s in falhas]}

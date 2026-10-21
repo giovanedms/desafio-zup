@@ -86,7 +86,8 @@
         "trace_id",
         "id_autorizacao",
         "valor",
-        "saldo_reservado"
+        "saldo_reservado",
+        "tipo_operacao"
       ],
       "properties": {
         "event_id": {
@@ -148,7 +149,8 @@
             "DEBITO",
             "CREDITO",
             "RESERVA"
-          ]
+          ],
+          "description": "Obrigatório: a contabilização lança por tipo. Entrou em `required` em 2026-10-21, antes de qualquer release (quebra registrada em quebras-aceitas.json; ADR-0008)."
         },
         "moeda": {
           "type": "string",
@@ -159,6 +161,17 @@
         },
         "id_estabelecimento": {
           "type": "string"
+        },
+        "canal": {
+          "type": "string",
+          "enum": [
+            "APP",
+            "WEB",
+            "POS",
+            "PIX",
+            "BACKOFFICE"
+          ],
+          "description": "Canal de origem da operação (opcional, aditivo). Registro do canal exigido para PLD/FT (Circular BCB 3.978/2020). Consumidor que não usa ignora."
         },
         "id_autorizacao_original": {
           "type": "string",

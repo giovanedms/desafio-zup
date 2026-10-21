@@ -25,12 +25,13 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 ## R2. Outbox crescendo / relay atrasado
 
 - **Sintoma:** alarme `IteratorAge` do relay > 60 s, ou itens antigos na tabela `autorizacoes-outbox`.
-- **Diagnóstico:** erros da Lambda relay (PutEvents throttled? quota?); estado do event source mapping.
+- **Diagnóstico:** erros da Lambda relay (PutEvents throttled? quota?); estado do event source mapping; linha `{"msg": "sweeper", ...}` no log do `desafio-sweeper` (`publicados`, `falhos`, `varridos`, `interrompida`).
 - **Ação:**
   - throttling → pedir aumento de quota de PutEvents;
   - erro de código → corrigir e reimplantar.
-  - O **sweeper** republica o que passou de 15 min, mesmo com o Stream expirado (24 h).
-- **Verificação:** outbox volta a quase zero; IteratorAge < 1 s.
+  - O **sweeper** republica o que passou de 15 min, mesmo com o Stream expirado (24 h). A drenagem é **incremental**: por rodada (a cada 5 min) ele lê o outbox em páginas de 500 itens (`Limit` do Scan), publica cada página antes de ler a próxima e para em **10.000 itens** ou em **40 s** (abaixo do timeout de 60 s da Lambda), o que vier primeiro. Ou seja, **no máximo N = 10.000 por rodada**: `interrompida: true` no log quer dizer que sobrou backlog para a rodada seguinte, não falha.
+  - Backlog muito maior que isso (ex.: relay parado por horas a milhares de TPS): o caminho de recuperação é o **relay** voltar a ler o Stream (24 h de retenção); o sweeper não drena milhões de itens. Se o Stream já expirou, invocar o sweeper à mão em sequência (`aws lambda invoke --function-name desafio-sweeper`) até `interrompida: false`; cada invocação é idempotente (consumidores deduplicam por `(source, id)`).
+- **Verificação:** outbox volta a quase zero; IteratorAge < 1 s; o sweeper loga `interrompida: false`.
 
 ## R3. Aumento de quota antes de pico (início de mês, campanha)
 

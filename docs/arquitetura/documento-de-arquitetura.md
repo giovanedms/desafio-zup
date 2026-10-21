@@ -145,7 +145,7 @@ Ver `docs/dominio/` (linguagem ubíqua e agregados) e o ADR-0002. Os agregados:
 - **Diagrama:** [05-implantacao-aws.svg](diagramas/05-implantacao-aws.svg).
 - **State:** S3 com KMS e lock nativo.
 - **Deploy:** pela esteira do GitHub Actions (OIDC, sem chave de longa duração) a cada push na `main`, ou `make deploy`, que exige `CONFIRMO:` e confere o ID da conta.
-- **Inventário completo** (174 recursos do sandbox, ambiente `esteira`, bootstrap da conta, custo e desvios): `docs/operacao/infraestrutura.md`.
+- **Inventário completo** (203 recursos do sandbox, ambiente `esteira`, bootstrap da conta, custo e desvios): `docs/operacao/infraestrutura.md`.
 
 ## 8. Qualidade
 

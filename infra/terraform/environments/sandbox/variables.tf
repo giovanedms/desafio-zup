@@ -74,6 +74,16 @@ variable "waf_limite_por_consumidor" {
   default     = 120000
 }
 
+variable "plano_carga" {
+  description = "Usage plan do canal-carga (só a janela de medição). Padrão estacionado no nível do plano-padrao (200 rps, metade do teto do WAF por consumidor); a medição sobe este plano e os dois tetos do WAF juntos (terraform.tfvars.example)."
+  type = object({
+    rate_limit  = number
+    burst_limit = number
+    quota_dia   = number
+  })
+  default = { rate_limit = 200, burst_limit = 400, quota_dia = 1000000 }
+}
+
 variable "deletion_protection" {
   description = "Proteção contra exclusão (tabelas e NLB). false no sandbox para o destroy funcionar."
   type        = bool

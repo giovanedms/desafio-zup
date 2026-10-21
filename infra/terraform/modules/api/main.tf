@@ -23,7 +23,7 @@ locals {
           connectionType      = "VPC_LINK"
           connectionId        = aws_api_gateway_vpc_link.this.id
           passthroughBehavior = "when_no_match"
-          timeoutInMillis     = 29000
+          timeoutInMillis     = var.timeout_integracao_ms # 10 s; a conta do orçamento está na variável
           # O serviço confia no client_id que o gateway extrai do token (sobrescreve qualquer X-Client-Id do cliente).
           # X-Gateway-Request-Id = $context.requestId: a chave de junção entre a linha do access log da borda e a do
           # serviço; é também o correlation_id das gateway responses. Sobrescreve qualquer valor vindo de fora. A AWS
@@ -346,9 +346,14 @@ resource "aws_cloudwatch_log_group" "execucao" {
 
 # ------------------------------------------------------------------ Usage plans e API keys
 
-# Usage plans: padrão (200 rps) e restrito (5 rps, para demonstrar 429).
+locals {
+  # Planos de canal + o plano da janela de medição (variável própria: a medição o sobe via tfvars, ver plano_carga).
+  planos = merge(var.planos, { "plano-carga" = var.plano_carga })
+}
+
+# Usage plans: padrão (200 rps), restrito (5 rps, para demonstrar 429) e carga (estacionado; a medição sobe).
 resource "aws_api_gateway_usage_plan" "this" {
-  for_each = var.planos
+  for_each = local.planos
 
   name = each.key
 

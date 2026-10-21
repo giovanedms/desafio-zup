@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | **0. Bootstrap da conta** | Manual, uma vez por conta (seção 2) | Administrador da Organization | — | Sim |
 | **1. Ambiente `esteira`** (`infra/terraform/environments/esteira`, 5 recursos) | Terraform | Administrador, uma vez; **nunca** a própria esteira | `esteira/terraform.tfstate` | Sim |
-| **2. Ambiente `sandbox`** (`infra/terraform/environments/sandbox`, 174 recursos) | Terraform | Esteira (push na `main`) ou `make deploy` | `sandbox/terraform.tfstate` | Não: é o que o destroy remove |
+| **2. Ambiente `sandbox`** (`infra/terraform/environments/sandbox`, 174 recursos <!-- recontar após deploy -->) | Terraform | Esteira (push na `main`) ou `make deploy` | `sandbox/terraform.tfstate` | Não: é o que o destroy remove |
 
 Além delas, a AWS cria sozinha alguns recursos ao primeiro uso de certos serviços (seção 5). O Terraform não os gerencia.
 
@@ -28,6 +28,7 @@ flowchart LR
   ROLE --> TF["terraform: state no S3 (camada 0)"]
   TF --> SBX["sandbox: 174 recursos (camada 2)"]
 ```
+<!-- recontar após deploy: o total do diagrama (174) mudou com o painel 6 -->
 
 ## 2. Camada 0 — bootstrap da conta
 
@@ -67,7 +68,7 @@ Feito à mão em 19/10/2026. Configuração conferida pela API em 20/10/2026.
 
 **Por que o `sub` tem IDs.** Para este repositório, o GitHub emite o claim com o ID imutável do dono e do repositório (`dono@id/repo@id`). O formato só com nomes foi recusado no primeiro deploy: o evento `AssumeRoleWithWebIdentity` negado, no CloudTrail, mostrou o `sub` real. Um repositório recriado com o mesmo nome tem outro ID e **não** assume a role. Forks e pull requests também não, porque o `ref` exigido é `refs/heads/main`.
 
-**IAM delegada (`iam-com-boundary-obrigatorio`)**, em 7 statements:
+**IAM delegada (`iam-com-boundary-obrigatorio`)**, em 10 statements (os 3 últimos são o perímetro da trilha de auditoria, painel 6):
 - **Criar e alterar role:** `CreateRole`, `PutRolePermissionsBoundary`, `PutRolePolicy`, `DeleteRolePolicy`, `AttachRolePolicy` e `DetachRolePolicy`, só com `iam:PermissionsBoundary` igual ao boundary.
 - **Manter roles:** `DeleteRole`, `TagRole`, `UntagRole`, `UpdateAssumeRolePolicy`, `UpdateRole` e `UpdateRoleDescription`, só em roles com a tag `project=desafio-autorizacao`.
 - **Etiquetar role nova:** `TagRole` quando o pedido traz a tag `project=desafio-autorizacao`.
@@ -75,6 +76,11 @@ Feito à mão em 19/10/2026. Configuração conferida pela API em 20/10/2026.
 - **Leitura:** `iam:Get*` e `iam:List*`.
 - **`Deny iam:*`** na própria role, no boundary, na `OrganizationAccountAccessRole` e no provedor OIDC.
 - **`Deny iam:DeleteRolePermissionsBoundary`** em tudo.
+- **`Deny` no CloudTrail:** `DeleteTrail`, `StopLogging`, `UpdateTrail` e `PutEventSelectors`, em qualquer trail.
+- **`Deny s3:BypassGovernanceRetention`** em qualquer bucket: o Object Lock em `GOVERNANCE` do bucket da trilha deixa de ser contornável pela esteira.
+- **`Deny` no bucket da trilha** (`desafio-zup-cloudtrail-*` e os objetos): `DeleteObjectVersion`, `PutBucketObjectLockConfiguration`, `PutLifecycleConfiguration`, `PutBucketPolicy` e `DeleteBucketPolicy` (reescrever a policy para negar a entrega do trail também desligaria a trilha).
+
+O `PowerUserAccess` dá `s3:*` e `cloudtrail:*`; o `Deny` explícito na política inline vence o `Allow` da gerenciada. Nada do deploy ou do destroy usa essas ações: o trail e o bucket são da camada 0. **Aplicar:** o administrador aplica o ambiente `esteira` (comandos abaixo); a esteira não se altera sozinha.
 
 **Boundary (`desafio-zup-limite-de-permissoes`)**: o teto de toda role da stack. Os recursos são da conta em sa-east-1, exceto as 4 ações sem nível de recurso do último item. Statements:
 - **Dados:** ações de item, consulta e Stream do DynamoDB em `table/*`.
@@ -99,22 +105,22 @@ AWS_PROFILE=desafio-zup terraform -chdir=infra/terraform/environments/esteira ap
 
 As variáveis `repositorio_github`, `id_dono_github`, `id_repositorio_github` e `branch_de_deploy` têm default para este repositório. Em um fork, os IDs mudam e precisam ser passados.
 
-## 4. Camada 2 — ambiente `sandbox` (174 recursos)
+## 4. Camada 2 — ambiente `sandbox` (174 recursos) <!-- recontar após deploy -->
 
 | Módulo | Recursos | Conteúdo |
 |---|---:|---|
 | raiz (`main.tf`) | 10 | Cluster ECS, namespace do Service Connect, 4 task roles (trust com `aws:SourceAccount` e `aws:SourceArn`) e as 4 políticas delas |
-| `rede` | 15 | VPC, subnets, rotas, security groups, 2 VPC endpoints gateway |
+| `rede` | 15 <!-- recontar após deploy --> | VPC, subnets, rotas, 2 VPC endpoints gateway e **um security group por serviço** com as regras de entrada e saída de cada um (seção 4.1) |
 | `api` | 30 | API Gateway REST, Cognito, WAF (teto por consumidor e por IP com 429, regras gerenciadas), NLB, VPC Link, logs do gateway |
 | `ecs_servico` × 4 (`autorizacao`, `limites`, `limites_acl`, `reconciliador`) | 32 (9 em `autorizacao` e `limites`, 7 em `limites_acl` e `reconciliador`) | Service, task definition, log group, role de execução e a política dela, alvo e política de autoscaling. Em `autorizacao` e `limites`, mais as 2 ações agendadas da janela de pico (início e fim) |
 | `dados` | 7 | 5 tabelas DynamoDB e Contributor Insights em 2 delas |
 | `ecr` | 4 | 2 repositórios (`autorizacao`, `limites`) e as lifecycle policies. O `desafio-zup/relay` saiu do conjunto padrão |
 | `eventos` | 27 | Bus, archive, 4 regras, 4 targets (com retry explícito e DLQ de entrega), 9 filas SQS (inclui a `financas-entrega-dlq`), 4 queue policies, 4 redrive-allow |
 | `lambdas` | 22 | 4 funções, 3 event source mappings, 1 schedule, 4 roles e 4 políticas, 2 DLQs, 4 log groups |
-| `observabilidade` | 27 | 16 alarmes, 5 metric filters, 1 dashboard, 1 regra de Contributor Insights, tópico SNS de alarmes e a policy dele, chave KMS do tópico e o alias. Com `email_alarmes`, mais 1 assinatura |
-| **Total** | **174** | `terraform state list` mostra 175 linhas: a 175ª é o data source `module.api.data.aws_region.atual` |
+| `observabilidade` | 27 <!-- recontar após deploy --> | 16 alarmes <!-- recontar após deploy -->, 5 metric filters <!-- recontar após deploy -->, 1 dashboard, 1 regra de Contributor Insights, tópico SNS de alarmes e a policy dele, chave KMS do tópico e o alias. Com `email_alarmes`, mais 1 assinatura. Painel 6: o alarme de 5XX virou burn rate (4 janelas + 2 alarmes compostos), e entraram idade das filas, Errors das 4 Lambdas, IteratorAge do CDC e 2 sinais de log (seção 4.8) |
+| **Total** | **174** <!-- recontar após deploy --> | `terraform state list` mostra 175 linhas: a 175ª é o data source `module.api.data.aws_region.atual` |
 
-**Tags.** O `default_tags` do provider aplica `environment=sandbox`, `team=plataforma-financas`, `managed-by=terraform` e `project=desafio-autorizacao`. Ficam **sem tag 62 recursos de 25 tipos**, todos de tipos que não têm argumento de tags no provider. Pelo state:
+**Tags.** O `default_tags` do provider aplica `environment=sandbox`, `team=plataforma-financas`, `managed-by=terraform` e `project=desafio-autorizacao`. Ficam **sem tag 62 recursos de 25 tipos** <!-- recontar após deploy -->, todos de tipos que não têm argumento de tags no provider. Pelo state:
 - **IAM:** `aws_iam_role_policy` (12), `aws_iam_role_policy_attachment` (1).
 - **API Gateway:** `aws_api_gateway_account` (1), `aws_api_gateway_deployment` (1), `aws_api_gateway_method_settings` (1), `aws_api_gateway_usage_plan_key` (3).
 - **Cognito:** `aws_cognito_user_pool_client` (3), `aws_cognito_user_pool_domain` (1), `aws_cognito_resource_server` (1).
@@ -133,8 +139,10 @@ Os outros 112 têm as 4 tags. O ambiente `esteira` usa as mesmas.
 | Subnets `desafio-publica-sa-east-1a` e `desafio-publica-sa-east-1c` | `10.40.0.0/24` e `10.40.1.0/24`. `map_public_ip_on_launch = false`: o IP público vem do service ECS (`assign_public_ip = true`) |
 | Internet gateway, route table `desafio-publica` | Rota `0.0.0.0/0` para o IGW, associada às 2 subnets |
 | Security group default `desafio-default-fechado` | Sem regras (fechado) |
-| Security group `desafio-tasks-<sufixo>` (tag `Name` = `desafio-tasks`; o nome usa `name_prefix`) | Entrada: TCP 8080 de `10.40.0.0/16` (NLB e Service Connect). Saída: TCP 443 para `0.0.0.0/0` (APIs AWS) e TCP 8080 para `10.40.0.0/16` |
+| Security groups por serviço `desafio-<serviço>-<sufixo>` (tag `Name` = `desafio-<serviço>`; o nome usa `name_prefix`) | **`autorizacao`:** entrada TCP 8080 de `10.40.0.0/16` (o NLB, ver abaixo); saída 443 para `0.0.0.0/0` e 8080 **só para o SG do `limites`**. **`limites`:** entrada TCP 8080 **só dos SGs do `autorizacao` e do `reconciliador`** (`referenced_security_group_id`); saída 443. **`limites-acl`:** sem entrada; saída 443. **`reconciliador`:** sem entrada; saída 443 e 8080 só para o SG do `limites` |
 | VPC endpoints **gateway** `com.amazonaws.sa-east-1.dynamodb` e `com.amazonaws.sa-east-1.s3` | Na route table pública, com a política padrão (acesso total) |
+
+**Segmentação leste-oeste (painel 6, G3).** Até o commit `5309e09` as 4 tasks dividiam um SG que abria a 8080 para a VPC inteira: o `limites-acl`, ou qualquer coisa rodando na VPC, chamava a API interna que move o limite. Agora a 8080 do `limites` só aceita os dois clientes reais, por referência de SG. Isso funciona com o Service Connect porque o proxy roda dentro da task cliente e a conexão sai da ENI dela para a `containerPort` do servidor ([ECS, Service Connect: networking](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect-concepts-deploy.html#service-connect-concepts-network)). O `autorizacao` ainda aceita o CIDR da VPC porque o NLB foi criado sem SG, e a AWS não deixa associar SG a um NLB depois de criado ([NLB security groups](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-security-groups.html)): ligar agora recriaria NLB, VPC Link e integração. O `run "rede_leste_oeste"` do `terraform test` reprova se o `limites` aceitar CIDR ou outro SG, se um worker ganhar entrada ou se a saída 8080 apontar para outro lugar.
 
 **Caminho do tráfego.** DynamoDB e S3 saem pelos endpoints gateway e não passam pela internet. As camadas das imagens do ECR são servidas pelo S3. As demais APIs (ECR API, CloudWatch Logs, SQS do `limites-acl`) saem pelo internet gateway na porta 443, com o IP público da task. **Não há NAT gateway.**
 
@@ -145,11 +153,11 @@ Os outros 112 têm as 4 tags. O ambiente `esteira` usa as mesmas.
 | REST API | `desafio-autorizacao` | Regional. O body importado parte do contrato `contracts/openapi/autorizacao-v1.yaml`, que traz as 2 rotas (`/v1/contratos/{id_contrato}/autorizacoes` e `.../{id_autorizacao}`) e declara só o esquema `oauth2`. O módulo (`modules/api/main.tf`, `local.especificacao`) acrescenta: a integração de cada rota com o VPC Link, que injeta `X-Client-Id` (do token) e `X-Gateway-Request-Id` (= `$context.requestId`, a junção com o log do serviço); o validador `parametros` (só parâmetros: barra a falta do `Idempotency-Key`; o **corpo não é validado na borda**, o serviço é a autoridade e responde o 422 do contrato); os esquemas `cognito` (authorizer do user pool) e `api_key` (header `x-api-key`); e as **12 gateway responses** em RFC 9457 (`ACCESS_DENIED`, `BAD_REQUEST_BODY`, `BAD_REQUEST_PARAMETERS`, `DEFAULT_4XX`, `DEFAULT_5XX`, `INTEGRATION_TIMEOUT`, `INVALID_API_KEY`, `MISSING_AUTHENTICATION_TOKEN`, `QUOTA_EXCEEDED`, `THROTTLED`, `UNAUTHORIZED` e `WAF_FILTERED`). O `DEFAULT_4XX` fixa 400, e a AWS aplica esse status a todo 4XX sem resposta própria: por isso `WAF_FILTERED`, `INVALID_API_KEY` e `MISSING_AUTHENTICATION_TOKEN` têm entrada explícita (403 `SEM_PERMISSAO`). As respostas ficam dentro do body porque, como resources separados, eram apagadas a cada reimportação (achado no deploy 1.0.1) |
 | Deployment e stage | `v1` | Redeploy quando muda o hash do body. X-Ray ligado. Access log JSON em `/aws/apigateway/desafio-autorizacao-v1` (`requestId`, `extendedRequestId`, IP, método, rota, status, latências, `clientId`). Execution log nível `ERROR` em `API-Gateway-Execution-Logs_<api-id>/v1`. Métricas por método. Sem cache |
 | Configuração da conta (`aws_api_gateway_account`) | — | Aponta para a role `desafio-autorizacao-apigw-cloudwatch` (`AmazonAPIGatewayPushToCloudWatchLogs`). É configuração da conta e da região, não da API |
-| VPC Link | `desafio-autorizacao-nlb` | Integração do REST (v1) com o NLB |
+| VPC Link | `desafio-autorizacao-nlb` | Integração do REST (v1) com o NLB. **Timeout da integração: 10 s** (`var.timeout_integracao_ms`; era 29 s, painel 6 D7). A conta está no `modules/api/variables.tf`: 10 s cobrem a falha transitória que as tentativas do código absorvem (um timeout no `limites` com a nova tentativa, ~4 s, ou 2-3 timeouts seguidos numa chamada ao DynamoDB). O `max_attempts: 3` do botocore são 3 tentativas **novas**, 4 no total, até 8 s por chamada mais o backoff; o pior caso teórico (~34 s) nem cabia nos 29 s. Acima de 10 s o canal recebe 504 `TEMPO_ESGOTADO` e repete com a mesma `Idempotency-Key` (replay) |
 | NLB | `desafio-autorizacao-nlb` | Interno, cross-zone, sem proteção contra exclusão (sandbox). Listener TCP 80 para o target group `desafio-autorizacao-tg` (TCP 8080, alvo `ip`). Health check HTTP `/saude` a cada 10 s (2 sucessos ou 2 falhas). Deregistration de 30 s |
 | Cognito user pool | `desafio-autorizacao-canais` | Só administrador cria usuário. Domínio `desafio-autorizacao-<conta>`. Resource server `autorizacoes` com escopos `read` e `write` |
 | Cognito app clients | `canal-app`, `canal-pos`, `canal-carga` | Fluxo `client_credentials`, com segredo, escopos `autorizacoes/read` e `autorizacoes/write`. Validade do token: padrão do Cognito |
-| API keys e usage plans | — | `canal-app` → `plano-restrito` (5 rps, burst 10, 1.000/dia). `canal-pos` → `plano-padrao` (200 rps, burst 400, 1 milhão/dia). `canal-carga` → `plano-carga` (6.000 rps, burst 5.000, 50 milhões/dia). A AWS aplica o throttling de usage plan em regime de melhor esforço (ADR-0010). O smoke dispara rajadas concorrentes de 40 chamadas pelo `canal-app` (até 3 tentativas) e exige ao menos um 429 em problem+json com `Retry-After` |
+| API keys e usage plans | — | `canal-app` → `plano-restrito` (5 rps, burst 10, 1.000/dia). `canal-pos` → `plano-padrao` (200 rps, burst 400, 1 milhão/dia). `canal-carga` → `plano-carga`, **estacionado** em 200 rps, burst 400, 1 milhão/dia (`var.plano_carga`; era 6.000 rps no default, painel 6 D11): metade do teto do WAF por consumidor, para um apply limpo não criar uma key com 60% do throttle da conta. A janela de medição sobe o plano e os dois tetos do WAF pelo tfvars (`terraform.tfvars.example`) e volta ao default depois. A AWS aplica o throttling de usage plan em regime de melhor esforço (ADR-0010). O smoke dispara rajadas concorrentes de 40 chamadas pelo `canal-app` (até 3 tentativas) e exige ao menos um 429 em problem+json com `Retry-After` |
 | WAF | `desafio-autorizacao-waf` | Regional, associado ao stage. Regra 1, `limite-por-consumidor`: rate-based agregada pelo header `x-api-key`, 120.000 requisições em 5 min (400 rps, o dobro do `plano-padrao`); requisição sem o header não conta. Regra 2, `limite-por-ip`: 300.000 por IP em 5 min (1.000 rps). As duas bloqueiam com **429**, `Retry-After: 60` e o corpo do catálogo (`codigo` `LIMITE_DE_REQUISICOES`); o `Content-Type` sai `application/json` (limitação do WAF) e não há `correlation_id`. Regra 3, `aws-common`: `AWSManagedRulesCommonRuleSet`, bloqueio pela gateway response `WAF_FILTERED` (403 problem+json). Ação padrão `allow`. Métricas e amostragem ligadas. A medição com o `canal-carga` sobe os dois tetos (`waf_limite_por_consumidor`, `waf_limite_por_ip`) |
 
 Outputs do ambiente: `invoke_url`, `token_endpoint`, `cognito_client_ids`, `ecr_urls`, `dashboard`, `topico_alarmes`, e os **sensíveis** `cognito_client_secrets` e `api_keys`. Os scripts `tests/e2e/aws.py` e `tests/load/aws_k6.py` leem esses outputs e nunca os imprimem.
@@ -167,7 +175,7 @@ Cluster `desafio` com Container Insights ligado. Namespace HTTP `desafio.local` 
 
 Comum aos 4:
 - Fargate `LATEST`, `awsvpc`, arquitetura **X86_64** no sandbox (seção 6) e usuário `10001:10001`.
-- Subnets públicas com IP público e o security group `desafio-tasks`.
+- Subnets públicas com IP público e o security group **do próprio serviço** (seção 4.1).
 - Circuit breaker de deploy com rollback, mínimo saudável de 100% e máximo de 200%. ECS Exec desligado.
 - **Janela de pico agendada** (`var.janelas_de_pico`) em `autorizacao` e `limites`: `aws_appautoscaling_scheduled_action` `<serviço>-inicio-de-mes-inicio` (`cron(30 6 1 * ? *)`, mínimo 4) e `<serviço>-inicio-de-mes-fim` (`cron(0 12 1 * ? *)`, volta a 2–20), no fuso `America/Sao_Paulo`. Um apply dentro da janela devolve o mínimo de base (runbook R3).
 - Target tracking de CPU a 60%, com cooldown de 60 s para subir e 300 s para descer. Em `limites-acl` e `reconciliador`, mínimo = máximo = 1, então a política não age. É a configuração do sandbox, não um limite do desenho:
@@ -189,12 +197,13 @@ Cada módulo `ecs_servico` também cria o log group `/ecs/<nome>` (7 dias) e a r
 O `run "task_roles_menor_privilegio"` em `infra/terraform/environments/sandbox/tests/sandbox.tftest.hcl` falha nestes casos:
 - alguma das 4 políticas usa `*`, `dynamodb:*` ou (em `limites-acl` e `reconciliador`) `sqs:*`;
 - `autorizacao`, `limites` ou `reconciliador` apontam para recurso que não é tabela ou índice DynamoDB;
+- `autorizacao`, `limites` ou `reconciliador` tocam qualquer recurso **fora da allowlist exclusiva** de cada um (`autorizacoes` + `autorizacoes-outbox`; `limites`; `autorizacoes`, os 2 índices e `autorizacoes-outbox`). Um `GetItem` do `autorizacao` na tabela `limites` reprova (painel 6, C8);
 - o `reconciliador` não alcança os dois índices;
 - o `limites-acl` toca algo além da fila do legado e da tabela `limites`;
 - alguma das 4 task roles está sem o boundary;
 - alguma das 4 task roles está sem `aws:SourceAccount`/`aws:SourceArn` na trust policy.
 
-Outros `run` do mesmo arquivo cobrem: warm throughput na tabela e no GSI quando configurado; retry e DLQ de entrega em todos os targets do EventBridge, com a policy da DLQ restrita às 4 regras; o validador do gateway (só parâmetros), o `X-Gateway-Request-Id` em toda integração, os 403 explícitos e o 429 das regras rate-based do WAF; ação SNS em todos os alarmes, a CMK e a policy do tópico, os alarmes de defasagem do legado e de reservas; a janela de pico do `ecs_servico`; e a trust policy da role do scheduler. `make tf-test` falha se nenhum `run` rodar.
+Outros `run` do mesmo arquivo cobrem: warm throughput na tabela e no GSI quando configurado; retry e DLQ de entrega em todos os targets do EventBridge, com a policy da DLQ restrita às 4 regras; o validador do gateway (só parâmetros), o `X-Gateway-Request-Id` em toda integração, o timeout de 10 s das integrações, os planos abaixo da metade do teto do WAF por consumidor, os 403 explícitos e o 429 das regras rate-based do WAF; ação SNS em todos os alarmes que notificam (inclusive os compostos), os limiares do burn rate (1,44% e 0,6%) e do p99 (400 ms), a idade de toda fila consumidora, Errors das 4 Lambdas, IteratorAge do CDC, os 3 metric filters dos sinais de log (seletor JSON no `/ecs/autorizacao`, termo no reconciliador e no CDC) e o alarme de `varreduras_com_erro`, a CMK e a policy do tópico, os alarmes de defasagem do legado e de reservas; a janela de pico do `ecs_servico`; a trust policy da role do scheduler, o filtro `INSERT` do relay e o teto de 200 do ESM da contabilização; e a segmentação leste-oeste dos SGs (`run "rede_leste_oeste"`). `make tf-test` falha se nenhum `run` rodar.
 
 ### 4.4 Dados (`modules/dados`)
 
@@ -202,7 +211,7 @@ Outros `run` do mesmo arquivo cobrem: warm throughput na tabela e no GSI quando 
 |---|---|---|---|---|
 | `limites` | `id_contrato` | — | `NEW_AND_OLD_IMAGES` (Lambda `desafio-relay-cdc-limites`, só `MODIFY`) | — |
 | `autorizacoes` | `pk` | `gsi_orfas` (`orfa_shard`, `orfa_lease_ms`) e `gsi_vencimentos` (`venc_shard`, `venc_ms`), ambos esparsos, projeção `ALL`, com N = 64 valores de shard cada (`EP#`/`RM#`/`RV#` 0..63; eram 10 até 20/10) | — | `ttl` |
-| `autorizacoes-outbox` | `pk` | — | `NEW_IMAGE` (Lambda `desafio-relay`) | `ttl` |
+| `autorizacoes-outbox` | `pk` | — | `NEW_IMAGE` (Lambda `desafio-relay`, só `INSERT`) | `ttl` ligado, mas **inofensivo**: o item do outbox não grava mais o atributo (painel 6, B-4), então nada expira por ele; quem apaga é o relay depois de publicar. Mantido para espelhar o `infra/local/bootstrap.py` |
 | `contabilizacao-lancamentos` | `pk` | — | — | — |
 | `contabilizacao-inbox` | `pk` | — | — | `ttl` |
 
@@ -245,10 +254,10 @@ Todas as filas usam SSE-SQS.
 
 | Função | Handler | Gatilho | Role |
 |---|---|---|---|
-| `desafio-relay` | `relay.lambda_handler.handler` | Stream de `autorizacoes-outbox` | `desafio-relay-role` |
+| `desafio-relay` | `relay.lambda_handler.handler` | Stream de `autorizacoes-outbox` com filtro `eventName = INSERT` (o `REMOVE` que o próprio relay gera ao apagar o item publicado não invoca a função; painel 6, B-7) | `desafio-relay-role` |
 | `desafio-sweeper` | `relay.sweeper.handler_agendado` | EventBridge Scheduler `desafio-sweeper-5min`, `rate(5 minutes)`, pela role `desafio-sweeper-scheduler` | `desafio-relay-role` (a mesma do relay) |
 | `desafio-relay-cdc-limites` | `relay.lambda_handler.handler_cdc_limites` | Stream de `limites` com filtro `eventName = MODIFY`; publica `LimiteAlterado` | `desafio-relay-cdc-limites-role` |
-| `desafio-contabilizacao` | `contabilizacao.adapters.inbound.lambda_sqs.handler` | Fila `contabilizacao`: lote de 10, concorrência máxima de 20, falha parcial de lote | `desafio-contabilizacao-role` |
+| `desafio-contabilizacao` | `contabilizacao.adapters.inbound.lambda_sqs.handler` | Fila `contabilizacao`: lote de 10, **teto de concorrência de 200** (`var.concorrencia_maxima_sqs`; era 20), falha parcial de lote | `desafio-contabilizacao-role` |
 
 - **Comum:** arm64, Python 3.13, pacote zip gerado por `make pacotes` em `infra/terraform/build/`, 256 MB, timeout de 30 s (o sweeper tem 60 s), X-Ray `Active`, sem concorrência reservada e log group `/aws/lambda/<nome>` com 7 dias.
 - **Gatilhos de Stream** (relay e CDC): lote de 100, posição `LATEST`, bisect em erro, 5 novas tentativas, `ReportBatchItemFailures`, sem limite de idade do registro (vale a retenção do Stream). Em falha, os registros vão para `relay-dlq` ou `relay-cdc-limites-dlq` (14 dias).
@@ -259,6 +268,7 @@ Todas as filas usam SSE-SQS.
 - **Contabilização:** consumir a fila e ler e escrever nas duas tabelas dela; logs; X-Ray.
 - **Scheduler:** `lambda:InvokeFunction` só no sweeper. A trust policy da role exige `aws:SourceAccount` = conta e `aws:SourceArn` = `arn:aws:scheduler:sa-east-1:<conta>:schedule-group/default` (o schedule do sweeper fica no grupo `default`, fixado no Terraform).
 - **Concorrência:** nenhuma função tem concorrência reservada. A conta tem 1.000 execuções concorrentes em vigor (seção 2), compartilhadas; os 4 `checkov:skip=CKV_AWS_115` dizem isso.
+- **Teto do ESM da contabilização (painel 6, D2):** concorrência = taxa de lotes × duração do lote. No pior mix (toda aprovação é captura, `docs/capacidade.md` §1.1) chegam ~10.000 mensagens/s; um lote de 10 com 2 escritas por evento a ~4 ms custa ~80 ms, ~100 ms com o overhead: 1.000 lotes/s × 0,1 s = 100 em voo. O teto de 200 dá 2× de folga e usa 20% da concorrência da conta. Os 20 de antes seguravam ~2.500 eventos/s. É teto, não reserva: parado, não custa nada. A idade da fila tem alarme (seção 4.8).
 
 ### 4.7 Imagens (`modules/ecr`)
 
@@ -268,6 +278,8 @@ Repositórios `desafio-zup/autorizacao` e `desafio-zup/limites`, com:
 - `force_delete = true`, para o destroy apagar as imagens;
 - lifecycle que mantém as 10 imagens mais recentes.
 
+**Imagens (painel 6, G5/G9):** as bases dos 4 Dockerfiles são fixadas por digest (`python:3.13-slim@sha256:…`, Python 3.13.16 sobre Debian trixie; `ghcr.io/astral-sh/uv:0.12@sha256:…`, uv 0.12.24), e o estágio runtime remove o `pip` da base (com o `ensurepip`): era ele que trazia `urllib3`, `msgpack` e `pkg_resources` vulneráveis, invisíveis ao scan do lock. Conferido em 21/10/2026 com `trivy image` nas 4 imagens: 0 CRITICAL; 0 HIGH em pacotes Python; 44 HIGH no Debian, **nenhum com correção publicada**. A esteira escaneia a imagem antes do push (seção 6).
+
 A esteira publica só `autorizacao` e `limites`. O `desafio-zup/relay`, que ficava vazio, saiu do conjunto padrão do módulo: na AWS o relay roda como Lambda zip, e a imagem dele só existe no ambiente local. O apply seguinte ao commit que tirou o repositório o destrói (`force_delete = true`).
 
 ### 4.8 Observabilidade (`modules/observabilidade`)
@@ -276,22 +288,30 @@ Dashboard `desafio-autorizacao`. Log groups: 10, todos com retenção de 7 dias 
 
 | Alarme (`desafio-autorizacao-…`) | Métrica | Dispara quando |
 |---|---|---|
-| `api-5xx-acima-de-1pct` | `100 * erros / FILL(total, 1)`, com `erros` = soma de `5XXError` e `total` = soma de `Count` do stage `v1` (5 min) | > 1% |
-| `api-latencia-p99` | `Latency` p99 do stage `v1` (1 min) | > 150 ms em 3 de 5 pontos |
+| `api-5xx-burn-rapido` (composto) | `api-5xx-burn-rapido-1h` **E** `api-5xx-burn-rapido-5min` em ALARM. Cada janela: `IF(total >= 1 rps × janela, 100 * FILL(erros, 0) / total, 0)`, com `erros` = soma de `5XXError` (inclui o 503 do shedding e o 504 de timeout) e `total` = soma de `Count` do stage `v1` | > 1,44% nas duas janelas (14,4× o orçamento de 0,1% do SLO de 99,9%: 2% do orçamento do mês em 1 h). Runbook R10 |
+| `api-5xx-burn-lento` (composto) | `api-5xx-burn-lento-6h` **E** `api-5xx-burn-lento-30min`, mesma expressão | > 0,6% nas duas (6×: 5% do orçamento em 6 h). Runbook R10 |
+| `api-5xx-burn-<janela>` (4, sem ação própria) | As janelas que alimentam os compostos | Só o composto notifica: a janela curta sozinha dispararia num pico de segundos |
+| `api-latencia-p99` | `Latency` p99 do stage `v1` (1 min) | > **400 ms** em 3 de 5 pontos (`var.p99_alarme_ms`). O SLO de 150 ms fica como linha no dashboard: o entregue não o atinge (164 ms no melhor degrau), e alarmar nele deixaria o alarme sempre em ALARM. Runbook R11 |
 | `dlq-<fila>` (7: `antifraude-dlq`, `contabilizacao-dlq`, `notificacoes-dlq`, `legado-contratos-dlq`, `relay-dlq`, `relay-cdc-limites-dlq`, `financas-entrega-dlq`) | `ApproximateNumberOfMessagesVisible` máximo (1 min) | > 0 |
 | `relay-iterator-age` | `IteratorAge` máximo de `desafio-relay` (1 min) | > 60 s |
+| `relay-cdc-limites-iterator-age` | `IteratorAge` máximo de `desafio-relay-cdc-limites` (1 min) | > 60 s. Runbook R12 |
+| `lambda-erros-<função>` (4: `relay`, `sweeper`, `cdc-limites`, `contabilizacao`) | `Errors` soma (5 min) | ≥ 1. Falha parcial de lote não conta (aparece no IteratorAge e na DLQ). Runbook R12 |
+| `idade-da-fila-<fila>` (3: `contabilizacao`, `antifraude`, `notificacoes`) | `ApproximateAgeOfOldestMessage` máximo (1 min) | > 300 s (`var.idade_fila_limite_s`, acima da visibilidade de 180 s). A fila do legado tem o alarme próprio abaixo. No sandbox, `antifraude` e `notificacoes` não têm consumidor: o alarme delas entra em ALARM 5 min depois do primeiro evento e fica até as mensagens expirarem, e isso é o sinal certo (ninguém consome). Runbook R13 |
+| `motivo-desconhecido-do-limite` | `desafio-zup/autorizacao MotivoDesconhecidoDoLimite`, alimentada por 2 metric filters: `{ $.evento = "motivo_desconhecido_do_limite" }` em `/ecs/autorizacao` (linha JSON pura) e o termo `"motivo_desconhecido_do_limite"` em `/ecs/reconciliador` (linha com prefixo de data e logger); soma em 5 min | ≥ 1. Runbook R14 |
+| `cdc-registro-descartado` | `desafio-zup/relay RegistrosDoCdcDescartados` (termo `cdc_registro_descartado` no log group do CDC), soma em 5 min | ≥ 1. Runbook R14 |
 | `guarda-de-idempotencia` | `desafio-zup/limites OperacoesNaGuarda` máximo (5 min) | > 2.000 entradas |
 | `reservas-ativas-no-item` | `desafio-zup/limites ReservasAtivas` máximo (5 min) | > 2.000 reservas num contrato (`var.limite_reservas_ativas`) |
 | `defasagem-do-legado` | `ApproximateAgeOfOldestMessage` máximo da fila `legado-contratos` (1 min) | > 300 s (`var.defasagem_legado_limite_s`, ADR-0014) |
 | `reconciliador-encaminhadas` | `OrfasEncaminhadas` (logs com `orfa_ENCAMINHADA` ou `reserva_ENCAMINHADA`), soma em 5 min | ≥ 1 |
 | `reconciliador-falhas` | `FalhasDoReconciliador` (`orfa_FALHOU` ou `reserva_FALHOU`), soma em 5 min | ≥ 6 |
 | `reconciliador-hold_perdido` | `ReservasSemHold` (`reserva_PERDEU_O_HOLD`), soma em 15 min | ≥ 20 |
+| `reconciliador-varreduras_com_erro` | `RodadasComVarreduraComErro` (rodadas cuja linha traz o campo `varreduras_com_erro`: alguma varredura levantou exceção), soma em 2 min | ≥ 2 (de ~4 rodadas). O heartbeat só renova em rodada sem exceção e o healthcheck reprova acima de 90 s: com 2 rodadas com erro, a task está a uma rodada de ser reciclada. Runbook R8 |
 
-- **Metric filters (5):** os três do reconciliador, sobre `/ecs/reconciliador` (namespace `desafio-zup/autorizacao`), e dois sobre a mesma linha JSON `guarda_de_idempotencia` em `/ecs/limites` (namespace `desafio-zup/limites`): `OperacoesNaGuarda` (`$.operacoes_na_guarda`) e `ReservasAtivas` (`$.reservas_ativas`). A linha sai quando a guarda **ou** as reservas do contrato passam de 200 entradas.
+- **Metric filters (5 <!-- recontar após deploy -->):** os três de sinal de log (`motivo_desconhecido_do_limite` por seletor JSON no `/ecs/autorizacao` e por termo no `/ecs/reconciliador`; `cdc_registro_descartado` por termo no log group do CDC, que usa `log_format = Text`; filtro sem linha correspondente é inofensivo), os quatro do reconciliador (três de desfecho e `varreduras_com_erro`), sobre `/ecs/reconciliador` (namespace `desafio-zup/autorizacao`), e dois sobre a mesma linha JSON `guarda_de_idempotencia` em `/ecs/limites` (namespace `desafio-zup/limites`): `OperacoesNaGuarda` (`$.operacoes_na_guarda`) e `ReservasAtivas` (`$.reservas_ativas`). A linha sai quando a guarda **ou** as reservas do contrato passam de 200 entradas.
 - **Dashboard:** o widget de idade da mensagem mais antiga inclui a fila `legado-contratos`, e há um widget de reservas ativas por contrato.
 - **Regra de Contributor Insights `desafio-autorizacao-guarda-por-contrato`:** em `/ecs/limites`, os contratos com mais `operacoes_na_guarda` (ADR-0016, runbook R8).
-- Os 16 usam `treat_missing_data = notBreaching`: ausência de dado conta como OK. Fila vazia ou função sem invocação não dispara alarme.
-- **Ação dos alarmes:** todos têm `alarm_actions` e `ok_actions` no tópico SNS `desafio-autorizacao-alarmes` (mais `var.acoes_alarme`, vazio).
+- Todos usam `treat_missing_data = notBreaching`: ausência de dado conta como OK. Fila vazia ou função sem invocação não dispara alarme.
+- **Ação dos alarmes:** todos têm `alarm_actions` e `ok_actions` no tópico SNS `desafio-autorizacao-alarmes` (mais `var.acoes_alarme`, vazio), exceto as 4 janelas do burn rate, que notificam pelo composto do par.
   - O tópico usa a chave KMS **gerenciada pelo cliente** `alias/desafio-autorizacao-alarmes`, com rotação anual e janela de exclusão de 7 dias. Não usa a `alias/aws/sns`: a política dessa chave não deixa o CloudWatch cifrar, e o alarme falharia ao publicar. A política da chave dá administração à conta (IAM) e `kms:GenerateDataKey*`/`kms:Decrypt` ao `cloudwatch.amazonaws.com`.
   - A policy do tópico só aceita `sns:Publish` do `cloudwatch.amazonaws.com` com `aws:SourceAccount` = conta e `aws:SourceArn` = `arn:aws:cloudwatch:sa-east-1:<conta>:alarm:*`.
   - **Sem assinatura por padrão** (`var.email_alarmes = ""`): no sandbox os alarmes chegam ao tópico e ninguém recebe. Com e-mail, a AWS manda uma confirmação; até confirmar, nada chega.
@@ -342,13 +362,13 @@ As 13 têm o permissions boundary `desafio-zup-limite-de-permissoes` (conferido 
 
 | Job | O que barra | Ferramentas |
 |---|---|---|
-| `qualidade` | Lint, tipos, regras de arquitetura, testes unitários, de contrato e de propriedade | `make check` (ruff, mypy strict, import-linter, pytest) |
+| `qualidade` | Lint, **SAST** (regras `S`, flake8-bandit, do ruff; supressões por arquivo com motivo no `pyproject.toml`), tipos, regras de arquitetura, testes unitários, de contrato e de propriedade | `make check` (ruff, mypy strict, import-linter, pytest) |
 | `integracao` | Contratos das portas contra DynamoDB, SQS e EventBridge reais da LocalStack | LocalStack `4.14.0` fixada por digest, `make test-integracao` |
-| `contratos` | Lint e estrutura do OpenAPI; exemplos de evento contra os JSON Schemas; compatibilidade com a base em push e PR, fail-closed | Spectral, `openapi-spec-validator`, `jsonschema`, `scripts/compat_contratos.sh` |
+| `contratos` | Lint e estrutura do OpenAPI; exemplos de evento contra os JSON Schemas; compatibilidade com a base em push e PR, fail-closed | Spectral `6.17.0`, `openapi-spec-validator` `0.9.0`, `jsonschema` `4.26.0` (versões exatas; os `uvx` com `UV_EXCLUDE_NEWER` fixando também as transitivas), `scripts/compat_contratos.sh` |
 | `terraform` | Formato, validação dos 2 ambientes e testes com `mock_provider` (nenhuma chamada à AWS) | Terraform `1.16.1`, `make tf-fmt tf-validate tf-test` |
-| `seguranca` | Vulnerabilidade de dependências, segredo e misconfiguração (HIGH e CRITICAL), e política de IaC | Trivy (fs), Checkov |
+| `seguranca` | Vulnerabilidade de dependências, segredo e misconfiguração (HIGH e CRITICAL), e política de IaC. O `ignore-unfixed` vale só aqui, no lock: vulnerabilidade sem correção não tem ação no `uv.lock`; o que não tem correção na imagem aparece no `trivy image` do `deploy` | Trivy `v0.75.0` (fs), Checkov |
 | `e2e` | A stack local inteira e a demo de 7 seções, que sai com 1 em qualquer divergência | `make up`, `make demo` |
-| `deploy` | Depende dos 6 jobs acima, na `main` | OIDC, ECR, buildx, Terraform |
+| `deploy` | Depende dos 6 jobs acima, na `main`. Escaneia cada imagem antes do push: **CRITICAL reprova** (com ou sem correção; aceitar o risco = `.trivyignore` com CVE, motivo e data, revisado em PR) e HIGH é listado no log | OIDC, ECR, buildx, Trivy `v0.75.0` (image), Terraform |
 | `smoke` | Borda do gateway (201, replay idêntico, 401 `problem+json`, 422 do serviço com `valor: 0`, 429 `problem+json` com `Retry-After` numa rajada concorrente pelo `canal-app`) e corrida de 100 reservas no DynamoDB real | `tests/e2e/aws.py borda` e `corrida` |
 | `destroy` | Só manual, com a frase | `terraform destroy` |
 
@@ -364,7 +384,7 @@ As 13 têm o permissions boundary `desafio-zup-limite-de-permissoes` (conferido 
 3. `make pacotes` (zips das Lambdas).
 4. `terraform init` com o bucket de state.
 5. `apply -target=module.ecr`.
-6. Login no ECR e `docker buildx build --platform linux/amd64` de `limites` e `autorizacao`, com cache do GitHub Actions. Uma tag que já existe é pulada.
+6. Login no ECR e, para `limites` e `autorizacao`: `docker buildx build --platform linux/amd64 --load` (cache do GitHub Actions), `trivy image` (lista HIGH, reprova CRITICAL) e só então `docker push`. Uma tag que já existe é pulada.
 7. `terraform plan -out=tfplan`. O resumo traz só os endereços dos recursos, sem valores.
 8. `terraform apply tfplan`.
 9. `aws ecs wait services-stable` nos 4 services.
@@ -372,7 +392,8 @@ As 13 têm o permissions boundary `desafio-zup-limite-de-permissoes` (conferido 
 **Por que X86_64 no sandbox.** O runner do GitHub é x86. Construir ARM64 exigiria emulação, e a esteira passa `TF_VAR_arquitetura_cpu=X86_64`. O default da variável é `ARM64`, o alvo de produção (ADR-0004). Na AWS, o ARM64 não foi medido (`docs/capacidade.md`).
 
 **Garantias da esteira:**
-- Actions fixadas por SHA de commit, com a tag no comentário.
+- Actions fixadas por SHA de commit, com a tag no comentário. Ferramentas baixadas na hora com versão exata (Spectral, `openapi-spec-validator`, `jsonschema`, Trivy) e imagens base por digest.
+- **Dependabot** (`.github/dependabot.yml`): PRs semanais para o `uv.lock`, as actions e as imagens base, com cooldown de 7 dias. As versões dos comandos `npx`/`uvx` e do Trivy sobem à mão.
 - `permissions: contents: read` por padrão; `id-token: write` só em `deploy`, `smoke` e `destroy`.
 - Grupo de concorrência `aws-sandbox` sem cancelamento: um apply nunca é interrompido no meio.
 - Fora da `main`, execuções antigas do mesmo ref são canceladas.
@@ -392,7 +413,7 @@ Preços **de sa-east-1 na AWS Pricing API**, consultados em 20/10/2026. Os itens
 | NLB | US$ 0,034/h, mais US$ 0,00825 por LCU-hora (≈ 0 parado) | ~0,82 |
 | IPv4 público | 6 tasks × US$ 0,005/h | ~0,72 |
 | WAF | US$ 5/mês pelo web ACL + US$ 1/mês por regra (3), rateado por hora; mais US$ 0,60 por milhão de requisições | ~0,27 |
-| Alarmes | ~25 métricas de alarme (16 da stack, o de 5xx com 2 métricas, + 8 do target tracking) × US$ 0,135/mês | ~0,11 |
+| Alarmes | ~25 métricas de alarme (16 da stack, o de 5xx com 2 métricas, + 8 do target tracking) × US$ 0,135/mês <!-- recontar após deploy -->. Painel 6: ~41 métricas (as 4 janelas do burn rate têm 2 cada) + 2 alarmes compostos (US$ 0,50/mês cada no preço de lista, não conferido para sa-east-1) | ~0,11 <!-- recontar após deploy --> (~0,2 estimado) |
 | Chave KMS dos alarmes | US$ 1/mês por chave gerenciada pelo cliente (preço de lista da AWS, não conferido na Pricing API de sa-east-1), mais requisições só quando um alarme muda de estado | ~0,03 |
 | **Fixo** | | **≈ 7** |
 
@@ -414,7 +435,7 @@ O Cost Explorer da conta ainda mostrava US$ 0 em 20/10/2026, porque os dados de 
 ## 8. Como conferir este inventário
 
 ```bash
-# Init com o bucket de state da conta (o backend é parcial) e contagem dos recursos gerenciados (174; o data source fica de fora)
+# Init com o bucket de state da conta (o backend é parcial) e contagem dos recursos gerenciados (174, a recontar após o deploy do painel 6; o data source fica de fora)
 AWS_PROFILE=desafio-zup terraform -chdir=infra/terraform/environments/sandbox init -backend-config="bucket=desafio-zup-tfstate-<conta>"
 AWS_PROFILE=desafio-zup terraform -chdir=infra/terraform/environments/sandbox state list | grep -vc '\.data\.'
 # Mesma conta para o ambiente da esteira (5)
@@ -431,6 +452,7 @@ aws ecs describe-services --profile desafio-zup --region sa-east-1 --cluster des
 |---|---|---|---|
 | Rede das tasks | Subnets públicas com IP público e sem ingress da internet. Sem NAT. Endpoints gateway só para DynamoDB e S3 | Subnets privadas e endpoints de interface (ECR, Logs, STS, SQS, EventBridge) | ADR-0017, `docs/compliance.md` |
 | Egress | TCP 443 para `0.0.0.0/0` | Prefix lists dos endpoints | `docs/compliance.md` |
+| **Segmentação leste-oeste** | SG por serviço; a 8080 do `limites` só aceita os SGs do `autorizacao` e do `reconciliador`; workers sem entrada. O `autorizacao` aceita a 8080 do CIDR da VPC porque o NLB não tem SG (não dá para associar depois de criado) | NLB criado com SG e entrada do `autorizacao` por referência ao SG do NLB; mTLS do Service Connect com identidade por serviço | Seção 4.1, `docs/compliance.md` |
 | Arquitetura das tasks | X86_64 | ARM64 (Graviton), depois de medir | ADR-0004, seção 6 |
 | Proteção contra exclusão | Desligada em tabelas e NLB (`var.deletion_protection`). O user pool usa o padrão do Cognito (`INACTIVE`). `force_delete` no ECR | Ligada | `var.deletion_protection` e módulos `api` e `ecr` |
 | **Ação dos alarmes** | Tópico SNS com CMK em todos os alarmes, **sem assinatura** por padrão | Plantão assinado no tópico, com runbook por alarme | Seção 4.8, `var.email_alarmes` |
@@ -438,7 +460,8 @@ aws ecs describe-services --profile desafio-zup --region sa-east-1 --cluster des
 | **Trava de região da SCP** | O `NotAction` isenta também serviços regionais (KMS, Config, ACM, WAFv2, Direct Connect, Service Quotas…) | `NotAction` só com serviços globais de fato | Desvio registrado aqui |
 | **Budget** | Só alerta por e-mail | Budget action ou automação que reduza ou pare a carga | Desvio registrado aqui |
 | Retenção | Logs por 7 dias; archive de eventos por 30 dias; CloudTrail por 30 dias em `GOVERNANCE` (1 dia de lock) | Trilha de eventos: 10 anos em `COMPLIANCE` (Circular 3.978). CloudTrail: registro de incidentes por 5 anos (ANPD 15/2024) | ADR-0017, `docs/compliance.md` |
-| Role da esteira | `PowerUserAccess` + IAM delegada com boundary. A `PowerUserAccess` também cria e apaga service-linked roles | Política gerada pelo IAM Access Analyzer a partir do CloudTrail | `docs/compliance.md` |
+| Role da esteira | `PowerUserAccess` + IAM delegada com boundary, e `Deny` explícito no CloudTrail, no contorno do Object Lock e no bucket da trilha. A `PowerUserAccess` também cria e apaga service-linked roles. Sem `environment` com revisor obrigatório nos jobs de CD | Política gerada pelo IAM Access Analyzer a partir do CloudTrail; trilha numa conta de log separada (trail da Organization), fora do alcance de qualquer role da conta de workload | `docs/compliance.md` |
+| **Alarme de latência** | p99 > 400 ms (`var.p99_alarme_ms`), acima do SLO de 150 ms, que o entregue não atinge | Limiar no SLO depois de fechar a lacuna (alavanca 1 de `docs/capacidade.md`) | Seção 4.8 |
 | mTLS leste-oeste | Desligado | TLS do Service Connect com AWS Private CA | `docs/compliance.md` |
 | Escala para pico previsível | Target tracking de CPU e janela agendada (dia 1, 06:30–12:00, mínimo 4). Warm throughput **desligado**. Sem predictive scaling | Janelas do calendário de pagamentos, warm throughput a 2× o pico (valores no ADR-0013) e predictive scaling com histórico | ADR-0004, ADR-0013 |
 | WAF | Tetos por consumidor (120.000/5 min) e por IP (300.000/5 min) com 429. Sem logging do WAF | Tetos por plano de canal, logging do WAF (Firehose/S3) e KnownBadInputs | ADR-0010 |

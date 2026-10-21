@@ -65,10 +65,21 @@ variable "retencao_logs_dias" {
   default     = 7
 }
 
+# Concorrência = taxa de lotes x duração do lote. Pico: 5.000 TransacaoAutorizada/s; no pior mix (toda aprovação é
+# captura, docs/capacidade.md §1.1) mais 5.000 ReservaCapturada/s = ~10.000 mensagens/s na fila contabilizacao.
+# Lote de 10 com 2 escritas por evento (inbox + lançamento) a ~4 ms medidos (docs/capacidade.md §3) = ~80 ms, ~100 ms
+# com o overhead da invocação. 10.000 / 10 x 0,1 s = 100 em voo; 200 dá 2x de folga para escrita lenta e cold start.
+# O antigo 20 travava em 20 x 10 / 0,08 s = ~2.500 eventos/s, abaixo do pico (painel 6, D2). É teto, não reserva: não
+# custa nada parado, e 200 é 20% das 1.000 execuções concorrentes da conta (ADR-0004), que o relay e o CDC dividem.
 variable "concorrencia_maxima_sqs" {
-  description = "Concorrência máxima do ESM da fila contabilizacao (a conta nova tem 400 no total, ADR-0004)."
+  description = "Teto de concorrência do ESM da fila contabilizacao (maximum_concurrency, 2 a 1.000). 200 = ~10.000 eventos/s no pior mix com lotes de ~100 ms e 2x de folga; a conta tem 1.000 execuções concorrentes no total (ADR-0004), compartilhadas entre as funções."
   type        = number
-  default     = 20
+  default     = 200
+
+  validation {
+    condition     = var.concorrencia_maxima_sqs >= 2 && var.concorrencia_maxima_sqs <= 1000
+    error_message = "concorrencia_maxima_sqs deve estar entre 2 e 1000 (limites do maximum_concurrency do ESM de SQS)."
+  }
 }
 
 variable "memoria_mb" {

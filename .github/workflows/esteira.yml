@@ -8,7 +8,10 @@
 #   e2e ───────┘
 #   destroy: só manual (workflow_dispatch), na main, com a frase de confirmação exata.
 #
-# Actions fixadas por SHA de commit (a tag fica no comentário): tag de action é mutável; SHA não.
+# Actions fixadas por SHA de commit (a tag fica no comentário): tag de action é mutável; SHA não. Ferramentas que a
+# esteira baixa na hora também têm versão exata: Spectral (npx), openapi-spec-validator e jsonschema (uvx, com corte de
+# data para as dependências transitivas), Trivy (binário). Imagens base dos Dockerfiles por digest. Atualização pelo
+# Dependabot (.github/dependabot.yml), exceto as versões dos comandos npx/uvx, que sobem à mão junto com o corte.
 # Segredos do repositório: AWS_ROLE_ARN (role da esteira, ambiente infra/terraform/environments/esteira) e
 # AWS_ACCOUNT_ID. A role só confia em workflows da main deste repositório (claim `sub` do token OIDC).
 name: esteira
@@ -94,16 +97,22 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+      # Versão exata (npx sem lockfile: as dependências transitivas do Spectral seguem as faixas do package.json dele).
       - name: Spectral (lint OpenAPI)
-        run: npx --yes @stoplight/spectral-cli@6 lint contracts/openapi/*.yaml --ruleset .spectral.yaml
+        run: npx --yes @stoplight/spectral-cli@6.17.0 lint contracts/openapi/*.yaml --ruleset .spectral.yaml
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+      # Versões exatas, e UV_EXCLUDE_NEWER fixa também as transitivas: o uvx só resolve o que já existia nessa data.
       - name: Validação estrutural OpenAPI 3.0
-        run: for f in contracts/openapi/*.yaml; do uvx openapi-spec-validator "$f"; done
+        env:
+          UV_EXCLUDE_NEWER: "2026-10-07T00:00:00Z"
+        run: for f in contracts/openapi/*.yaml; do uvx openapi-spec-validator==0.9.0 "$f"; done
       - name: Exemplos de evento cumprem os schemas (JSON Schema draft-04)
+        env:
+          UV_EXCLUDE_NEWER: "2026-10-07T00:00:00Z"
         run: |
-          uvx --with jsonschema python - <<'PY'
+          uvx --with jsonschema==4.26.0 python - <<'PY'
           import json, pathlib, sys
           import jsonschema
           base = pathlib.Path("contracts/events")
@@ -144,15 +153,19 @@ jobs:
           terraform_wrapper: false
       - run: make tf-fmt tf-validate tf-test
 
-  # SCA + segredos + misconfiguração (Trivy) e política de IaC (Checkov).
+  # SCA + segredos + misconfiguração (Trivy) e política de IaC (Checkov). SAST fica no `qualidade` (regras S do ruff).
   seguranca:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # ignore-unfixed SÓ aqui, no lock: vulnerabilidade sem versão corrigida não tem ação possível no uv.lock (a que
+      # tem correção reprova e vira bump). O que não tem correção não some: o SO e o Python da IMAGEM são escaneados no
+      # job deploy, que lista todo HIGH (com e sem correção) e reprova qualquer CRITICAL antes do push.
       - name: Trivy filesystem (vuln, secret, misconfig)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          version: v0.75.0
           scan-type: fs
           scan-ref: .
           scanners: vuln,secret,misconfig
@@ -190,7 +203,7 @@ jobs:
 
   # ---------------------------------------------------------------- CD
   # Deploy do sandbox: só da main, depois de TODO o CI verde. Ordem: repositórios ECR → imagens (tag do commit,
-  # imutável) → plan → apply → serviços ECS estáveis.
+  # imutável; build, trivy image e só então push) → plan → apply → serviços ECS estáveis.
   deploy:
     needs: [qualidade, integracao, contratos, terraform, seguranca, e2e]
     if: >-
@@ -220,6 +233,11 @@ jobs:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Binário do Trivy em versão exata para escanear a imagem construída (o SHA é o que o trivy-action v0.36.0 usa).
+      - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          version: v0.75.0
+          cache: true
       - name: Credenciais temporárias (OIDC → role da esteira)
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -244,17 +262,25 @@ jobs:
       - name: Login no ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
-      - name: Build e push (tag que já existe é pulada)
+      # O gate do fs olha o lock; este olha o ARTEFATO (SO da base + venv), que é o que roda. A imagem é construída no
+      # daemon local (--load), escaneada e só então publicada: CRITICAL reprova antes do push e do apply. HIGH é
+      # listado no log sem reprovar (a base Debian traz HIGH sem correção; o risco fica visível, não escondido).
+      # Aceitar um CRITICAL sem correção = .trivyignore com CVE, motivo e data, revisado em PR (o Trivy o lê da raiz).
+      - name: Build, trivy image e push (tag que já existe é pulada)
         env:
           REGISTRO: ${{ steps.ecr.outputs.registry }}
         run: |
           for s in limites autorizacao; do
+            imagem="$REGISTRO/desafio-zup/$s:$TAG"
             if aws ecr describe-images --repository-name "desafio-zup/$s" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
               echo "desafio-zup/$s:$TAG já existe; pulando"; continue
             fi
             docker buildx build --platform linux/amd64 -f "services/$s/Dockerfile" \
               --cache-from "type=gha,scope=$s" --cache-to "type=gha,mode=max,scope=$s" \
-              -t "$REGISTRO/desafio-zup/$s:$TAG" --push .
+              --load -t "$imagem" .
+            trivy image --no-progress --severity HIGH --exit-code 0 "$imagem"
+            trivy image --no-progress --severity CRITICAL --exit-code 1 "$imagem"
+            docker push "$imagem"
           done
       - name: terraform plan
         run: terraform -chdir="$TF_ENV" plan -input=false -out=tfplan

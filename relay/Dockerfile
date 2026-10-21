@@ -2,11 +2,13 @@
 # Build a partir da RAIZ do workspace (context = entrega/):
 #   docker build -f relay/Dockerfile -t desafio-zup/relay:dev .
 
-# Fonte do binário do uv (fixado na série 0.12).
-FROM ghcr.io/astral-sh/uv:0.12 AS uv
+# Bases fixadas por DIGEST (tag é mutável; o digest, não). A tag fica para leitura e para o Dependabot, que abre PR
+# quando ela anda. Resolvidas em 21/10/2026: uv 0.12.24 e Python 3.13.16 (Debian trixie), índices multi-arquitetura.
+# Fonte do binário do uv.
+FROM ghcr.io/astral-sh/uv:0.12@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a AS uv
 
 # ---- build: resolve e instala só o necessário para o relay num venv isolado ----
-FROM python:3.13-slim AS build
+FROM python:3.13-slim@sha256:cf50a4f6ac4f026458b08d5222023d700ac806410dff5e9ca8728fa44f2b850f AS build
 COPY --from=uv /uv /usr/local/bin/uv
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
@@ -33,8 +35,16 @@ COPY relay relay
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --package relay --no-editable
 
-# ---- runtime: só o venv, sem uv, sem compilador, sem fontes ----
-FROM python:3.13-slim AS runtime
+# ---- runtime: só o venv, sem uv, sem pip, sem compilador, sem fontes ----
+FROM python:3.13-slim@sha256:cf50a4f6ac4f026458b08d5222023d700ac806410dff5e9ca8728fa44f2b850f AS runtime
+
+# Sem instalador de pacotes no runtime: o pip da imagem base (e o que ele vendoriza: urllib3, certifi, msgpack,
+# pkg_resources) não é usado pela aplicação, trazia CVEs HIGH com correção (painel 6, G5) e deixaria um `pip install`
+# pronto para quem invadir o container. O ensurepip sai junto (guarda o wheel do pip). O python:3.13 já não traz
+# setuptools nem wheel; o rm cobre a base se isso voltar.
+RUN python -m pip uninstall --yes --no-input pip \
+    && rm -rf /usr/local/lib/python3.13/ensurepip /usr/local/lib/python3.13/site-packages/setuptools* \
+        /usr/local/lib/python3.13/site-packages/wheel* /usr/local/bin/pip* /usr/local/bin/wheel
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \

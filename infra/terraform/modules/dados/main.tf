@@ -25,7 +25,10 @@ locals {
         gsi_vencimentos = { hash_key = "venc_shard", hash_type = "S", range_key = "venc_ms", range_type = "N" }
       }
     }
-    # Outbox transacional (ADR-0007); o stream NEW_IMAGE alimenta o relay.
+    # Outbox transacional (ADR-0007); o stream NEW_IMAGE alimenta o relay. O TTL fica LIGADO e inofensivo: o item do
+    # outbox não grava mais o atributo `ttl` (painel 6, B-4: o TTL apagava evento ainda não publicado), então nada expira
+    # por ele; quem tira o item é o relay depois de publicar. Mantido para espelhar o infra/local/bootstrap.py, que cria a
+    # tabela com TTL; desligar exigiria mudar os dois juntos e não ganha nada.
     "autorizacoes-outbox" = {
       hash_key    = "pk"
       stream_view = "NEW_IMAGE"

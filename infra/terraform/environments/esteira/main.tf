@@ -132,7 +132,8 @@ resource "aws_iam_role_policy_attachment" "power_user" {
 }
 
 # IAM delegada: a esteira só cria/altera role que carregue o boundary; não mexe na própria role, na role de
-# administração da Organization nem no boundary (padrão "delegated admin" com permissions boundary).
+# administração da Organization nem no boundary (padrão "delegated admin" com permissions boundary). Na mesma política,
+# o perímetro da trilha de auditoria: Deny no CloudTrail, no contorno do Object Lock e no bucket da trilha.
 resource "aws_iam_role_policy" "iam_delegada" {
   name = "iam-com-boundary-obrigatorio"
   role = aws_iam_role.esteira.id
@@ -201,6 +202,34 @@ resource "aws_iam_role_policy" "iam_delegada" {
         Effect   = "Deny"
         Action   = "iam:DeleteRolePermissionsBoundary"
         Resource = "*"
+      },
+      # Perímetro da trilha de auditoria (painel 6, G6). O PowerUserAccess dá s3:* e cloudtrail:*, então um commit na
+      # main podia apagar o trail ou as versões do bucket WORM (Object Lock GOVERNANCE se contorna com
+      # s3:BypassGovernanceRetention). Deny explícito vence o Allow da política gerenciada. A esteira nunca administra
+      # o trail nem o bucket dele (camada 0, bootstrap manual), então nada do deploy/destroy depende destas ações.
+      {
+        Sid      = "NuncaDesligarATrilha"
+        Effect   = "Deny"
+        Action   = ["cloudtrail:DeleteTrail", "cloudtrail:StopLogging", "cloudtrail:UpdateTrail", "cloudtrail:PutEventSelectors"]
+        Resource = "*"
+      },
+      {
+        # Contornar retenção de Object Lock em modo GOVERNANCE: nenhum bucket da conta precisa disso pela esteira.
+        Sid      = "NuncaContornarObjectLock"
+        Effect   = "Deny"
+        Action   = "s3:BypassGovernanceRetention"
+        Resource = "*"
+      },
+      {
+        # Bucket da trilha: apagar versão, trocar o Object Lock ou o lifecycle (encurtar a retenção) e reescrever a
+        # policy (negar a entrega do trail também é desligar a trilha).
+        Sid    = "NuncaMexerNoBucketDaTrilha"
+        Effect = "Deny"
+        Action = [
+          "s3:DeleteObjectVersion", "s3:PutBucketObjectLockConfiguration", "s3:PutLifecycleConfiguration",
+          "s3:PutBucketPolicy", "s3:DeleteBucketPolicy",
+        ]
+        Resource = ["arn:aws:s3:::desafio-zup-cloudtrail-*", "arn:aws:s3:::desafio-zup-cloudtrail-*/*"]
       },
     ]
   })

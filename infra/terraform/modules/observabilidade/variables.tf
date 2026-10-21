@@ -91,13 +91,62 @@ variable "limite_reservas_ativas" {
 }
 
 variable "p99_limite_ms" {
-  description = "Limiar do alarme de latência p99 (RNF: 150 ms)."
+  description = "SLO de latência p99 no gateway (ADR-0001: 150 ms). Linha do dashboard; NÃO é o limiar do alarme (p99_alarme_ms)."
   type        = number
   default     = 150
 }
 
+variable "p99_alarme_ms" {
+  description = "Limiar do alarme de latência p99 (3 de 5 min). 400 ms, ~2,7x o SLO: acima do medido com folga de CPU (164 ms) e abaixo da saturação (874 ms); alarmar no SLO dispararia sempre, porque o entregue não o atinge (docs/capacidade.md, seção 3)."
+  type        = number
+  default     = 400
+}
+
+variable "slo_disponibilidade" {
+  description = "SLO de disponibilidade mensal da API (ADR-0001: 99,9%). Base do burn rate dos alarmes de 5XX (orçamento = 1 - SLO)."
+  type        = number
+  default     = 0.999
+
+  validation {
+    condition     = var.slo_disponibilidade > 0 && var.slo_disponibilidade < 1
+    error_message = "slo_disponibilidade deve estar entre 0 e 1 (ex.: 0.999)."
+  }
+}
+
+variable "burn_rate_rps_minimo" {
+  description = "Média mínima de requisições por segundo numa janela para o burn rate avaliar (abaixo disso a janela conta como OK: sem amostra para medir 0,1%)."
+  type        = number
+  default     = 1
+}
+
+variable "idade_fila_limite_s" {
+  description = "Limiar do alarme de idade da mensagem mais antiga nas filas consumidoras (s). 300 > visibilidade de 180 s: uma única falha transitória (a mensagem volta depois da visibilidade) não dispara."
+  type        = number
+  default     = 300
+}
+
+variable "funcoes_lambda" {
+  description = "Chave curta -> nome da função Lambda. Cada uma ganha alarme de Errors >= 1 em 5 min."
+  type        = map(string)
+}
+
+variable "cdc_funcao" {
+  description = "Nome da função relay-cdc-limites (alarme de IteratorAge, como o do relay)."
+  type        = string
+}
+
+variable "log_group_autorizacao" {
+  description = "Nome do log group do serviço autorizacao (origem da linha motivo_desconhecido_do_limite)."
+  type        = string
+}
+
+variable "log_group_cdc" {
+  description = "Nome do log group da função relay-cdc-limites (origem da linha cdc_registro_descartado)."
+  type        = string
+}
+
 variable "iterator_age_limite_ms" {
-  description = "Limiar do IteratorAge do relay (60 s)."
+  description = "Limiar do IteratorAge do relay e do relay-cdc-limites (60 s)."
   type        = number
   default     = 60000
 }

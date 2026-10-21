@@ -32,3 +32,8 @@ output "cdc_limites_dlq_nome" {
   description = "Nome da DLQ do relay-cdc-limites."
   value       = aws_sqs_queue.cdc_limites_dlq.name
 }
+
+output "cdc_limites_log_group_nome" {
+  description = "Log group da função relay-cdc-limites (metric filter de registro descartado)."
+  value       = aws_cloudwatch_log_group.this["cdc_limites"].name
+}

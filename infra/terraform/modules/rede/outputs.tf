@@ -13,7 +13,7 @@ output "subnet_ids_publicas" {
   value       = aws_subnet.publica[*].id
 }
 
-output "sg_tasks_id" {
-  description = "ID do SG das tasks Fargate."
-  value       = aws_security_group.tasks.id
+output "sg_ids" {
+  description = "Serviço -> ID do SG das tasks dele (autorizacao, limites, limites-acl, reconciliador)."
+  value       = local.sgs_dos_servicos
 }

@@ -31,12 +31,36 @@ line-length = 100
 target-version = "py313"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "SIM", "N", "RUF", "PL"]
+# S = flake8-bandit (SAST). Cada supressão abaixo é por arquivo e diz por que o achado é benigno ali.
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "N", "RUF", "PL", "S"]
 ignore = [
     "PLR0913", "PLR2004",
     "RUF001", "RUF002", "RUF003",  # notação matemática intencional nas docstrings (−, ≥, Σ, ≠)
     "N818",  # linguagem ubíqua em português: exceções se chamam pelo fato (ValorMonetarioInvalido)
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Testes: assert é o mecanismo do pytest; "test" é a credencial fictícia da LocalStack e do Stubber do botocore. Os
+# subprocess (terraform output, docker compose, k6) têm argv fixo, sem shell=True e sem entrada externa; o executável
+# vem do PATH do operador/CI de propósito.
+"**/tests/**" = ["S101", "S106", "S603", "S607"]
+# Credenciais fictícias "test" da LocalStack. Só são usadas DEPOIS do guard que recusa endpoint fora de
+# 127.0.0.1/localhost/localstack (raise ou sys.exit): esse guard é o controle, e é o que torna o S106 inofensivo.
+"services/limites/src/limites/main.py" = ["S106"]
+"services/contabilizacao/src/contabilizacao/main.py" = ["S106"]
+"relay/src/relay/local.py" = ["S106", "S108"]
+"legado-mock/src/legado_mock/__main__.py" = ["S106"]
+"infra/local/bootstrap.py" = ["S106"]
+# Heartbeat dos workers em /tmp DENTRO do container (uid 10001, FS próprio da task): arquivo vazio, só o mtime importa,
+# lido pelo healthcheck do próprio container. Não há outro usuário nem dado sensível para um ataque de symlink/race.
+"services/autorizacao/src/autorizacao/adapters/inbound/reconciliador.py" = ["S108"]
+"services/contabilizacao/src/contabilizacao/adapters/inbound/poller.py" = ["S108"]
+"services/limites/src/limites/adapters/inbound/legado/consumidor.py" = ["S108"]
+# assert de invariante do agregado, para estreitar o tipo (mypy strict): aprovação sempre tem saldos, recusa sempre
+# tem motivo, estorno sempre tem original. As imagens não rodam com -O/PYTHONOPTIMIZE; violado, é bug e vira 500.
+"services/autorizacao/src/autorizacao/adapters/inbound/http.py" = ["S101"]
+"services/autorizacao/src/autorizacao/adapters/outbound/dynamodb.py" = ["S101"]
+"services/autorizacao/src/autorizacao/application/autorizar.py" = ["S101"]
 
 [tool.ruff.lint.pycodestyle]
 max-line-length = 120  # E501: docstrings/comentários em PT até 120; o formatter mantém o código em 100

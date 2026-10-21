@@ -1,0 +1,57 @@
+# Dependabot: PRs de atualização para o lock do Python, as actions (fixadas por SHA) e as imagens base (fixadas por
+# digest). Os PRs passam pela esteira inteira (make check, trivy fs, contratos, e2e) antes de qualquer merge.
+# Cooldown: versão publicada há menos de 7 dias não vira PR (janela para o ecossistema detectar pacote malicioso);
+# correção de segurança não espera o cooldown (security updates seguem o fluxo próprio do Dependabot).
+# Fora daqui: as versões dos comandos npx/uvx da esteira (Spectral, openapi-spec-validator, jsonschema) e o Trivy,
+# que sobem à mão (comentário no topo de .github/workflows/esteira.yml).
+version: 2
+updates:
+  # Workspace uv (pyproject.toml da raiz + membros, uv.lock).
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      timezone: "America/Sao_Paulo"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      python-menores:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "deps(python)"
+
+  # Actions do workflow (o Dependabot atualiza o SHA e a tag do comentário).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      timezone: "America/Sao_Paulo"
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(actions)"
+
+  # Imagens base dos 4 Dockerfiles (python:3.13-slim e uv:0.12 por digest).
+  - package-ecosystem: "docker"
+    directories:
+      - "/services/autorizacao"
+      - "/services/limites"
+      - "/services/contabilizacao"
+      - "/relay"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      timezone: "America/Sao_Paulo"
+    cooldown:
+      default-days: 7
+    groups:
+      imagens-base:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(docker)"

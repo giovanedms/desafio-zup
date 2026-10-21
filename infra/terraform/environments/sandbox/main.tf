@@ -51,7 +51,7 @@ locals {
 
 # ---------------------------------------------------------------- módulos de base
 
-# Rede (VPC, subnets públicas, endpoints gateway, SG das tasks).
+# Rede (VPC, subnets públicas, endpoints gateway, um SG por serviço com a 8080 do limites só para os clientes dele).
 module "rede" {
   source = "../../modules/rede"
 
@@ -161,7 +161,7 @@ module "limites" {
   repositorio_ecr_arn      = module.ecr.arns["limites"]
   task_role_arn            = aws_iam_role.task_limites.arn
   subnet_ids               = module.rede.subnet_ids_publicas
-  security_group_ids       = [module.rede.sg_tasks_id]
+  security_group_ids       = [module.rede.sg_ids["limites"]]
   cpu                      = var.cpu
   memoria                  = var.memoria
   desired_count            = var.tasks_desejadas
@@ -190,7 +190,7 @@ module "autorizacao" {
   repositorio_ecr_arn = module.ecr.arns["autorizacao"]
   task_role_arn       = aws_iam_role.task_autorizacao.arn
   subnet_ids          = module.rede.subnet_ids_publicas
-  security_group_ids  = [module.rede.sg_tasks_id]
+  security_group_ids  = [module.rede.sg_ids["autorizacao"]]
   cpu                 = var.cpu
   memoria             = var.memoria
   desired_count       = var.tasks_desejadas
@@ -262,7 +262,7 @@ module "limites_acl" {
   repositorio_ecr_arn = module.ecr.arns["limites"]
   task_role_arn       = aws_iam_role.task_limites_acl.arn
   subnet_ids          = module.rede.subnet_ids_publicas
-  security_group_ids  = [module.rede.sg_tasks_id]
+  security_group_ids  = [module.rede.sg_ids["limites-acl"]]
   cpu                 = 256
   memoria             = 512
   desired_count       = 1
@@ -346,7 +346,7 @@ module "reconciliador" {
   repositorio_ecr_arn = module.ecr.arns["autorizacao"]
   task_role_arn       = aws_iam_role.task_reconciliador.arn
   subnet_ids          = module.rede.subnet_ids_publicas
-  security_group_ids  = [module.rede.sg_tasks_id]
+  security_group_ids  = [module.rede.sg_ids["reconciliador"]]
   cpu                 = 256
   memoria             = 512
   desired_count       = 1
@@ -389,6 +389,7 @@ module "api" {
   contrato_openapi          = local.contrato
   waf_limite_por_ip         = var.waf_limite_por_ip
   waf_limite_por_consumidor = var.waf_limite_por_consumidor
+  plano_carga               = var.plano_carga
   deletion_protection       = var.deletion_protection
 }
 
@@ -417,7 +418,7 @@ module "lambdas" {
   }
 }
 
-# Dashboard e alarmes.
+# Dashboard e alarmes (burn rate do SLO, p99, DLQs, idade das filas, Errors e IteratorAge das Lambdas, sinais de log).
 module "observabilidade" {
   source = "../../modules/observabilidade"
 
@@ -434,6 +435,16 @@ module "observabilidade" {
   fila_legado             = module.eventos.fila_legado_nome
   dlqs                    = concat(values(module.eventos.dlqs_nomes), [module.lambdas.relay_dlq_nome, module.lambdas.cdc_limites_dlq_nome, module.eventos.fila_legado_dlq_nome, module.eventos.entrega_dlq_nome])
   relay_funcao            = module.lambdas.relay_nome
+  cdc_funcao              = module.lambdas.cdc_limites_nome
   log_group_limites       = module.limites.log_group_nome
   log_group_reconciliador = module.reconciliador.log_group_nome
+  log_group_autorizacao   = module.autorizacao.log_group_nome
+  log_group_cdc           = module.lambdas.cdc_limites_log_group_nome
+
+  funcoes_lambda = {
+    relay          = module.lambdas.relay_nome
+    sweeper        = module.lambdas.sweeper_nome
+    cdc-limites    = module.lambdas.cdc_limites_nome
+    contabilizacao = module.lambdas.contabilizacao_nome
+  }
 }

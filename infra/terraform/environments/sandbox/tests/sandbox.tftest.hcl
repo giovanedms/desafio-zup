@@ -267,6 +267,23 @@ run "api_com_tracing_e_problem_json" {
     )
     error_message = "O corpo do 429 do WAF deve seguir o catálogo (codigo LIMITE_DE_REQUISICOES, status 429)."
   }
+
+  # D7: toda integração com o timeout do orçamento (10 s), não o teto de 29 s da AWS.
+  assert {
+    condition = alltrue(flatten([
+      for caminho, metodos in output.timeouts_da_integracao : [for metodo, t in metodos : t == 10000]
+    ]))
+    error_message = "Toda integração deve usar timeoutInMillis = 10000 (orçamento em var.timeout_integracao_ms)."
+  }
+
+  # D11: num apply limpo, nenhum plano passa da metade do teto do WAF por consumidor (o plano-carga sobe só via tfvars).
+  assert {
+    condition = alltrue([
+      for p in aws_api_gateway_usage_plan.this :
+      p.throttle_settings[0].rate_limit * 300 * 2 <= var.waf_limite_por_consumidor
+    ]) && length(aws_api_gateway_usage_plan.this) == 3
+    error_message = "Os 3 planos padrão devem ficar a no máximo metade do teto do WAF por consumidor (plano-carga estacionado em 200 rps)."
+  }
 }
 
 # --- Observabilidade: todo alarme com ação (tópico SNS com CMK), defasagem do legado e reservas no item ------------
@@ -284,12 +301,21 @@ run "observabilidade_alarmes_com_acao" {
     tabelas_com_latencia    = ["limites"]
     cluster_nome            = "desafio"
     servicos_ecs            = ["autorizacao"]
-    filas                   = ["contabilizacao", "legado-contratos"]
+    filas                   = ["contabilizacao", "antifraude", "legado-contratos"]
     fila_legado             = "legado-contratos"
     dlqs                    = ["contabilizacao-dlq", "financas-entrega-dlq"]
     relay_funcao            = "desafio-relay"
+    cdc_funcao              = "desafio-relay-cdc-limites"
     log_group_limites       = "/ecs/limites"
     log_group_reconciliador = "/ecs/reconciliador"
+    log_group_autorizacao   = "/ecs/autorizacao"
+    log_group_cdc           = "/aws/lambda/desafio-relay-cdc-limites"
+    funcoes_lambda = {
+      relay          = "desafio-relay"
+      sweeper        = "desafio-sweeper"
+      cdc-limites    = "desafio-relay-cdc-limites"
+      contabilizacao = "desafio-contabilizacao"
+    }
   }
 
   override_resource {
@@ -308,19 +334,106 @@ run "observabilidade_alarmes_com_acao" {
     }
   }
 
+  # As janelas do burn rate (api_5xx_janela) ficam de fora de propósito: quem notifica é o composto de cada par.
   assert {
     condition = alltrue([
       for a in concat(
         [
-          aws_cloudwatch_metric_alarm.api_5xx, aws_cloudwatch_metric_alarm.api_p99, aws_cloudwatch_metric_alarm.relay_iterator_age,
+          aws_cloudwatch_metric_alarm.api_p99, aws_cloudwatch_metric_alarm.relay_iterator_age, aws_cloudwatch_metric_alarm.cdc_iterator_age,
           aws_cloudwatch_metric_alarm.guarda, aws_cloudwatch_metric_alarm.reservas, aws_cloudwatch_metric_alarm.defasagem_legado,
         ],
         values(aws_cloudwatch_metric_alarm.dlq), values(aws_cloudwatch_metric_alarm.reconciliador),
+        values(aws_cloudwatch_metric_alarm.idade_da_fila), values(aws_cloudwatch_metric_alarm.lambda_erros),
+        values(aws_cloudwatch_metric_alarm.sinal), values(aws_cloudwatch_composite_alarm.api_5xx_burn),
       ) :
       contains(a.alarm_actions, "arn:aws:sns:sa-east-1:123456789012:desafio-autorizacao-alarmes")
       && contains(a.ok_actions, "arn:aws:sns:sa-east-1:123456789012:desafio-autorizacao-alarmes")
     ])
-    error_message = "Todo alarme deve notificar o tópico SNS de alarmes (ALARM e OK)."
+    error_message = "Todo alarme que notifica (inclusive os compostos de burn rate) deve ir ao tópico SNS de alarmes (ALARM e OK)."
+  }
+
+  # D3: burn rate de duas janelas sobre o SLO de 99,9% (orçamento 0,1%): 14,4x = 1,44% (1 h E 5 min) e 6x = 0,6% (6 h E 30 min).
+  assert {
+    condition = (
+      abs(aws_cloudwatch_metric_alarm.api_5xx_janela["rapido-1h"].threshold - 1.44) < 0.0001
+      && abs(aws_cloudwatch_metric_alarm.api_5xx_janela["rapido-5min"].threshold - 1.44) < 0.0001
+      && abs(aws_cloudwatch_metric_alarm.api_5xx_janela["lento-6h"].threshold - 0.6) < 0.0001
+      && abs(aws_cloudwatch_metric_alarm.api_5xx_janela["lento-30min"].threshold - 0.6) < 0.0001
+      && one([for q in aws_cloudwatch_metric_alarm.api_5xx_janela["rapido-1h"].metric_query : q.metric[0].period if q.id == "erros"]) == 3600
+      && one([for q in aws_cloudwatch_metric_alarm.api_5xx_janela["lento-30min"].metric_query : q.metric[0].period if q.id == "total"]) == 1800
+    )
+    error_message = "Burn rate: janelas 1 h/5 min a 1,44% e 6 h/30 min a 0,6% (14,4x e 6x o orçamento de 0,1%)."
+  }
+
+  assert {
+    condition = alltrue([
+      for k, a in aws_cloudwatch_composite_alarm.api_5xx_burn :
+      strcontains(a.alarm_rule, "api-5xx-burn-${k == "rapido" ? "rapido-1h" : "lento-6h"}")
+      && strcontains(a.alarm_rule, "api-5xx-burn-${k == "rapido" ? "rapido-5min" : "lento-30min"}")
+      && strcontains(a.alarm_rule, " AND ")
+    ]) && length(aws_cloudwatch_composite_alarm.api_5xx_burn) == 2
+    error_message = "Cada par de burn rate é um alarme composto: janela longa E janela curta."
+  }
+
+  # O numerador é o 5XXError do stage, que inclui o 503 do shedding (consome o orçamento por desenho).
+  assert {
+    condition = alltrue([
+      for a in aws_cloudwatch_metric_alarm.api_5xx_janela :
+      one([for q in a.metric_query : q.metric[0].metric_name if q.id == "erros"]) == "5XXError"
+    ])
+    error_message = "O burn rate conta todo 5XX do stage (inclusive o 503 do load shedding)."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.api_p99.threshold == 400 && aws_cloudwatch_metric_alarm.api_p99.threshold > var.p99_limite_ms
+    error_message = "O alarme de p99 dispara em 400 ms (acima do SLO de 150 ms, que o entregue não atinge), não no próprio SLO."
+  }
+
+  # D2: idade da mensagem mais antiga em TODA fila consumidora; a do legado tem o alarme próprio do ADR-0014.
+  assert {
+    condition = (
+      toset(keys(aws_cloudwatch_metric_alarm.idade_da_fila)) == toset(["contabilizacao", "antifraude"])
+      && alltrue([for a in aws_cloudwatch_metric_alarm.idade_da_fila : a.metric_name == "ApproximateAgeOfOldestMessage" && a.threshold == 300])
+    )
+    error_message = "Toda fila consumidora (menos a do legado) deve ter alarme de ApproximateAgeOfOldestMessage > 300 s."
+  }
+
+  # F-2: Errors >= 1 em cada Lambda; F-6: IteratorAge também no CDC de limites.
+  assert {
+    condition = (
+      toset(keys(aws_cloudwatch_metric_alarm.lambda_erros)) == toset(["relay", "sweeper", "cdc-limites", "contabilizacao"])
+      && alltrue([for a in aws_cloudwatch_metric_alarm.lambda_erros : a.metric_name == "Errors" && a.threshold == 1 && a.comparison_operator == "GreaterThanOrEqualToThreshold"])
+      && aws_cloudwatch_metric_alarm.cdc_iterator_age.dimensions.FunctionName == "desafio-relay-cdc-limites"
+    )
+    error_message = "Cada Lambda deve ter alarme de Errors >= 1, e o relay-cdc-limites alarme de IteratorAge."
+  }
+
+  # E-N6 e F-6: sinais de log com metric filter no log group certo, no formato da linha de cada um (JSON puro no
+  # /ecs/autorizacao; termo onde a linha tem prefixo), os dois do motivo desconhecido na MESMA métrica do alarme.
+  assert {
+    condition = (
+      aws_cloudwatch_log_metric_filter.sinal["motivo-desconhecido-autorizacao"].log_group_name == "/ecs/autorizacao"
+      && aws_cloudwatch_log_metric_filter.sinal["motivo-desconhecido-autorizacao"].pattern == "{ $.evento = \"motivo_desconhecido_do_limite\" }"
+      && aws_cloudwatch_log_metric_filter.sinal["motivo-desconhecido-reconciliador"].log_group_name == "/ecs/reconciliador"
+      && aws_cloudwatch_log_metric_filter.sinal["motivo-desconhecido-reconciliador"].pattern == "\"motivo_desconhecido_do_limite\""
+      && alltrue([
+        for k in ["motivo-desconhecido-autorizacao", "motivo-desconhecido-reconciliador"] :
+        aws_cloudwatch_log_metric_filter.sinal[k].metric_transformation[0].name == aws_cloudwatch_metric_alarm.sinal["motivo-desconhecido-do-limite"].metric_name
+      ])
+      && aws_cloudwatch_log_metric_filter.sinal["cdc-registro-descartado"].log_group_name == "/aws/lambda/desafio-relay-cdc-limites"
+      && strcontains(aws_cloudwatch_log_metric_filter.sinal["cdc-registro-descartado"].pattern, "cdc_registro_descartado")
+    )
+    error_message = "Metric filters de motivo_desconhecido_do_limite (/ecs/autorizacao JSON, /ecs/reconciliador termo) e cdc_registro_descartado (log group do CDC)."
+  }
+
+  # Reconciliador: rodada com varredura que levantou (campo varreduras_com_erro) alarma em 2 de ~4 rodadas.
+  assert {
+    condition = (
+      aws_cloudwatch_log_metric_filter.reconciliador["varreduras_com_erro"].pattern == "\"varreduras_com_erro\""
+      && aws_cloudwatch_metric_alarm.reconciliador["varreduras_com_erro"].threshold == 2
+      && aws_cloudwatch_metric_alarm.reconciliador["varreduras_com_erro"].period == 120
+    )
+    error_message = "Rodadas com varreduras_com_erro: metric filter por termo e alarme >= 2 em 2 min."
   }
 
   assert {
@@ -437,6 +550,110 @@ run "lambdas_scheduler_com_source_arn" {
     )
     error_message = "A role do scheduler só pode ser assumida a partir do schedule group default desta conta."
   }
+
+  # B-7: o relay só é invocado por INSERT (o REMOVE que ele mesmo e o TTL geram não chega à função).
+  assert {
+    condition     = jsondecode(one(one(aws_lambda_event_source_mapping.relay.filter_criteria).filter).pattern).eventName == ["INSERT"]
+    error_message = "O ESM do relay deve filtrar eventName = INSERT."
+  }
+
+  # D2: teto do ESM da contabilização dimensionado para o pico (~10.000 eventos/s no pior mix), não os 20 de antes.
+  assert {
+    condition     = aws_lambda_event_source_mapping.contabilizacao.scaling_config[0].maximum_concurrency == 200
+    error_message = "O ESM da contabilização deve ter maximum_concurrency = 200 (conta em modules/lambdas/variables.tf)."
+  }
+}
+
+# --- Rede leste-oeste: SG por serviço; a 8080 do limites só aceita os SGs do autorizacao e do reconciliador ---------
+run "rede_leste_oeste" {
+  command = plan
+
+  module {
+    source = "../../modules/rede"
+  }
+
+  variables {
+    nome = "desafio"
+  }
+
+  override_resource {
+    target          = aws_security_group.autorizacao
+    override_during = plan
+    values = {
+      id = "sg-autorizacao"
+    }
+  }
+
+  override_resource {
+    target          = aws_security_group.limites
+    override_during = plan
+    values = {
+      id = "sg-limites"
+    }
+  }
+
+  override_resource {
+    target          = aws_security_group.limites_acl
+    override_during = plan
+    values = {
+      id = "sg-limites-acl"
+    }
+  }
+
+  override_resource {
+    target          = aws_security_group.reconciliador
+    override_during = plan
+    values = {
+      id = "sg-reconciliador"
+    }
+  }
+
+  assert {
+    condition = (
+      toset([for r in aws_vpc_security_group_ingress_rule.limites_dos_clientes : r.referenced_security_group_id]) == toset(["sg-autorizacao", "sg-reconciliador"])
+      && alltrue([
+        for r in aws_vpc_security_group_ingress_rule.limites_dos_clientes :
+        r.security_group_id == "sg-limites" && r.cidr_ipv4 == null && r.from_port == 8080 && r.to_port == 8080
+      ])
+    )
+    error_message = "A 8080 do limites só aceita os SGs do autorizacao e do reconciliador, por referência (sem CIDR)."
+  }
+
+  # O NLB não tem SG (não dá para associar depois de criado): o autorizacao aceita a 8080 do CIDR da VPC, e só ele.
+  assert {
+    condition = (
+      aws_vpc_security_group_ingress_rule.autorizacao_do_nlb.security_group_id == "sg-autorizacao"
+      && aws_vpc_security_group_ingress_rule.autorizacao_do_nlb.cidr_ipv4 == "10.40.0.0/16"
+      && aws_vpc_security_group_ingress_rule.autorizacao_do_nlb.from_port == 8080
+      && aws_vpc_security_group_ingress_rule.autorizacao_do_nlb.to_port == 8080
+    )
+    error_message = "O autorizacao aceita a 8080 do CIDR da VPC (NLB sem SG)."
+  }
+
+  # Workers sem entrada: as únicas regras de ingress do módulo são do autorizacao e do limites.
+  assert {
+    condition = toset(concat(
+      [aws_vpc_security_group_ingress_rule.autorizacao_do_nlb.security_group_id],
+      [for r in aws_vpc_security_group_ingress_rule.limites_dos_clientes : r.security_group_id],
+    )) == toset(["sg-autorizacao", "sg-limites"])
+    error_message = "limites-acl e reconciliador não podem ter regra de entrada."
+  }
+
+  assert {
+    condition = (
+      toset([for r in aws_vpc_security_group_egress_rule.clientes_para_limites : r.security_group_id]) == toset(["sg-autorizacao", "sg-reconciliador"])
+      && alltrue([for r in aws_vpc_security_group_egress_rule.clientes_para_limites : r.referenced_security_group_id == "sg-limites" && r.cidr_ipv4 == null])
+    )
+    error_message = "A saída 8080 existe só no autorizacao e no reconciliador, e só para o SG do limites."
+  }
+
+  assert {
+    condition = (
+      toset([for r in aws_vpc_security_group_egress_rule.https : r.security_group_id]) == toset(["sg-autorizacao", "sg-limites", "sg-limites-acl", "sg-reconciliador"])
+      && alltrue([for r in aws_vpc_security_group_egress_rule.https : r.from_port == 443 && r.to_port == 443])
+    )
+    error_message = "Todo SG de serviço sai só na 443 para as APIs AWS."
+  }
 }
 
 # --- Raiz: policies das task roles sem Action "*" / "dynamodb:*" e sem Resource "*" ------------------
@@ -552,6 +769,33 @@ run "task_roles_menor_privilegio" {
       alltrue([for r in tolist(s.Resource) : r == "arn:aws:sqs:sa-east-1:123456789012:legado-contratos" || r == "arn:aws:dynamodb:sa-east-1:123456789012:table/limites"])
     ])
     error_message = "A ACL só pode tocar a fila do legado e a tabela limites."
+  }
+
+  # Database-per-service (MS-03): allowlist EXCLUSIVA de recursos por task role. Um GetItem do autorizacao na tabela
+  # limites passaria nos asserts de forma acima; aqui não passa.
+  assert {
+    condition = toset(flatten([for s in jsondecode(aws_iam_role_policy.task_autorizacao.policy).Statement : tolist(s.Resource)])) == toset([
+      "arn:aws:dynamodb:sa-east-1:123456789012:table/autorizacoes",
+      "arn:aws:dynamodb:sa-east-1:123456789012:table/autorizacoes-outbox",
+    ])
+    error_message = "O autorizacao só pode tocar as tabelas autorizacoes e autorizacoes-outbox."
+  }
+
+  assert {
+    condition = toset(flatten([for s in jsondecode(aws_iam_role_policy.task_limites.policy).Statement : tolist(s.Resource)])) == toset([
+      "arn:aws:dynamodb:sa-east-1:123456789012:table/limites",
+    ])
+    error_message = "O limites só pode tocar a tabela limites."
+  }
+
+  assert {
+    condition = toset(flatten([for s in jsondecode(aws_iam_role_policy.task_reconciliador.policy).Statement : tolist(s.Resource)])) == toset([
+      "arn:aws:dynamodb:sa-east-1:123456789012:table/autorizacoes",
+      "arn:aws:dynamodb:sa-east-1:123456789012:table/autorizacoes/index/gsi_orfas",
+      "arn:aws:dynamodb:sa-east-1:123456789012:table/autorizacoes/index/gsi_vencimentos",
+      "arn:aws:dynamodb:sa-east-1:123456789012:table/autorizacoes-outbox",
+    ])
+    error_message = "O reconciliador só pode tocar autorizacoes (tabela e os 2 índices) e autorizacoes-outbox."
   }
 
   assert {

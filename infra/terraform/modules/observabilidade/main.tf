@@ -111,7 +111,7 @@ resource "aws_cloudwatch_dashboard" "this" {
             concat(["AWS/ApiGateway", "Latency"], local.api_dim, [{ stat = "p99", label = "Latency p99" }]),
             concat(["AWS/ApiGateway", "IntegrationLatency"], local.api_dim, [{ stat = "p99", label = "IntegrationLatency p99" }]),
           ]
-          annotations = { horizontal = [{ label = "RNF p99", value = var.p99_limite_ms }] }
+          annotations = { horizontal = [{ label = "SLO p99 (ADR-0001)", value = var.p99_limite_ms }, { label = "alarme", value = var.p99_alarme_ms }] }
         }
       },
       {
@@ -219,21 +219,49 @@ resource "aws_cloudwatch_dashboard" "this" {
   })
 }
 
-# Alarme: taxa de 5XX acima de 1% das requisições em 5 minutos (métrica calculada 5XX/Count).
-resource "aws_cloudwatch_metric_alarm" "api_5xx" {
-  alarm_name          = "${var.nome}-api-5xx-acima-de-1pct"
-  alarm_description   = "Mais de 1% das requisições da API terminaram em 5XX nos últimos 5 minutos."
+# Disponibilidade por burn rate (SRE Workbook, cap. 5, "multiwindow, multi-burn-rate alerts") sobre o SLO de 99,9% ao
+# mês (ADR-0001): orçamento de erro de 0,1% das requisições. Burn rate N = gastar o orçamento N vezes mais rápido do que
+# o mês permite. Dois pares de janelas; cada par só dispara se a janela longa E a curta passarem do limiar (a longa dá
+# significância, a curta faz o alarme voltar a OK logo que o problema acaba):
+#   rápido: 1 h e 5 min acima de 14,4x (1,44% de erro) = 2% do orçamento do mês em 1 h;
+#   lento:  6 h e 30 min acima de 6x (0,6% de erro)    = 5% do orçamento do mês em 6 h.
+# Erro = 5XXError do stage, o que INCLUI o 503 do load shedding e o 504 de timeout da integração. É de propósito: o
+# shedding protege a frota, mas o canal recebeu erro e isso consome o orçamento (o ADR-0013 chama o 503 de comportamento
+# projetado; projetado não quer dizer de graça). 4XX, inclusive o 429 do WAF e do usage plan, não entra.
+# Janela com média abaixo de var.burn_rate_rps_minimo não avalia: no sandbox ocioso, 1 erro em 20 requisições do smoke
+# daria 5% e "queimaria" um orçamento sem amostra para existir. A 5.000 TPS a guarda nunca age.
+locals {
+  orcamento_de_erro_pct = (1 - var.slo_disponibilidade) * 100
+
+  janelas_de_burn = {
+    rapido-1h   = { par = "rapido", periodo = 3600, fator = 14.4 }
+    rapido-5min = { par = "rapido", periodo = 300, fator = 14.4 }
+    lento-6h    = { par = "lento", periodo = 21600, fator = 6 }
+    lento-30min = { par = "lento", periodo = 1800, fator = 6 }
+  }
+
+  pares_de_burn = {
+    rapido = { longa = "rapido-1h", curta = "rapido-5min", descricao = "1 h e 5 min acima de 14,4x o orçamento (2% do orçamento do mês em 1 h)" }
+    lento  = { longa = "lento-6h", curta = "lento-30min", descricao = "6 h e 30 min acima de 6x o orçamento (5% do orçamento do mês em 6 h)" }
+  }
+}
+
+# Uma janela do burn rate: % de 5XX sobre o total da janela, contra fator x orçamento. Sem ação própria: quem notifica é
+# o alarme composto do par (abaixo); a janela curta sozinha dispararia num pico de segundos.
+resource "aws_cloudwatch_metric_alarm" "api_5xx_janela" {
+  for_each = local.janelas_de_burn
+
+  alarm_name          = "${var.nome}-api-5xx-burn-${each.key}"
+  alarm_description   = "Janela ${each.key} do burn rate de 5XX (inclui o 503 do shedding): taxa acima de ${each.value.fator}x o orçamento de ${format("%.2f", local.orcamento_de_erro_pct)}%. Notifica pelo composto api-5xx-burn-${each.value.par}."
   comparison_operator = "GreaterThanThreshold"
-  threshold           = 1
+  threshold           = each.value.fator * local.orcamento_de_erro_pct
   evaluation_periods  = 1
   treat_missing_data  = "notBreaching"
-  alarm_actions       = local.acoes
-  ok_actions          = local.acoes
 
   metric_query {
     id          = "taxa"
-    expression  = "100 * erros / FILL(total, 1)"
-    label       = "Taxa de 5XX (%)"
+    expression  = "IF(total >= ${var.burn_rate_rps_minimo * each.value.periodo}, 100 * FILL(erros, 0) / total, 0)"
+    label       = "Taxa de 5XX (%) em ${each.key}"
     return_data = true
   }
 
@@ -242,7 +270,7 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
     metric {
       namespace   = "AWS/ApiGateway"
       metric_name = "5XXError"
-      period      = 300
+      period      = each.value.periodo
       stat        = "Sum"
       dimensions  = { ApiName = var.api_nome, Stage = var.api_stage }
     }
@@ -253,17 +281,32 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
     metric {
       namespace   = "AWS/ApiGateway"
       metric_name = "Count"
-      period      = 300
+      period      = each.value.periodo
       stat        = "Sum"
       dimensions  = { ApiName = var.api_nome, Stage = var.api_stage }
     }
   }
 }
 
-# Alarme: latência p99 da API acima de 150 ms (RNF), 3 de 5 minutos.
+# Alarme composto por par de janelas (longa E curta): é este que notifica o plantão.
+resource "aws_cloudwatch_composite_alarm" "api_5xx_burn" {
+  for_each = local.pares_de_burn
+
+  alarm_name        = "${var.nome}-api-5xx-burn-${each.key}"
+  alarm_description = "SLO de disponibilidade (${format("%.2f", var.slo_disponibilidade * 100)}%) em risco: 5XX, inclusive o 503 do shedding, ${each.value.descricao}. Runbook R10."
+  alarm_rule        = "ALARM(\"${aws_cloudwatch_metric_alarm.api_5xx_janela[each.value.longa].alarm_name}\") AND ALARM(\"${aws_cloudwatch_metric_alarm.api_5xx_janela[each.value.curta].alarm_name}\")"
+  alarm_actions     = local.acoes
+  ok_actions        = local.acoes
+}
+
+# Alarme de latência p99 da API, 3 de 5 minutos. O limiar NÃO é o SLO: o SLO de p99 <= 150 ms (ADR-0001) é a linha do
+# dashboard, e o entregue não o atinge (164 ms no melhor degrau, 526 ms a 60% de CPU, 874 ms saturado com shedding:
+# docs/capacidade.md, seção 3). Alarmar em 150 ms deixaria o alarme em ALARM o tempo todo. var.p99_alarme_ms (400 ms,
+# ~2,7x o SLO) separa a lacuna conhecida de "o serviço piorou": dispara quando a frota roda sem folga de CPU ou uma
+# dependência fica lenta. Fechar o SLO é a alavanca 1 de docs/capacidade.md, não este alarme. Runbook R11.
 resource "aws_cloudwatch_metric_alarm" "api_p99" {
   alarm_name          = "${var.nome}-api-latencia-p99"
-  alarm_description   = "Latência p99 da API acima do RNF (150 ms)."
+  alarm_description   = "Latência p99 da API acima de ${var.p99_alarme_ms} ms em 3 de 5 min (o SLO é ${var.p99_limite_ms} ms, ADR-0001; o limiar fica acima do medido com folga de CPU). Runbook R11."
   namespace           = "AWS/ApiGateway"
   metric_name         = "Latency"
   dimensions          = { ApiName = var.api_nome, Stage = var.api_stage }
@@ -272,7 +315,7 @@ resource "aws_cloudwatch_metric_alarm" "api_p99" {
   evaluation_periods  = 5
   datapoints_to_alarm = 3
   comparison_operator = "GreaterThanThreshold"
-  threshold           = var.p99_limite_ms
+  threshold           = var.p99_alarme_ms
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.acoes
   ok_actions          = local.acoes
@@ -312,6 +355,138 @@ resource "aws_cloudwatch_metric_alarm" "relay_iterator_age" {
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.acoes
   ok_actions          = local.acoes
+}
+
+# Alarme: CDC de limites atrasado (IteratorAge > 60 s) = LimiteAlterado demorando a sair do Stream da tabela limites.
+resource "aws_cloudwatch_metric_alarm" "cdc_iterator_age" {
+  alarm_name          = "${var.nome}-relay-cdc-limites-iterator-age"
+  alarm_description   = "O relay-cdc-limites está mais de ${var.iterator_age_limite_ms / 1000} s atrás do Stream da tabela limites (LimiteAlterado atrasado). Runbook R12."
+  namespace           = "AWS/Lambda"
+  metric_name         = "IteratorAge"
+  dimensions          = { FunctionName = var.cdc_funcao }
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.iterator_age_limite_ms
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
+}
+
+# Alarme por função Lambda: invocação que terminou em erro (exceção não tratada, timeout, falta de memória). Falha
+# PARCIAL de lote (ReportBatchItemFailures) não conta como Errors: essa aparece no IteratorAge e na DLQ.
+resource "aws_cloudwatch_metric_alarm" "lambda_erros" {
+  for_each = var.funcoes_lambda
+
+  alarm_name          = "${var.nome}-lambda-erros-${each.key}"
+  alarm_description   = "A função ${each.value} terminou invocação com erro nos últimos 5 min (exceção, timeout ou memória). Runbook R12."
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  dimensions          = { FunctionName = each.value }
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
+}
+
+# Alarme por fila consumidora: a mensagem mais antiga esperando mais que o limiar = consumidor parado ou mais lento que a
+# chegada (o teto do ESM da contabilização, por exemplo). A DLQ não pega isso: o redrive é por recebimento, não por
+# espera. A fila do legado fica de fora porque tem alarme próprio, com o limiar do ADR-0014 (defasagem_legado).
+resource "aws_cloudwatch_metric_alarm" "idade_da_fila" {
+  for_each = toset([for f in var.filas : f if f != var.fila_legado])
+
+  alarm_name          = "${var.nome}-idade-da-fila-${each.value}"
+  alarm_description   = "A mensagem mais antiga da fila ${each.value} espera há mais de ${var.idade_fila_limite_s} s: consumidor parado ou mais lento que a chegada. Runbook R13."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateAgeOfOldestMessage"
+  dimensions          = { QueueName = each.value }
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.idade_fila_limite_s
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
+}
+
+# Sinais de log sem métrica nativa: um alarme por sinal, alimentado por um ou mais metric filters (mesma métrica).
+# O padrão segue o formato de cada log group: no /ecs/autorizacao a linha é JSON puro (seletor JSON); no
+# /ecs/reconciliador ela vem com prefixo de data e logger, e no Lambda (log_format Text) com nível e request id, então
+# lá o filtro casa o TERMO, como os do reconciliador. Filtro sem linha correspondente é inofensivo: a métrica fica em 0.
+locals {
+  alarmes_de_sinal = {
+    # O limites devolveu um motivo de recusa que o autorizacao não conhece: o leitor tolerante mapeia para
+    # RECUSA_DO_LIMITE, mas o contrato interno mudou sem o cliente acompanhar (painel 6, E-N6).
+    motivo-desconhecido-do-limite = {
+      namespace = "desafio-zup/autorizacao"
+      metrica   = "MotivoDesconhecidoDoLimite"
+      descricao = "O autorizacao (API ou reconciliador) recebeu do limites um motivo de recusa fora do enum que conhece (vira RECUSA_DO_LIMITE). Runbook R14."
+    }
+    # Registro do Stream de limites que o CDC descartou sem publicar LimiteAlterado (painel 6, F-6).
+    cdc-registro-descartado = {
+      namespace = "desafio-zup/relay"
+      metrica   = "RegistrosDoCdcDescartados"
+      descricao = "O relay-cdc-limites descartou registro do Stream de limites (LimiteAlterado não publicado). Runbook R14."
+    }
+  }
+
+  filtros_de_sinal = {
+    motivo-desconhecido-autorizacao = {
+      alarme    = "motivo-desconhecido-do-limite"
+      log_group = var.log_group_autorizacao
+      padrao    = "{ $.evento = \"motivo_desconhecido_do_limite\" }"
+    }
+    motivo-desconhecido-reconciliador = {
+      alarme    = "motivo-desconhecido-do-limite"
+      log_group = var.log_group_reconciliador
+      padrao    = "\"motivo_desconhecido_do_limite\""
+    }
+    cdc-registro-descartado = {
+      alarme    = "cdc-registro-descartado"
+      log_group = var.log_group_cdc
+      padrao    = "\"cdc_registro_descartado\""
+    }
+  }
+}
+
+# Um metric filter por (sinal, log group): cada linha que casa vale 1 na métrica do sinal.
+resource "aws_cloudwatch_log_metric_filter" "sinal" {
+  for_each       = local.filtros_de_sinal
+  name           = "${var.nome}-${each.key}"
+  log_group_name = each.value.log_group
+  pattern        = each.value.padrao
+
+  metric_transformation {
+    name          = local.alarmes_de_sinal[each.value.alarme].metrica
+    namespace     = local.alarmes_de_sinal[each.value.alarme].namespace
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# Um alarme por sinal de log: uma ocorrência em 5 min basta (não deveria acontecer nunca).
+resource "aws_cloudwatch_metric_alarm" "sinal" {
+  for_each            = local.alarmes_de_sinal
+  alarm_name          = "${var.nome}-${each.key}"
+  alarm_description   = each.value.descricao
+  namespace           = each.value.namespace
+  metric_name         = each.value.metrica
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.acoes
+  ok_actions          = local.acoes
+
+  depends_on = [aws_cloudwatch_log_metric_filter.sinal]
 }
 
 # Métrica a partir do log JSON do limites: uma linha por escrita de contrato com guarda OU reservas >= 200 entradas.
@@ -444,6 +619,17 @@ locals {
       periodo   = 900
       limiar    = 20
       descricao = "Reserva vencida segue APROVADA sem hold por 10+ min: expiração interrompida. Reconciliação manual."
+    }
+    # Varredura que LEVANTOU (exceção, não desfecho de negócio): a linha da rodada só traz o campo
+    # varreduras_com_erro quando alguma das duas varreduras falhou. O heartbeat só renova em rodada sem exceção e o
+    # healthcheck reprova com ele acima de 90 s: 2 rodadas com erro em 2 min (de ~4) = a task está a uma rodada de
+    # ser reciclada pelo ECS. Um soluço isolado não dispara.
+    varreduras_com_erro = {
+      padrao    = "\"varreduras_com_erro\""
+      metrica   = "RodadasComVarreduraComErro"
+      periodo   = 120
+      limiar    = 2
+      descricao = "Rodadas do reconciliador com varredura que levantou exceção (2+ em 2 min): heartbeat sem renovar, task perto de ser reciclada. Runbook R8."
     }
   }
 }

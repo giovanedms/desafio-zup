@@ -70,3 +70,12 @@ output "parametros_da_integracao" {
     }
   }
 }
+
+output "timeouts_da_integracao" {
+  description = "Caminho -> método -> timeoutInMillis da integração (orçamento do caminho síncrono), para teste."
+  value = {
+    for caminho, operacoes in local.paths : caminho => {
+      for metodo, op in operacoes : metodo => op["x-amazon-apigateway-integration"].timeoutInMillis
+    }
+  }
+}

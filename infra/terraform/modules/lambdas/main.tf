@@ -199,7 +199,8 @@ resource "aws_lambda_function" "sweeper" {
   depends_on = [aws_iam_role_policy.relay]
 }
 
-# Liga o stream do outbox ao relay: lote de 100, falha parcial, bisect e destino on-failure.
+# Liga o stream do outbox ao relay: lote de 100, falha parcial, bisect e destino on-failure. O filtro entrega só INSERT
+# (o único que o relay publica, outbox_dynamodb.py): o REMOVE que o próprio relay gera ao apagar o item não invoca a função.
 resource "aws_lambda_event_source_mapping" "relay" {
   event_source_arn                   = var.outbox_stream_arn
   function_name                      = aws_lambda_function.relay.arn
@@ -209,6 +210,12 @@ resource "aws_lambda_event_source_mapping" "relay" {
   function_response_types            = ["ReportBatchItemFailures"]
   bisect_batch_on_function_error     = true
   maximum_retry_attempts             = 5
+
+  filter_criteria {
+    filter {
+      pattern = jsonencode({ eventName = ["INSERT"] })
+    }
+  }
 
   destination_config {
     on_failure {

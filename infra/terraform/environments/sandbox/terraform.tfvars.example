@@ -33,3 +33,9 @@ deletion_protection = false
 # WAF (429): requisições em 5 minutos por x-api-key e por IP. A medição com k6 (canal-carga, um IP) sobe os dois.
 waf_limite_por_consumidor = 120000
 waf_limite_por_ip         = 300000
+
+# Janela de medição (k6 com o canal-carga). O default estaciona o plano-carga em 200 rps (metade do teto do WAF por
+# consumidor). Para refazer os degraus de docs/capacidade.md, subir os TRÊS juntos e voltar ao default depois:
+# plano_carga               = { rate_limit = 6000, burst_limit = 5000, quota_dia = 50000000 }
+# waf_limite_por_consumidor = 2000000  # >= rate_limit x 300 s, com folga
+# waf_limite_por_ip         = 20000000 # o k6 sai de um IP só

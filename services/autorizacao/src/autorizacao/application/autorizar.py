@@ -57,7 +57,9 @@ _JA_ENCERRADAS = (
     StatusAutorizacao.ESTORNADA,
     StatusAutorizacao.EXPIRADA,
     StatusAutorizacao.CAPTURADA,
-    StatusAutorizacao.RECONCILIACAO_MANUAL,  # reserva sem hold em análise: ninguém mexe até decidirem
+    # Reserva sem hold na fila humana: operação NOVA não mexe. Só a retomada de quem já tinha começado com ela
+    # APROVADA segue (`encerravel_pelo_vencedor`): se foi ela quem removeu o hold, o limite responde que aplicou.
+    StatusAutorizacao.RECONCILIACAO_MANUAL,
 )
 # Estorno dono da marca que ainda pode aplicar no limite: bloqueia outro estorno da mesma original.
 _ESTORNO_EM_VOO = (StatusAutorizacao.EM_PROCESSAMENTO, StatusAutorizacao.RECONCILIACAO_MANUAL)
@@ -133,15 +135,21 @@ class AutorizarTransacao:
                 assumida = existente.assumir(agora)
                 if not self.repositorio.assumir(assumida, existente.lease_ate):
                     raise EmAndamento(1)
-                return self.processar(assumida, self._validar_original(pedido, existente.client_id))
+                original = self._validar_original(pedido, existente.client_id, retomada=True)
+                return self.processar(assumida, original)
 
-    def _validar_original(self, pedido: PedidoDeAutorizacao, client_id: str) -> Autorizacao | None:
+    def _validar_original(
+        self, pedido: PedidoDeAutorizacao, client_id: str, *, retomada: bool = False
+    ) -> Autorizacao | None:
         """Estorno: original estornável, aprovada e de mesmo valor. Captura: RESERVA aprovada que cobre
         o valor. Em ambos, original já encerrada (estornada/capturada/expirada) → 409. Original de OUTRO
-        canal é tratada como inexistente: saber o UUID não dá direito de estornar nem capturar (BOLA)."""
+        canal é tratada como inexistente: saber o UUID não dá direito de estornar nem capturar (BOLA).
+        Na retomada, a reserva que foi para a fila por falta de hold também passa: esta autorização foi
+        registrada com ela APROVADA e pode ter sido quem removeu o hold (o limite decide)."""
         if pedido.id_autorizacao_original is None:
             return None
-        acao = "estornável" if pedido.tipo is TipoOperacao.ESTORNO else "capturável"
+        estorno = pedido.tipo is TipoOperacao.ESTORNO
+        acao, acoes = ("estornável", "estornáveis") if estorno else ("capturável", "capturáveis")
         original = self.repositorio.obter(pedido.id_autorizacao_original)
         if (
             original is None
@@ -152,10 +160,13 @@ class AutorizarTransacao:
         aceitos = _ESTORNAVEIS if pedido.tipo is TipoOperacao.ESTORNO else (TipoOperacao.RESERVA,)
         if original.tipo not in aceitos:
             raise AutorizacaoOriginalInvalida(f"{original.tipo} não é {acao}")
-        if original.status in _JA_ENCERRADAS:
+        aberta = original.status is StatusAutorizacao.APROVADA or (
+            retomada and original.encerravel_pelo_vencedor
+        )
+        if not aberta and original.status in _JA_ENCERRADAS:
             raise ConflitoDeEstado(f"autorização original já está {original.status}")
-        if original.status is not StatusAutorizacao.APROVADA:
-            raise AutorizacaoOriginalInvalida(f"só autorizações aprovadas são {acao}s")
+        if not aberta:
+            raise AutorizacaoOriginalInvalida(f"só autorizações aprovadas são {acoes}")
         if pedido.tipo is TipoOperacao.ESTORNO and original.valor != pedido.valor:
             raise AutorizacaoOriginalInvalida("estorno parcial não é suportado na v1")
         if pedido.eh_captura and pedido.valor > original.valor:
@@ -232,15 +243,48 @@ class AutorizarTransacao:
                 return Desfecho(atual, replay=True)  # outra execução concluiu a mesma operação
             raise EmAndamento(1) from None
         except OriginalJaEncerrada:
-            # Outro estorno da mesma original venceu. O efeito no limite foi um só (id da operação
-            # derivado da original), então esta autorização termina recusada, sem efeito próprio.
-            # (Captura e expiração não chegam aqui: quem perde o hold já volta RESERVA_NAO_ENCONTRADA.)
-            perdedora = em_processamento.recusar(
-                MotivoRecusa.ORIGINAL_JA_ENCERRADA, None, self.relogio.agora(), self.ids.novo_id()
-            )
-            self.repositorio.concluir(perdedora, None)
-            return Desfecho(perdedora.sem_eventos(), replay=False)
+            return self._original_fechada_por_outro(em_processamento, concluida)
         return Desfecho(concluida.sem_eventos(), replay=False)
+
+    def _original_fechada_por_outro(
+        self, em_processamento: Autorizacao, aprovada: Autorizacao
+    ) -> Desfecho:
+        """A operação desta autorização ESTÁ aplicada no limite (só a aprovação encerra a original), mas a
+        original já não pode ser encerrada por ela (nem APROVADA, nem reserva sem hold na fila humana).
+
+        Efeito compartilhado: ESTORNO cuja original está ESTORNADA. O id da operação de estorno é derivado da
+        original, então o efeito no limite foi um só e saiu no `TransacaoEstornada` de quem encerrou: esta
+        termina recusada, sem efeito próprio a registrar.
+
+        Efeito exclusivo (captura, ou estorno cuja original foi encerrada de outro jeito): recusar perderia um
+        efeito aplicado sem evento. Pelo árbitro do hold (ADR-0020) e pela marca de estorno, ninguém além do
+        vencedor encerra a original enquanto ela está aberta, então este caminho só existe com o invariante
+        quebrado (bug, edição manual, original apagada pelo TTL). Aqui a autorização fica EM_PROCESSAMENTO (no
+        índice de órfãs) e a exceção sobe (500, com a linha de log abaixo), em vez de recusar um efeito
+        aplicado."""
+        atual = self.repositorio.obter(aprovada.id_autorizacao_original or "")
+        compartilhado = (
+            aprovada.tipo is TipoOperacao.ESTORNO
+            and atual is not None
+            and atual.status is StatusAutorizacao.ESTORNADA
+        )
+        if not compartilhado:
+            _log.error(
+                json.dumps(
+                    {
+                        "evento": "efeito_aplicado_com_original_encerrada",
+                        "id_autorizacao": aprovada.id_autorizacao,
+                        "id_autorizacao_original": aprovada.id_autorizacao_original,
+                        "status_da_original": atual.status.value if atual else None,
+                    }
+                )
+            )
+            raise OriginalJaEncerrada(aprovada.id_autorizacao_original or "")
+        perdedora = em_processamento.recusar(
+            MotivoRecusa.ORIGINAL_JA_ENCERRADA, None, self.relogio.agora(), self.ids.novo_id()
+        )
+        self.repositorio.concluir(perdedora, None)
+        return Desfecho(perdedora.sem_eventos(), replay=False)
 
 
 def _encerrar(

@@ -284,6 +284,12 @@ run "api_com_tracing_e_problem_json" {
     ]) && length(aws_api_gateway_usage_plan.this) == 3
     error_message = "Os 3 planos padrão devem ficar a no máximo metade do teto do WAF por consumidor (plano-carga estacionado em 200 rps)."
   }
+
+  # G7-5 (painel 7): 401 do gateway com o desafio que a RFC 9110 §15.5.2 exige, como o 401 do serviço.
+  assert {
+    condition     = output.respostas_do_gateway["UNAUTHORIZED"].responseParameters["gatewayresponse.header.WWW-Authenticate"] == "'Bearer'"
+    error_message = "UNAUTHORIZED precisa levar WWW-Authenticate: Bearer."
+  }
 }
 
 # --- Observabilidade: todo alarme com ação (tópico SNS com CMK), defasagem do legado e reservas no item ------------
@@ -408,8 +414,9 @@ run "observabilidade_alarmes_com_acao" {
     error_message = "Cada Lambda deve ter alarme de Errors >= 1, e o relay-cdc-limites alarme de IteratorAge."
   }
 
-  # E-N6 e F-6: sinais de log com metric filter no log group certo, no formato da linha de cada um (JSON puro no
-  # /ecs/autorizacao; termo onde a linha tem prefixo), os dois do motivo desconhecido na MESMA métrica do alarme.
+  # E-N6, F-6 e F7-5/B-1 (painel 7): sinais de log com metric filter no log group certo, no formato da linha de cada um
+  # (JSON puro no /ecs/autorizacao; termo onde a linha tem prefixo), cada par de filtros na MESMA métrica do alarme. O
+  # termo é o que o código emite (relay/tests/unit/test_sinais_de_log.py cruza os dois lados).
   assert {
     condition = (
       aws_cloudwatch_log_metric_filter.sinal["motivo-desconhecido-autorizacao"].log_group_name == "/ecs/autorizacao"
@@ -420,10 +427,24 @@ run "observabilidade_alarmes_com_acao" {
         for k in ["motivo-desconhecido-autorizacao", "motivo-desconhecido-reconciliador"] :
         aws_cloudwatch_log_metric_filter.sinal[k].metric_transformation[0].name == aws_cloudwatch_metric_alarm.sinal["motivo-desconhecido-do-limite"].metric_name
       ])
-      && aws_cloudwatch_log_metric_filter.sinal["cdc-registro-descartado"].log_group_name == "/aws/lambda/desafio-relay-cdc-limites"
-      && strcontains(aws_cloudwatch_log_metric_filter.sinal["cdc-registro-descartado"].pattern, "cdc_registro_descartado")
+      && aws_cloudwatch_log_metric_filter.sinal["cdc-registro-malformado"].log_group_name == "/aws/lambda/desafio-relay-cdc-limites"
+      && aws_cloudwatch_log_metric_filter.sinal["cdc-registro-malformado"].pattern == "\"cdc_registro_malformado\""
+      && aws_cloudwatch_log_metric_filter.sinal["outbox-registro-malformado-relay"].log_group_name == "/aws/lambda/desafio-relay"
+      && aws_cloudwatch_log_metric_filter.sinal["outbox-registro-malformado-sweeper"].log_group_name == "/aws/lambda/desafio-sweeper"
+      && alltrue([
+        for k in ["outbox-registro-malformado-relay", "outbox-registro-malformado-sweeper"] :
+        aws_cloudwatch_log_metric_filter.sinal[k].pattern == "\"outbox_registro_malformado\""
+        && aws_cloudwatch_log_metric_filter.sinal[k].metric_transformation[0].name == aws_cloudwatch_metric_alarm.sinal["outbox-registro-malformado"].metric_name
+      ])
+      && aws_cloudwatch_log_metric_filter.sinal["efeito-sem-evento-autorizacao"].log_group_name == "/ecs/autorizacao"
+      && aws_cloudwatch_log_metric_filter.sinal["efeito-sem-evento-autorizacao"].pattern == "{ $.evento = \"efeito_aplicado_com_original_encerrada\" }"
+      && aws_cloudwatch_log_metric_filter.sinal["efeito-sem-evento-reconciliador"].log_group_name == "/ecs/reconciliador"
+      && alltrue([
+        for k in ["efeito-sem-evento-autorizacao", "efeito-sem-evento-reconciliador"] :
+        aws_cloudwatch_log_metric_filter.sinal[k].metric_transformation[0].name == aws_cloudwatch_metric_alarm.sinal["efeito-sem-evento"].metric_name
+      ])
     )
-    error_message = "Metric filters de motivo_desconhecido_do_limite (/ecs/autorizacao JSON, /ecs/reconciliador termo) e cdc_registro_descartado (log group do CDC)."
+    error_message = "Metric filters de motivo_desconhecido_do_limite (/ecs/autorizacao JSON, /ecs/reconciliador termo), cdc_registro_malformado (log group do CDC) e outbox_registro_malformado (relay e sweeper, mesma métrica)."
   }
 
   # Reconciliador: rodada com varredura que levantou (campo varreduras_com_erro) alarma em 2 de ~4 rodadas.

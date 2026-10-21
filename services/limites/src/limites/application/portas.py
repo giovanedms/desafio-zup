@@ -29,7 +29,8 @@ class ArmazenamentoIndisponivel(RuntimeError):
 
 class PrazoDoChamadorVencido(RuntimeError):
     """A requisição esperou na fila além do prazo que o chamador mandou: não aplica (o chamador já desistiu
-    e pode estar decidindo sem esta escrita) → 503. Limita quanto tempo depois do envio uma escrita pode cair."""
+    e pode estar decidindo sem esta escrita) → 503. Limita quanto tempo depois do envio uma escrita pode COMEÇAR;
+    depois de começar, quem limita são os timeouts e tentativas do adapter (ver `AplicarOperacaoNoLimite.executar`)."""
 
 
 class ContratoJaExiste(Exception):

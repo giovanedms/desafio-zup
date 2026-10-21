@@ -6,8 +6,8 @@ O enunciado permite e encoraja IA, desde que eu saiba explicar cada decisão e c
 
 | Quem | Fez |
 |---|---|
-| **Eu (Giovane)** | Escolhas de negócio e de escopo: linguagem (Python), prazo, conta AWS e nomes, aceitar ou recusar cada ADR, revisão final e defesa |
-| **IA, modelo orquestrador** | Pesquisa dirigida, plano, ADRs, **domínio e casos de uso** (limites, autorização, contabilização, ACL, reconciliador), contratos (OpenAPI, eventos, problem types), revisão linha a linha de tudo que foi delegado |
+| **Eu (Giovane)** | As decisões que não delego. Escopo, prazo, linguagem (Python), conta AWS, custo e quotas. Aceitar ou recusar cada ADR. A cada rodada de revisão, decidir o que corrigir, o que implementar e o que fica declarado como limitação: por exemplo, conferir `id_conta` contra o titular e separar um security group por serviço, em vez de só declarar o risco. O processo que o código tem de passar antes de entrar: gates, painéis adversariais com prova de conceito e medição na AWS. Revisão final e defesa |
+| **IA, modelo orquestrador** | Pesquisa dirigida, plano, ADRs (propostos para a minha aprovação), **domínio e casos de uso** (limites, autorização, contabilização, ACL, reconciliador), contratos (OpenAPI, eventos, problem types), revisão linha a linha de tudo que foi delegado |
 | **IA, modelo executor** | Trabalho mecânico com especificação fechada e critério de aceite: adapters HTTP, Dockerfiles, relay, Terraform, k6, CI |
 
 ## Processo
@@ -17,7 +17,7 @@ O enunciado permite e encoraja IA, desde que eu saiba explicar cada decisão e c
    - App Mesh descontinuado em 30/09/2026;
    - o Schema Registry do EventBridge não valida eventos;
    - RFC 7807 → 9457.
-2. **Plano revisado por um painel de "juízes"** (modelos instruídos a reprovar). **O plano v1 foi reprovado.** O ponto central: eu tinha posto o item de limite numa transação do DynamoDB, que cancela sob contenção. Isso virou o ADR-0005.
+2. **Plano revisado por um painel de "juízes"** (modelos instruídos a reprovar). **O plano v1 foi reprovado.** O ponto central: o plano punha o item de limite numa transação do DynamoDB, que cancela sob contenção. Isso virou o ADR-0005.
 3. **Código com testes como especificação.** Cada regra tem teste; invariantes com **property-based** (Hypothesis); as portas de persistência dos três BCs com **suíte de contrato rodando nos dois adapters** (memória e DynamoDB/LocalStack), exceto `RegistroDeCompensacao.regravar`, que só tem teste em memória; integração com threads reais.
 4. **Revisão de tudo que foi delegado:** o orquestrador rodou os gates de novo e leu o código; nenhum "tudo verde" relatado foi aceito sem execução.
 
@@ -52,7 +52,7 @@ O enunciado permite e encoraja IA, desde que eu saiba explicar cada decisão e c
 | 500 esporádico do API Gateway (`Connection is closed`): keep-alive de 5 s do uvicorn fechava conexão que o gateway reaproveitava | Carga na AWS (log de execução do gateway) | `--timeout-keep-alive 400` |
 | `MAX_EM_VOO=256` transformava sobrecarga em fila de segundos (p50 das aceitas de 2,7 s) em vez de 503 rápido | Carga na AWS | Dimensionado como capacidade × p99 × 2: ≈ 37 por vCPU, 18 nas tasks de 0,5 vCPU entregues |
 | Serviço `autorizacao` saturava CPU a ~60 rps por vCPU (~16 ms por requisição) | Carga na AWS (Container Insights) | Sem access log por requisição e um `GetItem` a menos no caminho comum: ~8 ms por requisição |
-| Estimativa de ~6–8 WRU por autorização ignorava outbox e contabilização (medido: 14,6) | Carga na AWS (métricas por tabela) | `docs/capacidade.md` corrigido; outbox embutido no item como alavanca nº 1 |
+| Estimativa de ~6–8 WRU por autorização ignorava outbox e contabilização (medido no DEBITO: 14,6 de tabela; captura ~27, derivada) | Carga na AWS (métricas por tabela) | `docs/capacidade.md` corrigido; outbox embutido no item como alavanca nº 1 |
 | Mesmo gravada passo a passo, a compensação aplicava a operação ("garantir") para descobrir se ela existia: débito órfão que nunca chegou ganhava débito fantasma, e o cliente pagava por compra não autorizada se a reversão fosse recusada | Painel de juízes 4 (PoC) | Consulta só de leitura no `limites` (`GET .../operacoes/{id}`): o reconciliador pergunta antes de desfazer |
 | "Recusa da garantia = nunca aplicou" dependia da ordem de diagnóstico de outro BC; uma refatoração plausível abandonaria o hold | Painel de juízes 4 (mutação sobrevivia com 414 testes verdes) | A decisão vem da observação do hold; teste entre BCs com hold vivo, sem saldo e guarda esquecida |
 | Premissa "nenhuma escrita atrasada" só valia por suposição: o `limites` não tinha teto de fila e podia aplicar minutos depois | Revisão do argumento do reconciliador | Prazo propagado (`X-Prazo-Ms`): o `limites` não escreve depois que o chamador desistiu |

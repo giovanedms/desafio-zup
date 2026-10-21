@@ -1,8 +1,9 @@
 """Sweeper: republica o que está no outbox há mais que a idade mínima (relay parado, Stream expirado).
 
 Drenagem INCREMENTAL: lê o outbox em páginas de tamanho limitado e publica cada página antes de ler a
-próxima. Para no teto de itens ou no orçamento de tempo da rodada (abaixo do timeout da Lambda); o que
-sobrar sai nas rodadas seguintes. Nunca carrega a tabela inteira na memória antes de publicar.
+próxima. Para no teto de itens ANTIGOS (os que o filtro do Scan devolve) ou no orçamento de tempo da rodada
+(abaixo do timeout da Lambda); o que sobrar sai nas rodadas seguintes. Nunca carrega a tabela inteira na
+memória antes de publicar.
 """
 
 from __future__ import annotations
@@ -21,9 +22,13 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 IDADE_MINIMA_MS = 15 * 60 * 1000
-# Por rodada: tempo e memória (ids publicados) limitados; o resto fica para a próxima.
+# Por rodada, em itens ANTIGOS (os que o filtro devolve): limita a memória dos ids publicados/falhos e o volume
+# publicado; o resto fica para a próxima. NÃO conta o que o Scan avaliou e o filtro descartou (ScannedCount): o
+# Scan recomeça do início a cada rodada, e um teto em itens avaliados pararia toda rodada nos mesmos milhares de
+# itens novos, sem nunca chegar ao antigo que vem depois deles. O que o Scan lê é limitado pelo ORCAMENTO_S.
 TETO_DE_ITENS = 10_000
-# Por rodada: abaixo do timeout de 60 s da Lambda, com folga para publicar a última página.
+# Por rodada: abaixo do timeout de 60 s da Lambda, com folga para publicar a última página. É o que segura o Scan
+# numa tabela grande sem item antigo (páginas vazias também conferem o prazo).
 ORCAMENTO_S = 40.0
 MARGEM_S = 15.0  # com contexto Lambda: para de pedir página quando restar menos que isto
 
@@ -32,7 +37,7 @@ MARGEM_S = 15.0  # com contexto Lambda: para de pedir página quando restar meno
 class ResultadoDaVarredura:
     publicados: set[str]
     falhos: set[str]
-    varridos: int  # itens antigos lidos nesta rodada
+    varridos: int  # itens antigos lidos nesta rodada (o filtro devolveu, menos os malformados; não o ScannedCount)
     interrompida: bool  # parou no teto ou no orçamento: pode haver mais, a próxima rodada continua
 
 

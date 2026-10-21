@@ -230,11 +230,13 @@ def test_200_aplicada_ja_aplicada_e_recusada(cliente: TestClient) -> None:
 
 def test_400_e_404(cliente: TestClient) -> None:
     malformado = cliente.post(OPERACOES, content=b'{"valor": ')
+    nome_repetido = cliente.post(OPERACOES, content=_corpo("RESERVAR")[:-1] + b', "valor": 999}')
     inexistente = cliente.post(
         "/interno/v1/contratos/NAO-EXISTE/operacoes", content=_corpo("RESERVAR")
     )
 
     assert conferir(malformado, POST)["codigo"] == "REQUISICAO_MAL_FORMADA"
+    assert conferir(nome_repetido, POST)["codigo"] == "REQUISICAO_MAL_FORMADA"
     assert conferir(inexistente, POST)["codigo"] == "CONTRATO_NAO_ENCONTRADO"
 
 
@@ -246,6 +248,8 @@ INVALIDAS = {
     "id_conta fora do pattern": _corpo("RESERVAR", id_conta="conta com espaco"),
     "liberar sem id_reserva": _corpo("LIBERAR_RESERVA"),
     "JSON que não é objeto": b"[]",
+    # `erros` cortado em 20 (maxItems) e `erros_omitidos` declarado no Problema
+    "30 campos desconhecidos": _corpo("RESERVAR", **{f"extra{i}": "x" for i in range(30)}),
 }
 
 

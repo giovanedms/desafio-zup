@@ -9,9 +9,11 @@ RESERVA vencida do índice esparso:
 Corrida com captura/estorno do mesmo hold: o BC Limites é o árbitro. Quem remove o hold vence; os outros
 recebem RESERVA_NAO_ENCONTRADA. Se o expirador perde, só segue em frente: o vencedor é quem atualiza a
 reserva original, em segundos. Se a reserva continua APROVADA e sem hold 10 min depois do vencimento, o
-vencedor não vai aparecer (expiração interrompida por mais que a guarda, ou captura/estorno em reconciliação
-manual): a reserva passa a RECONCILIACAO_MANUAL (sai do índice de vencimentos, entra na fila humana, com
-evento), em vez de sangrar uma chamada ao limite a cada rodada.
+vencedor provavelmente não vai aparecer (expiração interrompida por mais que a guarda, ou captura/estorno em
+reconciliação manual): a reserva passa a RECONCILIACAO_MANUAL (sai do índice de vencimentos, entra na fila
+humana, com evento), em vez de sangrar uma chamada ao limite a cada rodada. Se o vencedor ainda estava
+concluindo (expirador atrasado chegou no meio), ele encerra a reserva assim mesmo e ela sai da fila
+(`Autorizacao.encerravel_pelo_vencedor`).
 
 Como no reconciliador, uma reserva que falha de forma inesperada conta como FALHOU (id no log) e o lote segue.
 """

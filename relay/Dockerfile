@@ -57,7 +57,7 @@ COPY --from=build /opt/venv /opt/venv
 
 USER 10001:10001
 
-# Sem HTTP: o loop toca /tmp/relay.heartbeat a cada iteração; saudável se mexeu nos últimos 30 s.
+# Sem HTTP: o loop toca /tmp/relay.heartbeat a cada iteração SEM exceção; saudável se mexeu nos últimos 30 s.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=15s --retries=3 \
     CMD ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/relay.heartbeat')<30 else 1)"]
 

@@ -17,6 +17,7 @@ variable "warm_throughput" {
     5.000 TPS, a partir das escritas medidas por autorização (docs/capacidade.md): limites 11.000 escritas/s;
     autorizacoes 31.000 escritas/s e gsi_orfas 20.000; autorizacoes-outbox 61.000 (acima da quota padrão de 40.000
     WRU/s por tabela: pedir a quota antes, ou aplicar a alavanca 1 de docs/capacidade.md, que elimina o outbox).
+    Esses valores são do DEBITO; com captura no mix o outbox chega a ~49.000 WRU/s no pico (docs/capacidade.md §1.6).
   EOT
   type = map(object({
     leitura = optional(number)

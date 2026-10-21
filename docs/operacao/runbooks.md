@@ -13,7 +13,7 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 | `api-latencia-p99` | R11 |
 | `lambda-erros-<função>`, `relay-cdc-limites-iterator-age` | R12 |
 | `idade-da-fila-<fila>` | R13 |
-| `motivo-desconhecido-do-limite`, `cdc-registro-descartado` | R14 |
+| `motivo-desconhecido-do-limite`, `cdc-registro-malformado`, `outbox-registro-malformado`, `efeito-sem-evento` | R14 |
 
 ## R1. Mensagens na DLQ de um consumidor
 
@@ -51,6 +51,7 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 - **Quotas** (ajustáveis, com prazo de dias; conta em `docs/capacidade.md`, seção 1):
   - EventBridge **PutEvents 12.000/s** e **Invocations 25.000/s** (as aprovadas, 6.000 e 20.000, não cobrem o mix com captura);
   - vCPU de Fargate ~200 (a conta tem 140) e `tasks_max` compatível;
+  - DynamoDB: quota de throughput por tabela ~75.000 WRU/s (o `autorizacoes-outbox` passa dos 40.000 padrão com mais de ~21% de capturas no mix, `docs/capacidade.md` §1.6);
   - concorrência de Lambda e throttle do API Gateway, se o pico passar do desenho. O ESM da contabilização tem teto de 200 em voo (`concorrencia_maxima_sqs`), dimensionado para ~10.000 eventos/s com lotes de ~100 ms (conta em `modules/lambdas/variables.tf`); acima disso, subir o teto no tfvars (até 1.000, que é a conta inteira) e acompanhar o alarme `idade-da-fila-contabilizacao` (R13).
 - **DynamoDB:** `warm_throughput` no tfvars (módulo `dados`) nas tabelas `limites`, `autorizacoes` (e no `gsi_orfas`) e `autorizacoes-outbox` a 2× o pico esperado, com pelo menos 1 dia de antecedência. Valores no ADR-0013. **Não dá para desfazer** (a AWS não deixa reduzir) e o aumento é cobrado: só em produção ou com decisão explícita.
 - **ECS:** janela em `janelas_de_pico` (tfvars). O default do sandbox já sobe o mínimo para 4 tasks no dia 1 de cada mês, 06:30–12:00 de Brasília. Para uma campanha avulsa, acrescentar uma janela com `inicio`/`fim` em `cron(...)` ou `at(...)`.
@@ -103,7 +104,7 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
   | `FORA_DO_PRAZO` | DEBITO, CREDITO, ESTORNO ou captura: a operação original pode ou não ter aplicado, e a guarda já pode ter esquecido o id | `ops` contém o `id_autorizacao` em `criada_em + 4 min`? (estorno: o id derivado da original) |
   | `DESFAZER_FORA_DO_PRAZO` | o limite **confirmou** que a operação original estava aplicada (`aplicacao_confirmada_em`) | `ops` contém o id da compensação (UUIDv5 de `id_autorizacao`, `id_operacao_de_compensacao`) em `desfazer_desde + 4 min`? |
   | `DESFAZER_RECUSADO` | aplicada (confirmado); o limite recusou a reversão (ex.: pagamento entrou no meio) | nada: é decisão de negócio (manter o débito ou creditar) |
-  | `RESERVA_SEM_HOLD` (status `RECONCILIACAO_MANUAL`, `resultado` APROVADA) | o hold sumiu e ninguém encerrou a reserva em 10 min | quem removeu: procurar na fila uma captura/estorno desta reserva; ou `ops` contém o id derivado da expiração |
+  | `RESERVA_SEM_HOLD` (status `RECONCILIACAO_MANUAL`, `resultado` APROVADA) | o hold sumiu e ninguém encerrou a reserva em 10 min | se a captura/estorno vencedora ainda estava concluindo, ela encerra a reserva sozinha em até ~4 min contados da criação dela (prazo de reaplicação) (some da fila como CAPTURADA/ESTORNADA; o evento está no archive); senão, quem removeu: procurar na fila uma captura/estorno desta reserva; ou `ops` contém o id derivado da expiração |
 
   Dentro de 24 h, o Stream da tabela `limites` também mostra o MODIFY que acrescentou a chave em `ops`.
 - **Ação:** concluir com a decisão (APROVADA com os eventos, RECUSADA ou COMPENSADA, desfazendo no limite o que precisar). Apagar a tabela temporária no fim.
@@ -128,7 +129,7 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 
 - **Sintoma:** a mensagem mais antiga da fila `legado-contratos` espera há mais de 5 min. O limite concedido da réplica está velho: uma redução feita no core ainda não vale aqui (risco aceito no ADR-0014, limitado por este alarme).
 - **Diagnóstico:**
-  1. o service `limites-acl` está rodando (`runningCount` 1) e o heartbeat está saudável? Logs em `/ecs/limites-acl`;
+  1. o service `limites-acl` está rodando (`runningCount` 1) e o heartbeat está saudável? Logs em `/ecs/limites-acl`. O heartbeat só renova em iteração sem exceção: fila inalcançável faz o ECS reciclar a task em ~30 s. Mensagem que falha (registro inválido, DynamoDB fora) não derruba o heartbeat; vai para reentrega e DLQ, e é este alarme que avisa;
   2. o volume do feed subiu (carga em lote do legado)? `NumberOfMessagesSent` da fila;
   3. mensagens repetindo até a DLQ (`legado-contratos-dlq` com alarme próprio): registro fora do layout.
 - **Ação:** task parada → forçar novo deployment do `limites-acl`; volume → mais tasks no `limites-acl` (o compare-and-set por versão converge em qualquer ordem, mas mais de um consumidor é inferência sem teste: `docs/operacao/infraestrutura.md`, seção 4.3); registro inválido → R1. Se a defasagem for longa e houver redução de limite relevante pendente (fraude), escalar para o negócio: o canal prioritário de bloqueio é gatilho de evolução do ADR-0014, não existe hoje.
@@ -163,7 +164,7 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 - **Sintoma:** `Errors` ≥ 1 em 5 min numa das 4 funções (`relay`, `sweeper`, `cdc-limites`, `contabilizacao`), ou o `IteratorAge` do `desafio-relay-cdc-limites` acima de 60 s. `Errors` conta invocação que terminou em exceção, timeout ou falta de memória; a falha **parcial** de lote (`ReportBatchItemFailures`) não conta e aparece no `IteratorAge` e na DLQ.
 - **Diagnóstico** (log group `/aws/lambda/<função>`; o `REPORT` da invocação mostra `Duration`, `Max Memory Used` e `Status: timeout` quando é o caso):
   - **`sweeper`:** o caso grave é o backlog grande no outbox (relay parado por muito tempo): a varredura não termina em 60 s ou não cabe em 256 MB. `Max Memory Used` perto do limite ou `Status: timeout` confirmam. Enquanto o sweeper falha, o outbox não é drenado por ele;
-  - **`relay`:** `PutEvents` estrangulado (quota), permissão no bus, evento malformado. Ver também o R2;
+  - **`relay`:** `PutEvents` estrangulado (quota), permissão no bus, entrada rejeitada pelo `PutEvents`. Item de outbox malformado não conta como `Errors`: é falha parcial do lote, com alarme `outbox-registro-malformado` (R14). Ver também o R2;
   - **`cdc-limites`:** registro do Stream que o código não consegue converter ou `PutEvents` falhando. O `IteratorAge` do CDC sobe junto quando o erro é persistente: o lote é retentado até 5 vezes e depois vai para a `relay-cdc-limites-dlq` (alarme `dlq-relay-cdc-limites-dlq`, R1);
   - **`contabilizacao`:** exceção no lote inteiro (configuração, permissão, tabela, ou uma mensagem que o código não trata e derruba a invocação). A falha de uma mensagem tratada volta pela resposta parcial de lote e, depois de 5 recebimentos, vai para a DLQ (R1).
 - **Ação:** causa externa (quota, permissão, DynamoDB) → corrigir e deixar o retry automático trabalhar; código → corrigir e reimplantar (push na `main`). Sweeper com backlog grande: subir à mão, temporariamente, a memória e o timeout da função para drenar (`aws lambda update-function-configuration --function-name desafio-sweeper --memory-size 1024 --timeout 300`; o próximo apply devolve os valores do Terraform) e tratar a causa do relay parado (R2). CDC atrasado sem erro: volume de escrita no `limites` acima do que os shards do Stream entregam; acompanhar até drenar.
@@ -181,14 +182,22 @@ Formato: **Sintoma → Diagnóstico → Ação → Verificação**. Os alarmes c
 - **Ação:** no teto → subir `concorrencia_maxima_sqs` no tfvars (R3) e aplicar; lenta por DynamoDB → ver throttling e quota da tabela; ESM desabilitado → habilitar. O consumidor é idempotente (inbox): a fila drena sem lançamento duplicado.
 - **Verificação:** `ApproximateAgeOfOldestMessage` caindo até ficar abaixo de 300 s e o alarme em OK.
 
-## R14. Sinal de contrato ou de dado descartado (alarmes `motivo-desconhecido-do-limite` e `cdc-registro-descartado`)
+## R14. Sinal de contrato ou de registro que o relay não converte (alarmes `motivo-desconhecido-do-limite`, `cdc-registro-malformado`, `outbox-registro-malformado` e `efeito-sem-evento`)
 
 - **`motivo-desconhecido-do-limite`:** o `limites` devolveu um motivo de recusa que o `autorizacao` (API ou reconciliador) não conhece. O leitor tolerante recusa com `RECUSA_DO_LIMITE` (nunca 500), então o canal não quebra, mas o contrato interno mudou sem o cliente acompanhar.
   - **Diagnóstico:** a linha `{"evento": "motivo_desconhecido_do_limite", "motivo": ...}` em `/ecs/autorizacao` (ou com prefixo em `/ecs/reconciliador`) traz o valor cru. Conferir o enum de `motivo` em `contracts/openapi/limites-interno-v1.yaml` e o que está publicado no `limites` em produção (versão da imagem).
   - **Ação:** mapear o motivo novo no `autorizacao` (código de recusa e texto) e publicar; se o `limites` publicou o motivo antes da hora, reverter o `limites`. Valor novo de enum no contrato interno pede o cliente atualizado antes do produtor.
   - **Verificação:** nenhuma linha nova em 5 min e o alarme em OK.
-- **`cdc-registro-descartado`:** o `desafio-relay-cdc-limites` descartou um registro do Stream da tabela `limites` sem publicar `LimiteAlterado`. O consumidor de `LimiteAlterado` (notificações) perdeu um fato.
-  - **Diagnóstico:** a linha no log group do CDC traz o motivo do descarte; achar o `id_contrato` e a versão do item. Dentro de 24 h o Stream ainda tem o registro.
-  - **Ação:** corrigir a causa (registro com formato que o código não espera); para o fato perdido, republicar o `LimiteAlterado` a partir do item atual do contrato, ou registrar o caso para o dono das notificações. Repetir é seguro: o `id` do CloudEvent é determinístico por contrato e versão (deduplicação no consumidor).
-  - **Verificação:** nenhum descarte novo em 5 min e o alarme em OK.
-- **Filtro sem linha:** os dois filtros existem mesmo que a linha nunca apareça (a métrica fica em 0). O alarme em OK não prova que o sinal está ligado; quem prova é o teste do serviço que emite a linha.
+- **`cdc-registro-malformado`:** o `desafio-relay-cdc-limites` recebeu do Stream da tabela `limites` um registro que não converte em `LimiteAlterado` (MODIFY sem as duas imagens, ou sem um campo do contrato). Nada é descartado: o registro volta como falha do lote e o ESM tenta de novo (até 5 vezes, com bisect); esgotadas as tentativas, a referência do lote (shard e faixa de sequências) vai para a `relay-cdc-limites-dlq` (R1) e o `IteratorAge` do CDC sobe (R12).
+  - **Diagnóstico:** a linha `{"evento": "cdc_registro_malformado", "sequencia": ..., "erro": ...}` em `/aws/lambda/desafio-relay-cdc-limites` traz a sequência e o motivo. Dentro de 24 h o Stream ainda tem o registro; o item atual do contrato está na `limites`.
+  - **Ação:** corrigir a causa (Stream sem `NEW_AND_OLD_IMAGES`, ou formato inesperado) e reimplantar. Para o fato que não saiu, republicar o `LimiteAlterado` a partir do item atual, ou registrar o caso para o dono das notificações. Repetir é seguro: o `id` é determinístico por contrato e versão.
+  - **Verificação:** nenhuma linha nova em 5 min, `IteratorAge` abaixo de 60 s e o alarme em OK.
+- **`outbox-registro-malformado`:** um item `OUTBOX#` da `autorizacoes-outbox` não tem `id_evento`, `detail_type`, `cloudevent` ou `criado_em_ms`, ou o Stream entregou um INSERT sem `NewImage`. O caso realista é o layout do item mudar num deploy enquanto tasks antigas ainda gravam. Nada é descartado: o `desafio-relay` devolve o registro como falha do lote (retry e, esgotado, a referência na `relay-dlq`, R1) e o item **fica** no outbox; com `criado_em_ms` válido, o `desafio-sweeper` volta a logá-lo a cada rodada depois de 15 min.
+  - **Diagnóstico:** a linha `{"evento": "outbox_registro_malformado", "pk": "OUTBOX#<id_evento>", ...}` em `/aws/lambda/desafio-relay` (com `sequencia`) ou em `/aws/lambda/desafio-sweeper`. `aws dynamodb get-item --table-name autorizacoes-outbox --key '{"pk":{"S":"OUTBOX#<id>"}}'` mostra o item.
+  - **Ação:** corrigir o produtor e reimplantar; depois completar o campo que falta no item (o `cloudevent` traz `id` e `type`). O sweeper o publica na rodada seguinte e o apaga. O ESM filtra só INSERT, então a correção não passa pelo relay. Repetir é seguro: os consumidores deduplicam por `id`.
+  - **Verificação:** nenhuma linha nova em 5 min, o item fora do outbox e o alarme em OK.
+- **`efeito-sem-evento`:** uma captura ou um estorno aplicou efeito exclusivo no limite, mas a original já estava encerrada por outro. É invariante quebrado (bug, edição manual do item, TTL): o dinheiro foi movido e nenhum evento saiu. A autorização não é recusada (o efeito existe), fica em processamento, a resposta ao canal é 500, e o reconciliador a leva para a fila humana quando passa o prazo de reaplicação.
+  - **Diagnóstico:** a linha `{"evento": "efeito_aplicado_com_original_encerrada", "id_autorizacao", "id_autorizacao_original", "status_da_original"}` em `/ecs/autorizacao` (ou com prefixo em `/ecs/reconciliador`). Conferir no item da original quem a encerrou e no `ops` do contrato o id da operação.
+  - **Ação:** decidir na fila humana (R7): o efeito está no limite e falta o fato contábil; publicar o evento correspondente ou desfazer o efeito com registro de quem decidiu. Abrir incidente: o invariante quebrou em algum lugar.
+  - **Verificação:** nenhuma linha nova em 5 min e a autorização fora da fila.
+- **Filtro sem linha:** os filtros existem mesmo que a linha nunca apareça (a métrica fica em 0). O alarme em OK não prova que o sinal está ligado; quem prova é o teste do serviço que emite a linha, e `relay/tests/unit/test_sinais_de_log.py` cruza o termo de cada filtro do relay com a linha emitida.

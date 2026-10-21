@@ -41,7 +41,9 @@ class TransacaoAutorizada(EventoDeDominio):
     id_estabelecimento: str | None
     saldos: SaldosDoLimite
     id_autorizacao_original: str | None = None  # preenchido na captura (DEBITO de uma RESERVA)
-    canal: str | None = None  # metadata.canal do pedido (PLD: o canal da operação vai no evento)
+    canal: str | None = (
+        None  # metadata.canal: declarado pelo chamador (opcional), não é o canal autenticado
+    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -151,6 +151,24 @@ def test_tabela_grande_sem_item_antigo_respeita_o_prazo() -> None:
     assert "publicar" not in diario
 
 
+def test_teto_conta_so_item_antigo_e_a_rodada_chega_ao_antigo_atras_dos_novos() -> None:
+    """F7-6: `varridos` e o teto contam o que o filtro devolveu, não o ScannedCount. Com 3.000 itens novos na
+    frente (ordem do Scan) e teto de 1.000, um teto em itens avaliados pararia na 2a página em toda rodada (o Scan
+    recomeça do início) e os 100 antigos nunca sairiam. Aqui a rodada lê as 7 páginas e publica os 100."""
+    dynamo, outbox, publicador, diario = _cenario(100, novos=3_000)
+    assert sorted(dynamo.tabela)[0].startswith("OUTBOX#n")  # os novos vêm antes no Scan
+
+    resultado = varrer(outbox, publicador, AGORA_MS, teto_de_itens=1_000)
+
+    assert diario.count("scan") == 7  # 3.100 avaliados em páginas de 500: passou de 1.000 avaliados
+    assert (resultado.varridos, len(resultado.publicados), resultado.interrompida) == (
+        100,
+        100,
+        False,
+    )
+    assert len(dynamo.tabela) == 3_000  # só os novos ficaram
+
+
 def test_falha_de_publicacao_fica_no_outbox_para_a_proxima_rodada() -> None:
     dynamo, outbox, publicador, _ = _cenario(30, falhar={"v000007"})
 

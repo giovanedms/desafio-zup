@@ -283,6 +283,34 @@ def test_encaminhar_guarda_motivo_e_progresso() -> None:
     assert evento.motivo == "DESFAZER_RECUSADO" and evento.aplicacao_confirmada_em == AGORA
 
 
+def test_reserva_na_fila_sem_hold_ainda_e_encerrada_pelo_vencedor_e_sai_da_fila() -> None:
+    """F7-1 (painel 7): o expirador encaminha a reserva por falta de hold enquanto a captura/estorno que o
+    removeu ainda não concluiu. O vencedor encerra assim mesmo; o motivo da fila deixa de valer."""
+    vencida = AGORA + VALIDADE_DA_RESERVA + timedelta(minutes=11)
+    na_fila = (
+        iniciada().aprovar(SALDOS, AGORA, "ev-1").encaminhar_reserva_sem_hold(vencida, "ev-rm")
+    )
+
+    assert na_fila.encerravel_pelo_vencedor
+    capturada = na_fila.capturar(vencida)
+    estornada = na_fila.estornar(vencida)
+    assert capturada.status is StatusAutorizacao.CAPTURADA
+    assert estornada.status is StatusAutorizacao.ESTORNADA
+    assert capturada.motivo_da_reconciliacao is estornada.motivo_da_reconciliacao is None
+
+
+def test_fila_humana_por_outro_motivo_nao_e_encerrada_por_captura_nem_estorno() -> None:
+    orfa = iniciada().encaminhar_para_reconciliacao(
+        MotivoDaReconciliacao.FORA_DO_PRAZO, AGORA, "ev-m"
+    )
+
+    assert not orfa.encerravel_pelo_vencedor
+    with pytest.raises(TransicaoInvalida):
+        orfa.capturar(AGORA)
+    with pytest.raises(TransicaoInvalida):
+        orfa.estornar(AGORA)
+
+
 def test_assumir_renova_lease_so_se_vencido() -> None:
     depois = AGORA + DURACAO_DO_LEASE + timedelta(seconds=1)
     assumida = iniciada().assumir(depois)

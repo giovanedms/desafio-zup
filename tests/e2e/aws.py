@@ -252,8 +252,9 @@ def borda() -> None:
             ),
             (
                 sem_token.status_code == 401
-                and sem_token.headers.get("content-type") == "application/problem+json",
-                "sem token deveria ser 401 application/problem+json (gateway response)",
+                and sem_token.headers.get("content-type") == "application/problem+json"
+                and sem_token.headers.get("www-authenticate") == "Bearer",
+                "sem token deveria ser 401 application/problem+json com WWW-Authenticate: Bearer (gateway response)",
             ),
             (
                 eh_422_do_servico(valor_zero),

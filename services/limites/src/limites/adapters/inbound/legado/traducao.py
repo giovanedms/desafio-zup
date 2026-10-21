@@ -33,8 +33,9 @@ TAMANHO_DO_REGISTRO = 84
 TAMANHO_DO_CONTRATO = 20
 TAMANHO_DA_CONTA = 16
 DIGITOS_DO_VALOR = 17
-_ID_DO_CONTRATO = re.compile(rf"^[A-Za-z0-9-]{{1,{TAMANHO_DO_CONTRATO}}}$")
-_ID_DA_CONTA = re.compile(rf"^[A-Za-z0-9-]{{1,{TAMANHO_DA_CONTA}}}$")
+# Sempre com `fullmatch`: com `match` e `$`, o `$` do Python casa antes de um `\n` final, e `CTR-1\n` passaria.
+_ID_DO_CONTRATO = re.compile(rf"[A-Za-z0-9-]{{1,{TAMANHO_DO_CONTRATO}}}")
+_ID_DA_CONTA = re.compile(rf"[A-Za-z0-9-]{{1,{TAMANHO_DA_CONTA}}}")
 FUSO_DO_LEGADO = ZoneInfo("America/Sao_Paulo")
 _PRODUTOS = {
     "01": TipoProduto.CREDITO,
@@ -76,7 +77,7 @@ def traduzir(registro: str) -> AtualizacaoDoLegado | None:
         raise RegistroLegadoInvalido(f"campo inválido: {erro}") from erro
     id_contrato = _campo(registro, 3, TAMANHO_DO_CONTRATO).strip()
     id_conta = _campo(registro, 23, TAMANHO_DA_CONTA).strip()
-    if not _ID_DO_CONTRATO.match(id_contrato) or not _ID_DA_CONTA.match(id_conta):
+    if not _ID_DO_CONTRATO.fullmatch(id_contrato) or not _ID_DA_CONTA.fullmatch(id_conta):
         # Vazio ou com caractere fora do pattern da API: contrato que nenhum canal conseguiria endereçar.
         raise RegistroLegadoInvalido("contrato ou conta ausente ou fora do pattern da API")
     try:
@@ -99,9 +100,9 @@ def formatar(atualizacao: AtualizacaoDoLegado) -> str:
     O que o layout não representa levanta `RegistroLegadoInvalido` em vez de truncar: truncar
     faria dois contratos distintos virarem o mesmo registro.
     """
-    if not _ID_DO_CONTRATO.match(atualizacao.id_contrato):
+    if not _ID_DO_CONTRATO.fullmatch(atualizacao.id_contrato):
         raise RegistroLegadoInvalido(f"id_contrato não cabe em {TAMANHO_DO_CONTRATO} posições")
-    if not _ID_DA_CONTA.match(atualizacao.id_conta):
+    if not _ID_DA_CONTA.fullmatch(atualizacao.id_conta):
         raise RegistroLegadoInvalido(f"id_conta não cabe em {TAMANHO_DA_CONTA} posições")
     produto = {v: k for k, v in _PRODUTOS.items()}[atualizacao.tipo_produto]
     situacao = {v: k for k, v in _SITUACOES.items()}[atualizacao.status]

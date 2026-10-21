@@ -29,8 +29,14 @@ class AplicarOperacaoNoLimite:
     def executar(
         self, id_contrato: str, operacao: OperacaoDeLimite, prazo: datetime | None = None
     ) -> ResultadoDaOperacao:
-        """`prazo`: instante depois do qual o chamador já desistiu. Conferido aqui, já na thread que vai
-        escrever (depois da espera na fila), para que nenhuma escrita caia muito depois do envio."""
+        """`prazo`: instante depois do qual o chamador já desistiu. Conferido UMA vez, aqui, já na thread que vai
+        escrever (depois da espera na fila): requisição que chega vencida não escreve nada.
+
+        O que isso limita é a espera na fila, não a escrita. A escrita que começa dentro do prazo pode cair depois
+        dele: o adapter repete a escrita (retries do SDK, voltas de diagnóstico) e quem limita esse tempo são os
+        timeouts e tentativas dele. Não se confere de novo entre as tentativas: elas acontecem dentro do adapter (as
+        do SDK, dentro de uma única chamada), e depois de um timeout a tentativa anterior pode ter sido aplicada:
+        desistir ali não impede a escrita de cair, e o 503 deixaria de poder dizer "nada foi aplicado"."""
         agora = self.relogio.agora()
         if prazo is not None and agora > prazo:
             raise PrazoDoChamadorVencido(id_contrato)

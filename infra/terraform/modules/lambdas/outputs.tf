@@ -34,6 +34,6 @@ output "cdc_limites_dlq_nome" {
 }
 
 output "cdc_limites_log_group_nome" {
-  description = "Log group da função relay-cdc-limites (metric filter de registro descartado)."
+  description = "Log group da função relay-cdc-limites (metric filter de registro malformado)."
   value       = aws_cloudwatch_log_group.this["cdc_limites"].name
 }

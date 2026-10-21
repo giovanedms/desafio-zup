@@ -1,9 +1,11 @@
 """Conformidade API ≡ OpenAPI: o app real responde o que contracts/openapi/autorizacao-v1.yaml declara.
 
 O app sobe com os dublês dos testes HTTP (repositório em memória, Limites falso) e cada resposta é conferida
-contra a resposta DECLARADA para aquele status na operação: status previsto, media type, corpo válido no
-schema (jsonschema, Draft 4, que é o dialeto do OpenAPI 3.0), todo membro do corpo declarado no schema e,
-nos problemas, `codigo`/`type`/`status` iguais à linha do catálogo (contracts/problem-types/catalogo.md).
+contra a resposta DECLARADA para aquele status na operação: status previsto, media type, headers de contrato
+declarados, corpo válido no schema (jsonschema, Draft 4, que é o dialeto do OpenAPI 3.0), todo membro do corpo
+declarado no schema e, nos problemas, `codigo`/`type`/`status` iguais à linha do catálogo
+(contracts/problem-types/catalogo.md). A outra direção também: todo corpo de requisição que o serviço aceita
+(2xx neste arquivo, ou o parse do corpo num corpus de variações) é válido no schema `PedidoDeAutorizacao`.
 Sem Schemathesis: os cenários são escolhidos, um por desfecho que o enunciado pede.
 """
 
@@ -23,7 +25,7 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 import yaml  # PyYAML chega com uvicorn[standard], dependência do serviço
-from autorizacao.adapters.inbound.http import _PROBLEMAS
+from autorizacao.adapters.inbound.http import _PROBLEMAS, _ler_pedido, _Rejeicao
 from autorizacao.adapters.outbound.memoria import RepositorioDeAutorizacoesEmMemoria
 from autorizacao.application.portas import ArmazenamentoIndisponivel
 from autorizacao.domain.autorizacao import MotivoRecusa
@@ -50,6 +52,19 @@ LimitesFalso = _dubles.LimitesFalso
 novo_cliente: Callable[..., Any] = _dubles._cliente
 corpo: Callable[..., bytes] = _dubles._corpo
 cabecalhos: Callable[..., dict[str, str]] = _dubles._cabecalhos
+CORPOS_COM_NULL: dict[str, dict[str, object]] = _dubles.CORPOS_COM_NULL
+CTR: str = _dubles.CTR
+
+# Headers com semântica de contrato que o serviço emite: cada um que aparecer tem de estar declarado na resposta.
+# Fora daqui: Content-Type (conferido pelo media type) e X-Correlation-Id, que sai em toda resposta e o contrato
+# declara só no 201/200 (nos problemas, a correlação da decisão vai no corpo, em `correlation_id`).
+HEADERS_DE_CONTRATO = (
+    "location",
+    "idempotent-replayed",
+    "retry-after",
+    "allow",
+    "www-authenticate",
+)
 
 # Formatos que o jsonschema só confere com pacotes opcionais (ausentes aqui): conferidos à mão.
 FORMATOS = FormatChecker()
@@ -119,6 +134,10 @@ def conferir(resposta: httpx.Response, operacao: tuple[str, str]) -> dict[str, A
     declarada = _no(declarada["$ref"]) if "$ref" in declarada else declarada
     ((media_type, conteudo),) = declarada["content"].items()
     assert resposta.headers["content-type"].split(";")[0] == media_type
+    headers_fora = {h for h in HEADERS_DE_CONTRATO if h in resposta.headers} - {
+        nome.lower() for nome in declarada.get("headers", {})
+    }
+    assert not headers_fora, f"headers da resposta {status} não declarados: {headers_fora}"
     schema = _json_schema(conteudo["schema"])
 
     corpo_json = json.loads(resposta.content)
@@ -138,6 +157,41 @@ def conferir(resposta: httpx.Response, operacao: tuple[str, str]) -> dict[str, A
     return dict(corpo_json)
 
 
+# --- Corpo de REQUISIÇÃO contra o contrato (painel 7, A7-1) -----------------------------------------------
+
+PEDIDO = Draft4Validator(
+    {"$ref": "#/components/schemas/PedidoDeAutorizacao", "components": COMPONENTES},
+    format_checker=FORMATOS,
+)
+
+
+def _erros_no_pedido(conteudo: bytes) -> list[str]:
+    return [
+        f"{list(e.absolute_path)}: {e.message}" for e in PEDIDO.iter_errors(json.loads(conteudo))
+    ]
+
+
+def _aceito_pelo_servico(conteudo: bytes) -> bool:
+    """O parse do corpo do serviço (o mesmo do POST): aceito = virou pedido de domínio, sem 400/422."""
+    try:
+        _ler_pedido(conteudo, CTR)
+    except _Rejeicao:
+        return False
+    return True
+
+
+def _conferir_pedidos_aceitos(cliente: Any) -> Any:
+    """Todo POST que o serviço aprova (201/200) neste arquivo tem corpo válido no schema do contrato."""
+
+    def conferir_pedido(resposta: httpx.Response) -> None:
+        if resposta.request.method == "POST" and resposta.status_code in (200, 201):
+            erros = _erros_no_pedido(resposta.request.content)
+            assert not erros, f"o serviço aprovou um corpo que o contrato recusa: {erros}"
+
+    cliente.event_hooks = {"request": [], "response": [conferir_pedido]}
+    return cliente
+
+
 @pytest.fixture
 def limites() -> Any:
     return LimitesFalso()
@@ -145,7 +199,7 @@ def limites() -> Any:
 
 @pytest.fixture
 def cliente(limites: Any) -> Any:
-    return novo_cliente(limites)
+    return _conferir_pedidos_aceitos(novo_cliente(limites))
 
 
 def test_201_e_replay_200(cliente: Any) -> None:
@@ -418,3 +472,199 @@ def test_todo_problema_do_servico_esta_no_catalogo_com_o_mesmo_tipo_e_status() -
 def test_motivos_de_recusa_do_contrato_sao_os_do_dominio() -> None:
     declarados = CONTRATO["components"]["schemas"]["Autorizacao"]["properties"]["motivo_recusa"]
     assert set(declarados["enum"]) == {m.value for m in MotivoRecusa}
+
+
+# --- painel 7 -------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tipo", ["RESERVA", "DEBITO", "CREDITO", "ESTORNO", "captura"])
+def test_201_e_replay_200_nos_quatro_tipos_e_na_captura(cliente: Any, tipo: str) -> None:
+    """A7-3: 201 e 200 conferidos em cada `tipo_operacao` (e na captura, que é DEBITO com original)."""
+    debito = cliente.post(
+        URL, content=corpo("300.00", tipo_operacao="DEBITO"), headers=cabecalhos()
+    )
+    reserva = cliente.post(URL, content=corpo(), headers=cabecalhos())
+    pedidos = {
+        "RESERVA": corpo("100.00"),
+        "DEBITO": corpo("100.00", tipo_operacao="DEBITO"),
+        "CREDITO": corpo("100.00", tipo_operacao="CREDITO"),
+        "ESTORNO": corpo(
+            "300.00",
+            tipo_operacao="ESTORNO",
+            id_autorizacao_original=debito.json()["id_autorizacao"],
+        ),
+        "captura": corpo(
+            "100.00",
+            tipo_operacao="DEBITO",
+            id_autorizacao_original=reserva.json()["id_autorizacao"],
+        ),
+    }
+    chave = str(uuid.uuid4())
+
+    primeira = cliente.post(URL, content=pedidos[tipo], headers=cabecalhos(chave))
+    replay = cliente.post(URL, content=pedidos[tipo], headers=cabecalhos(chave))
+
+    assert (primeira.status_code, replay.status_code) == (201, 200)
+    esperado = "DEBITO" if tipo == "captura" else tipo
+    assert conferir(primeira, POST)["tipo_operacao"] == esperado
+    assert conferir(replay, POST)["tipo_operacao"] == esperado
+    assert replay.headers["idempotent-replayed"] == "true"
+
+
+def _recusa_402(cliente: Any, _limites: Any) -> tuple[str, bytes]:
+    return URL, corpo("1000.01")
+
+
+def _recusa_404(cliente: Any, _limites: Any) -> tuple[str, bytes]:
+    return "/v1/contratos/CTR-NAO/autorizacoes", corpo()
+
+
+def _recusa_409(cliente: Any, limites: Any) -> tuple[str, bytes]:
+    reserva = cliente.post(URL, content=corpo(), headers=cabecalhos()).json()
+    limites.holds.clear()  # outra operação levou o hold: a captura é recusada e registrada
+    return URL, corpo(tipo_operacao="DEBITO", id_autorizacao_original=reserva["id_autorizacao"])
+
+
+def _recusa_422(cliente: Any, limites: Any) -> tuple[str, bytes]:
+    limites.inativos.add(CTR)
+    return URL, corpo()
+
+
+@pytest.mark.parametrize(
+    ("preparar", "status", "codigo"),
+    [
+        (_recusa_402, 402, "LIMITE_INSUFICIENTE"),
+        (_recusa_404, 404, "CONTRATO_NAO_ENCONTRADO"),
+        (_recusa_409, 409, "CONFLITO_DE_ESTADO"),
+        (_recusa_422, 422, "CONTRATO_INATIVO"),
+    ],
+    ids=["402", "404", "409", "422"],
+)
+def test_replay_de_recusa_registrada_sai_com_idempotent_replayed_declarado(
+    cliente: Any,
+    limites: Any,
+    preparar: Callable[[Any, Any], tuple[str, bytes]],
+    status: int,
+    codigo: str,
+) -> None:
+    """A7-4: o header sai no replay de toda recusa registrada; o contrato o declara nas quatro respostas."""
+    caminho, conteudo = preparar(cliente, limites)
+    chave = str(uuid.uuid4())
+
+    primeira = cliente.post(caminho, content=conteudo, headers=cabecalhos(chave))
+    replay = cliente.post(caminho, content=conteudo, headers=cabecalhos(chave))
+
+    assert primeira.status_code == replay.status_code == status
+    assert "idempotent-replayed" not in primeira.headers
+    assert replay.headers["idempotent-replayed"] == "true"
+    assert conferir(primeira, POST)["codigo"] == conferir(replay, POST)["codigo"] == codigo
+
+
+def test_o_conferidor_reprova_header_fora_do_contrato() -> None:
+    """Sanidade: Idempotent-Replayed num 415 (que nunca é replay) não está declarado e reprova."""
+    ruim = httpx.Response(
+        415,
+        headers={"content-type": "application/problem+json", "idempotent-replayed": "true"},
+        content=b"{}",
+    )
+
+    with pytest.raises(AssertionError, match="não declarados"):
+        conferir(ruim, POST)
+
+
+def test_401_declara_o_www_authenticate_que_o_servico_manda(cliente: Any) -> None:
+    sem_client_id = cabecalhos()
+    del sem_client_id["X-Client-Id"]
+
+    post = cliente.post(URL, content=corpo(), headers=sem_client_id)
+    get = cliente.get(f"{URL}/{uuid.uuid4()}")
+
+    assert post.headers["www-authenticate"] == get.headers["www-authenticate"] == "Bearer"
+    assert conferir(post, POST)["codigo"] == conferir(get, GET)["codigo"] == "NAO_AUTENTICADO"
+
+
+def test_contrato_declara_x_api_key_exigida_junto_com_o_token_nas_duas_operacoes() -> None:
+    """D7-4: o gateway exige token E API key no mesmo requisito; o contrato diz o mesmo."""
+    esquema = CONTRATO["components"]["securitySchemes"]["api_key"]
+    requisitos = [CONTRATO["security"], CONTRATO["paths"][GET[0]][GET[1]]["security"]]
+
+    assert (esquema["type"], esquema["in"], esquema["name"]) == ("apiKey", "header", "x-api-key")
+    assert all(r == [{"oauth2": r[0]["oauth2"], "api_key": []}] for r in requisitos)
+    assert "security" not in CONTRATO["paths"][POST[0]][POST[1]]  # o POST herda o da raiz
+
+
+# --- corpo de requisição ≡ schema PedidoDeAutorizacao ----------------------------------------------
+
+EXEMPLOS: dict[str, Any] = CONTRATO["paths"][POST[0]][POST[1]]["requestBody"]["content"][
+    "application/json"
+]["examples"]
+
+
+@pytest.mark.parametrize("nome", list(EXEMPLOS))
+def test_exemplo_de_pedido_do_contrato_e_aceito_pelo_servico(nome: str) -> None:
+    conteudo = json.dumps(EXEMPLOS[nome]["value"]).encode()
+
+    assert _erros_no_pedido(conteudo) == []
+    assert _aceito_pelo_servico(conteudo)
+
+
+@pytest.mark.parametrize(("campo", "extra"), CORPOS_COM_NULL.items(), ids=list(CORPOS_COM_NULL))
+def test_corpo_com_null_que_o_contrato_recusa_o_servico_recusa(
+    cliente: Any, campo: str, extra: dict[str, object]
+) -> None:
+    """A7-1: os corpos com `null` (os 6 do juiz e mais 2) são inválidos no contrato E recusados (antes: 201)."""
+    conteudo = corpo(**extra)
+    assert _erros_no_pedido(conteudo), "o caso deixou de ser inválido no contrato"
+
+    resposta = cliente.post(URL, content=conteudo, headers=cabecalhos())
+
+    assert resposta.status_code == 422
+    assert [e["campo"] for e in conferir(resposta, POST)["erros"]] == [campo]
+
+
+UUID_DE_EXEMPLO = "6f1c2b0e-3d4a-5b6c-8d7e-9f0a1b2c3d4e"
+# Campos opcionais presentes e ausentes, bordas de tamanho e de pattern, tipos trocados, extras e os nulls.
+VARIACOES: list[dict[str, object]] = [
+    {},
+    {"id_contrato": CTR},
+    {"id_contrato": "CTR-2"},
+    {"id_conta": "A" * 16},
+    {"id_conta": "A" * 17},
+    {"id_estabelecimento": "E" * 64},
+    {"id_estabelecimento": "E" * 65},
+    {"id_estabelecimento": "EST 1"},
+    {"metadata": {}},
+    {"metadata": {"canal": "PIX", "id_rastreio_canal": "a.b:c-d_e", "geo": {"uf": "SP"}}},
+    {"metadata": {"geo": {}}},
+    {"metadata": {"geo": {"municipio_ibge": "123456"}}},
+    {"metadata": {"canal": "pos"}},
+    {"metadata": {"rastreio": "x"}},
+    {"metadata": []},
+    {"tipo_operacao": "DEBITO"},
+    {"tipo_operacao": "CREDITO"},
+    {"tipo_operacao": "SAQUE"},
+    {"tipo_operacao": "ESTORNO", "id_autorizacao_original": UUID_DE_EXEMPLO},
+    {"tipo_operacao": "DEBITO", "id_autorizacao_original": UUID_DE_EXEMPLO.upper()},
+    {"tipo_operacao": "ESTORNO", "id_autorizacao_original": "nao-e-uuid"},
+    {"moeda": "brl"},
+    {"moeda": 986},
+    {"extra": 1},
+    *CORPOS_COM_NULL.values(),
+]
+VALORES = ["150.00", "150", "0.01", "9999999999999999.99", "1.5e2", "0", "-1", '"10.00"', "true"]
+
+
+def test_todo_corpo_que_o_servico_aceita_e_valido_no_contrato() -> None:
+    """Aceito pelo serviço ⇒ válido no contrato, num corpus de variações × valores. A volta não vale, de
+    propósito: o domínio recusa com 422 corpos que o schema aceita (moeda ≠ BRL, 3 casas, `id_contrato` ≠ path)."""
+    aceitos = recusados = 0
+    for variacao in VARIACOES:
+        for valor in VALORES:
+            conteudo = corpo(valor, **variacao)
+            if not _aceito_pelo_servico(conteudo):
+                recusados += 1
+                continue
+            aceitos += 1
+            assert _erros_no_pedido(conteudo) == [], (variacao, valor)
+
+    assert aceitos >= 40 and recusados >= 40  # as duas pontas foram exercitadas

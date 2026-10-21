@@ -1,15 +1,20 @@
-"""LeitorDeStream (modo local): retomada do iterador expirado e registro malformado do CDC."""
+"""Modo local: retomada do iterador expirado, registro malformado (CDC e outbox) e heartbeat do loop."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError
 from relay.cdc_limites import de_registro_do_stream_de_limites
 from relay.local import LeitorDeStream
+from relay.nucleo import ResultadoDoLote
+
+from relay import local
 
 
 def _erro(codigo: str) -> ClientError:
@@ -141,3 +146,73 @@ def test_cdc_malformado_e_logado_e_o_resto_do_shard_segue(caplog: pytest.LogCapt
         "shard-1",
         "201",
     )
+
+
+def test_outbox_malformado_e_logado_com_o_pk_e_o_resto_do_shard_segue(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sem DLQ no modo local: loga (mesmo termo do metric filter da AWS) e segue; o sweeper o reencontra."""
+    ruim = _insert("301")
+    del ruim["dynamodb"]["NewImage"]["detail_type"]
+    streams = StreamsFalso([{"Records": [ruim, _insert("302")], "NextShardIterator": "a"}])
+    leitor = LeitorDeStream(streams, "arn")  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.ERROR, logger="relay.local"):
+        pendentes = leitor.ler()
+
+    assert [e.id_evento for e in pendentes] == ["ev-302"]
+    linha = json.loads(caplog.records[-1].getMessage())
+    assert (linha["evento"], linha["pk"], linha["shard"], linha["sequencia"]) == (
+        "outbox_registro_malformado",
+        "OUTBOX#ev-301",
+        "shard-1",
+        "301",
+    )
+
+
+class Parar(BaseException):
+    """Escapa do `except Exception` do loop: encerra o `main()` depois de N voltas."""
+
+
+def _rodar_main(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, falhar: bool, voltas: int = 3
+) -> Path:
+    batida = tmp_path / "relay.heartbeat"
+    batida.touch()
+    os.utime(batida, (0, 0))  # heartbeat velho: só uma volta bem-sucedida o renova
+    chamadas = 0
+
+    def iteracao(*_: Any) -> ResultadoDoLote:
+        nonlocal chamadas
+        chamadas += 1
+        if chamadas > voltas:
+            raise Parar
+        if falhar:
+            raise RuntimeError("LocalStack fora do ar")
+        return ResultadoDoLote(set(), set())
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:4566")
+    monkeypatch.setattr(local, "HEARTBEAT", batida)
+    monkeypatch.setattr(local, "cliente_local", lambda *_a, **_k: object())
+    monkeypatch.setattr(local, "_descobrir_stream_arn", lambda *_a: "arn")
+    monkeypatch.setattr(local, "_leitor_de_limites", lambda *_a: None)
+    monkeypatch.setattr(local, "uma_iteracao", iteracao)
+    monkeypatch.setattr(local.time, "sleep", lambda _s: None)
+
+    with pytest.raises(Parar):
+        local.main()
+    assert chamadas == voltas + 1
+    return batida
+
+
+def test_volta_que_falha_nao_renova_o_heartbeat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F7-2: com toda volta falhando, o healthcheck da imagem (heartbeat < 30 s) reprova o relay."""
+    assert _rodar_main(monkeypatch, tmp_path, falhar=True).stat().st_mtime == 0
+
+
+def test_volta_sem_excecao_renova_o_heartbeat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assert _rodar_main(monkeypatch, tmp_path, falhar=False).stat().st_mtime > 0

@@ -5,6 +5,7 @@ root_packages =
     limites
     contabilizacao
     relay
+    plataforma
 include_external_packages = True
 
 [importlinter:contract:autorizacao-layers]
@@ -93,3 +94,20 @@ source_modules =
 forbidden_modules =
     boto3
     botocore
+
+# Pacote compartilhado (libs/plataforma, sem dependências no pyproject). Como root_package ele é atravessado:
+# um `domain -> plataforma.x -> boto3` quebra o contrato do serviço. Aqui ele mesmo fica proibido de importar
+# framework e SDK.
+[importlinter:contract:plataforma-pura]
+name = plataforma: sem framework nem AWS SDK
+type = forbidden
+source_modules =
+    plataforma
+forbidden_modules =
+    fastapi
+    starlette
+    pydantic
+    boto3
+    botocore
+    httpx
+    uvicorn

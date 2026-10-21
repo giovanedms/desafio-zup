@@ -16,7 +16,7 @@ O enunciado dá o endpoint, os campos, a tabela de status (201/200/402/409/422/4
 - O contrato (`contracts/openapi/`) é a fonte da verdade: o código e o gateway seguem o contrato, e não o contrário.
 - **Por que 3.0.3 e não 3.1/3.2:** o API Gateway REST importa 2.0/3.0, não 3.1.
 - **CI:** Spectral (lint) + `openapi-spec-validator` (estrutura) + **oasdiff** (breaking change contra a `main`).
-- **Código ≡ contrato:** `services/autorizacao/tests/contract/test_api_bate_com_o_contrato.py` sobe o app com dublês e confere cada desfecho (201 e 200 nos quatro `tipo_operacao`, 400, 401, 402, 404, 405, 409, 415, 422, 500, 503, e o GET com 200/404/405/422/503) contra a resposta declarada para aquele status: media type, corpo no schema (jsonschema, Draft 4), nenhum membro fora do contrato e `codigo`/`type`/`status` iguais ao catálogo. O dublê do port `Limites` tem as mesmas pré-condições do agregado real (não é mais permissivo que ele). Exaustividade: todo `MotivoRecusa` tem código, detalhe e linha no enum do contrato, e todo problema do serviço tem linha igual no catálogo. Os desfechos só da borda (403, 429, 504) não passam pelo serviço; na AWS, o smoke `tests/e2e/aws.py borda` confere o 401 e o 429 da borda e o 422 do serviço (`valor: 0`).
+- **Código ≡ contrato:** `services/autorizacao/tests/contract/test_api_bate_com_o_contrato.py` sobe o app com dublês e confere cada desfecho (201 e o replay 200 em cada um dos quatro `tipo_operacao` e na captura; 400, 401, 402, 404, 405, 409, 415, 422, 500, 503; o replay de recusa 402/404/409/422; e o GET com 200/401/404/405/422/503) contra a resposta declarada para aquele status: media type, headers de contrato emitidos (`Location`, `Idempotent-Replayed`, `Retry-After`, `Allow`, `WWW-Authenticate`) declarados na resposta, corpo no schema (jsonschema, Draft 4), nenhum membro fora do contrato e `codigo`/`type`/`status` iguais ao catálogo. Na outra direção, todo corpo de requisição que o serviço aceita é válido no schema `PedidoDeAutorizacao`: os de todo POST aprovado no arquivo e os de um corpus de variações (campos presentes e ausentes, bordas, `null`, extras); os exemplos do contrato são aceitos. O dublê do port `Limites` reproduz as pré-condições do agregado real (`Limite.diagnosticar`), na mesma ordem, inclusive `CONTRATO_INATIVO`; a diferença é a guarda de idempotência, que no dublê não expira (a janela de 5 min é testada no BC Limites). Exaustividade: todo `MotivoRecusa` tem código, detalhe e linha no enum do contrato, e todo problema do serviço tem linha igual no catálogo. Os desfechos só da borda (403, 429, 504) não passam pelo serviço; na AWS, o smoke `tests/e2e/aws.py borda` confere o 401 e o 429 da borda e o 422 do serviço (`valor: 0`).
 - O serviço não publica a spec que o FastAPI gera (`/openapi.json`, `/docs`, `/redoc` desligados): ela divergia do contrato.
 
 ### 2. Status
@@ -25,17 +25,17 @@ O enunciado dá o endpoint, os campos, a tabela de status (201/200/402/409/422/4
 |---|---|
 | Aprovada na primeira execução | 201 + `Location` **relativa** (`autorizacoes/{id}`) |
 | Replay de aprovação | 200, com corpo **idêntico** e `Idempotent-Replayed: true` |
-| Replay de recusa | **O mesmo status da original** (402/404/409/422), não 200, com corpo **idêntico** |
+| Replay de recusa | **O mesmo status da original** (402/404/409/422), não 200, com corpo **idêntico** e `Idempotent-Replayed: true` |
 | Limite insuficiente | **402**, mantido como no enunciado |
 | Mesma chave em processamento | 409 `requisicao-em-andamento` |
 | Estado mudou (estorno de estornada/expirada) | 409 `conflito-de-estado` |
 | **Não existe 409 de contenção** | reservas no mesmo contrato são serializadas pelo banco (ADR-0005) |
-| Sintaxe inválida | 400 (corpo que não é JSON, inclusive `NaN`/`Infinity`; `Idempotency-Key` ausente/inválida) |
-| `X-Client-Id` ausente ou fora de `^[A-Za-z0-9._-]{1,64}$` (acesso direto ao serviço) | 401 |
-| Corpo fora do schema ou regra de domínio | 422 (inclui campo desconhecido, tipo errado, obrigatório ausente, valor ≤ 0, `metadata` fora da allowlist) |
+| Sintaxe inválida | 400 (corpo que não é JSON, inclusive `NaN`/`Infinity`; objeto com nome repetido, que a RFC 7493 §2.3 proíbe e cada parser resolve de um jeito; `Idempotency-Key` ausente/inválida) |
+| `X-Client-Id` ausente ou fora de `^[A-Za-z0-9._-]{1,64}$` (acesso direto ao serviço) | 401 com `WWW-Authenticate: Bearer` (RFC 9110 §15.5.2), como o 401 do gateway |
+| Corpo fora do schema ou regra de domínio | 422 (inclui campo desconhecido, tipo errado, `null` em campo opcional, obrigatório ausente, valor ≤ 0, `metadata` fora da allowlist) |
 | Contrato inexistente | 404 |
 | Conta (`id_conta`) que não é a titular do contrato | 422 `CONTA_DIVERGENTE`, sem saldos na resposta |
-| Rota inexistente / método não suportado (acesso direto ao serviço) | 404 `RECURSO_NAO_ENCONTRADO` / 405 `METODO_NAO_PERMITIDO` com `Allow`, em problem+json |
+| Rota inexistente / método não suportado (acesso direto ao serviço) | 404 `RECURSO_NAO_ENCONTRADO` (inclusive com barra final: sem redirect 307) / 405 `METODO_NAO_PERMITIDO` com `Allow`, em problem+json |
 | Content-Type errado | 415 |
 | Gateway | 400 (header obrigatório ausente), 401/403/429/504 |
 | Rate limit | 429 só na borda (usage plan e WAF); o serviço não emite 429 |

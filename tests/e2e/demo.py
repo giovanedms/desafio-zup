@@ -131,11 +131,13 @@ def demo_aprovacao_e_replay(http: httpx.Client) -> None:
     confere(reuso.status_code == 422, "chave reutilizada com outro corpo deveria ser 422")
 
 
-def demo_corrida(http: httpx.Client, n: int = 100) -> None:
-    titulo(f"2. Corrida: {n} reservas paralelas de R$ 100 num limite de R$ 1.000")
+def demo_corrida(http: httpx.Client, n: int = 100, clientes: int = 50) -> None:
+    titulo(
+        f"2. Corrida: {n} reservas de R$ 100, {clientes} clientes simultâneos, num limite de R$ 1.000"
+    )
     id_contrato = novo_contrato("1000.00")
     antes = Counter(REPETIDAS)
-    with ThreadPoolExecutor(max_workers=50) as pool:
+    with ThreadPoolExecutor(max_workers=clientes) as pool:
         resultados = list(pool.map(lambda _: autorizar(http, id_contrato, reserva()), range(n)))
     if repetidas := REPETIDAS - antes:
         print(

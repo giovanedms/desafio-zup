@@ -20,8 +20,10 @@ Precisa de Node e de um Chrome do puppeteer (em ambiente root, passe um arquivo 
 cd docs/arquitetura/diagramas
 for f in *.mmd; do
   npx -y @mermaid-js/mermaid-cli@11.4.2 -c mermaid-config.json -i "$f" -o "${f%.mmd}.svg" -b white
-  npx -y @mermaid-js/mermaid-cli@11.4.2 -c mermaid-config.json -i "$f" -o "${f%.mmd}.png" -b white -s 2
+  npx -y @mermaid-js/mermaid-cli@11.4.2 -c mermaid-config.json -i "$f" -o "${f%.mmd}.png" -b white -s 2 -w 3400
 done
 ```
+
+O `-w 3400` abre a página larga o bastante para os diagramas 03 a 05, que têm mais de 2.700 px de largura natural; sem ele, o PNG sai espremido na largura padrão. Para projetar, prefira o SVG, que escala sem perda.
 
 Os blocos Mermaid de 1 a 3 também aparecem no documento de arquitetura. Se mudar um, mude o outro.

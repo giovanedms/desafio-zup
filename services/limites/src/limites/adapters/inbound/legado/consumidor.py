@@ -5,6 +5,10 @@ Os dois caminhos usam `processar_registro`: traduzir (ACL) → executar o caso d
 Na AWS o mesmo loop roda como serviço ECS (`limites-acl`, ACL_MODO_AWS=true, credenciais da task role).
 Registro inválido levanta `RegistroLegadoInvalido`: não é apagado, o SQS reentrega e, após
 maxReceiveCount, a mensagem vai para a DLQ (nunca é descartada em silêncio).
+Heartbeat em /tmp/limites-acl.heartbeat (healthcheck do container, < 30 s), renovado SÓ depois de uma iteração
+sem exceção: a fila inalcançável de forma persistente (rede, credencial, permissão) deixa o heartbeat envelhecer, o
+healthcheck reprova e o ECS recicla a task. Mensagem que falha (registro inválido, banco fora) não conta: fica
+para reentrega e DLQ, e o lote segue, como a órfã que FALHOU no reconciliador.
 """
 
 from __future__ import annotations
@@ -100,6 +104,19 @@ def uma_iteracao(
     return desfechos
 
 
+def iterar_e_sinalizar(
+    sqs: Any, url_fila: str, caso: SincronizarComLegado, heartbeat: Path
+) -> bool:
+    """Uma iteração; renova o heartbeat só se ela terminou sem exceção. Nunca levanta (o loop continua)."""
+    try:
+        uma_iteracao(sqs, url_fila, caso)
+    except Exception:
+        log.exception("iteração falhou; heartbeat não renovado")
+        return False
+    heartbeat.touch()
+    return True
+
+
 def _esperar_fila(sqs: Any, nome: str, tentativas: int = 30) -> str:
     """A fila nasce no bootstrap, que pode terminar depois do container subir."""
     for tentativa in range(1, tentativas + 1):
@@ -107,7 +124,8 @@ def _esperar_fila(sqs: Any, nome: str, tentativas: int = 30) -> str:
             return str(sqs.get_queue_url(QueueName=nome)["QueueUrl"])
         except sqs.exceptions.QueueDoesNotExist:
             log.warning("fila %s ainda não existe (%d/%d)", nome, tentativa, tentativas)
-            HEARTBEAT.touch()  # esperar a fila não é estar doente
+            # Esperar a fila não é estar doente, e a espera tem fim: sem fila, o processo sai.
+            HEARTBEAT.touch()
             time.sleep(2)
     sys.exit(f"fila {nome!r} não apareceu; rode o bootstrap")
 
@@ -127,12 +145,8 @@ def main() -> None:
     url_fila = _esperar_fila(sqs, config.fila_legado)
     log.info("ACL do legado iniciada: fila=%s tabela=%s", config.fila_legado, config.tabela_limites)
     while True:
-        try:
-            uma_iteracao(sqs, url_fila, caso)
-        except Exception:
-            log.exception("iteração falhou; tentando de novo")
+        if not iterar_e_sinalizar(sqs, url_fila, caso, HEARTBEAT):
             time.sleep(1)
-        HEARTBEAT.touch()
 
 
 if __name__ == "__main__":

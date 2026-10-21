@@ -58,7 +58,8 @@ class LeasePerdido(Exception):
 
 
 class OriginalJaEncerrada(Exception):
-    """Na conclusão do estorno/captura/expiração, a original já não estava APROVADA (outro venceu)."""
+    """Na conclusão do estorno/captura/expiração, a original já não podia ser encerrada pelo vencedor: nem
+    APROVADA, nem reserva sem hold na fila humana (`Autorizacao.encerravel_pelo_vencedor`)."""
 
 
 # --- Tradução para o BC Limites (Customer/Supplier) ------------------------------------------
@@ -145,7 +146,8 @@ class RepositorioDeAutorizacoes(LeituraDeAutorizacoes, Protocol):
 
         Condições: a gravada está EM_PROCESSAMENTO com o MESMO lease (dono do lease) → senão LeasePerdido.
         Com `original_encerrada` (ESTORNADA ou CAPTURADA): grava também o novo status da original,
-        condicionado a ela ainda estar APROVADA → senão OriginalJaEncerrada.
+        condicionado a ela ainda poder ser encerrada pelo vencedor (APROVADA, ou reserva sem hold na fila
+        humana; sai da fila) → senão OriginalJaEncerrada.
         """
         ...
 
@@ -156,8 +158,10 @@ class RepositorioDeAutorizacoes(LeituraDeAutorizacoes, Protocol):
         for deste estorno, ou for `substituir` (marca velha de um estorno que terminou sem aprovação).
 
         Devolve None se marcou; senão o id do estorno que segura a marca, ou "" se a original já não
-        está APROVADA. Um estorno por original em voo de cada vez: o id da operação de estorno é
-        derivado da original, e dois estornos separados por mais que a guarda do limite reaplicariam.
+        está APROVADA. Exceção: reserva que foi para a fila humana por falta de hold com a marca DESTE
+        estorno → None (a retomada segue, e o limite diz se foi ele quem removeu o hold). Um estorno por
+        original em voo de cada vez: o id da operação de estorno é derivado da original, e dois estornos
+        separados por mais que a guarda do limite reaplicariam.
         """
         ...
 
@@ -189,8 +193,9 @@ class ExpiracaoDeReservas(Protocol):
         ...
 
     def registrar_expiracao(self, expirada: Autorizacao) -> None:
-        """Grava a reserva EXPIRADA + eventos no outbox, numa escrita atômica, condicionada a ela ainda
-        estar APROVADA → senão OriginalJaEncerrada (captura ou estorno chegou primeiro)."""
+        """Grava a reserva EXPIRADA + eventos no outbox, numa escrita atômica, condicionada à mesma regra do
+        `concluir` para a original (APROVADA, ou sem hold na fila humana) → senão OriginalJaEncerrada (captura
+        ou estorno chegou primeiro)."""
         ...
 
 

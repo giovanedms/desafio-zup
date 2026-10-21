@@ -20,7 +20,8 @@ consulta RM#. Nada que precise de gente some de todos os índices.
 GSI esparso `gsi_vencimentos`, mesmo desenho: só RESERVAs APROVADAS ainda pendentes carregam `venc_shard`
 (RV#0..RV#N-1) e `venc_ms` (expira_em). Capturar, estornar ou expirar regrava a original com REMOVE desses
 atributos e ela sai do índice. O expirador consulta os N shards por vencimento; quem decide é o CAS
-"ainda APROVADA" da escrita final.
+"ainda APROVADA" da escrita final (ou reserva sem hold na fila humana, que o vencedor ainda encerra: sai da fila
+e volta a ter TTL).
 
 Quantos shards (N, ADR-0016 e docs/capacidade.md): a sort key dos dois índices cresce com o tempo (lease, vencimento),
 então o DynamoDB não divide uma chave quente por faixa de sort key, e cada valor de `*_shard` fica preso ao teto de
@@ -46,6 +47,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -81,6 +83,8 @@ from autorizacao.domain.pedido import TipoOperacao
 
 if TYPE_CHECKING:
     from mypy_boto3_dynamodb.client import DynamoDBClient
+
+_log = logging.getLogger(__name__)
 
 INDICE_DE_ORFAS = "gsi_orfas"
 INDICE_DE_VENCIMENTOS = "gsi_vencimentos"
@@ -149,6 +153,15 @@ _VALORES_EM_CURSO = {
 }
 
 
+# Reserva que o expirador pôs na fila humana por falta de hold: o vencedor que já aplicou ainda a encerra
+# (espelha `Autorizacao.encerravel_pelo_vencedor`).
+_NA_FILA_SEM_HOLD = "(#status = :manual AND motivo_da_reconciliacao = :sem_hold)"
+_VALORES_DA_FILA_SEM_HOLD = {
+    ":manual": {"S": StatusAutorizacao.RECONCILIACAO_MANUAL.value},
+    ":sem_hold": {"S": MotivoDaReconciliacao.RESERVA_SEM_HOLD.value},
+}
+
+
 def shard_da_fila_humana(id_autorizacao: str, shards: int = SHARDS_DE_ORFAS) -> str:
     """`RM#<n>`: fila de reconciliação manual, no mesmo GSI das órfãs (o reconciliador só lê EP#)."""
     return f"RM#{_shard(id_autorizacao, shards)}"
@@ -193,8 +206,13 @@ def _cancelamento(
 
     `condicoes` liga o índice de um item à exceção de domínio da condição dele (na ordem de prioridade).
     ConditionalCheckFailed num desses itens → a exceção dele; conflito ou estrangulamento em qualquer item →
-    `ArmazenamentoIndisponivel`; o resto (ex.: id de evento repetido no outbox, ValidationError) → None, e o
-    chamador relança o erro original: é defeito, não estado a tratar.
+    `ArmazenamentoIndisponivel`.
+
+    ConditionalCheckFailed em item FORA de `condicoes` só pode ser do outbox (`attribute_not_exists(pk)`): id de
+    evento repetido, com as condições de estado todas atendidas. A transação foi cancelada inteira (nada gravado)
+    e a próxima tentativa gera ids de evento novos, então repetir com a mesma Idempotency-Key resolve:
+    `ArmazenamentoIndisponivel` (503 com Retry-After), com uma linha de erro, porque com ids uuid4 isso é anomalia.
+    O resto (ex.: ValidationError) → None, e o chamador relança o erro original: é defeito, não estado a tratar.
     """
     resposta = cast("Mapping[str, Any]", erro.response)
     motivos = [str(m.get("Code") or "None") for m in resposta.get("CancellationReasons", [])]
@@ -202,6 +220,9 @@ def _cancelamento(
         if indice < len(motivos) and motivos[indice] == "ConditionalCheckFailed":
             return excecao
     if _CANCELAMENTOS_TRANSITORIOS.intersection(motivos):
+        return ArmazenamentoIndisponivel(alvo)
+    if "ConditionalCheckFailed" in motivos:
+        _log.error(json.dumps({"evento": "id_de_evento_repetido_no_outbox", "alvo": alvo}))
         return ArmazenamentoIndisponivel(alvo)
     return None
 
@@ -339,6 +360,7 @@ class RepositorioDeAutorizacoesDynamoDB:
         valores = {
             ":e": {"S": id_estorno},
             ":aprovada": {"S": StatusAutorizacao.APROVADA.value},
+            **_VALORES_DA_FILA_SEM_HOLD,
         }
         if substituir is not None:
             livre += " OR estorno_em_curso = :velho"
@@ -348,7 +370,11 @@ class RepositorioDeAutorizacoesDynamoDB:
                 TableName=self._tabela,
                 Key=chave(id_original),
                 UpdateExpression="SET estorno_em_curso = :e",
-                ConditionExpression=f"#status = :aprovada AND ({livre})",
+                # Reserva na fila humana por falta de hold: só a retomada do estorno que já tinha a marca segue.
+                ConditionExpression=(
+                    f"(#status = :aprovada AND ({livre})) OR "
+                    f"({_NA_FILA_SEM_HOLD} AND estorno_em_curso = :e)"
+                ),
                 ExpressionAttributeNames={"#status": "status"},
                 ExpressionAttributeValues=valores,
                 ReturnValuesOnConditionCheckFailure="ALL_OLD",
@@ -476,20 +502,26 @@ class RepositorioDeAutorizacoesDynamoDB:
 
 
 def _encerrar_original(tabela: str, original: Autorizacao) -> dict[str, Any]:
-    """APROVADA → ESTORNADA/CAPTURADA/EXPIRADA, só se ainda APROVADA; sai do índice de vencimentos."""
+    """→ ESTORNADA/CAPTURADA/EXPIRADA, só se a gravada ainda pode ser encerrada pelo vencedor
+    (`Autorizacao.encerravel_pelo_vencedor`: APROVADA, ou reserva sem hold na fila humana). Sai do índice de
+    vencimentos e da fila humana, perde o motivo da fila e volta a ter TTL (em APROVADA, os REMOVE não acham nada
+    e o TTL regravado é o mesmo)."""
     return {
         "Update": {
             "TableName": tabela,
             "Key": chave(original.id_autorizacao),
             "UpdateExpression": (
-                "SET #status = :novo, atualizada_em = :agora REMOVE venc_shard, venc_ms"
+                "SET #status = :novo, atualizada_em = :agora, #ttl = :ttl "
+                "REMOVE venc_shard, venc_ms, orfa_shard, orfa_lease_ms, motivo_da_reconciliacao"
             ),
-            "ConditionExpression": "#status = :aprovada",
-            "ExpressionAttributeNames": {"#status": "status"},
+            "ConditionExpression": f"#status = :aprovada OR {_NA_FILA_SEM_HOLD}",
+            "ExpressionAttributeNames": {"#status": "status", "#ttl": "ttl"},
             "ExpressionAttributeValues": {
                 ":novo": {"S": original.status.value},
                 ":aprovada": {"S": StatusAutorizacao.APROVADA.value},
                 ":agora": {"S": original.atualizada_em.isoformat()},
+                ":ttl": {"N": str(_ttl_quente(original))},
+                **_VALORES_DA_FILA_SEM_HOLD,
             },
         }
     }
@@ -546,6 +578,11 @@ def definicoes_das_tabelas(tabela: str, tabela_outbox: str) -> list[dict[str, An
 
 def _ms(instante: datetime) -> int:
     return int(instante.timestamp() * 1000)
+
+
+def _ttl_quente(a: Autorizacao) -> int:
+    """Fim da retenção quente, em epoch de segundos (o formato do TTL do DynamoDB)."""
+    return int((a.criada_em + RETENCAO_QUENTE).timestamp())
 
 
 def _item_do_outbox(evento: EventoDeDominio) -> dict[str, Any]:
@@ -617,7 +654,7 @@ def _para_item(
         "correlation_id": a.correlation_id,
         "traceparent": a.traceparent,
         # Na fila humana não há TTL: o caso fica até alguém resolver (o evento vai para o archive do barramento).
-        "ttl": None if na_fila_humana else int((a.criada_em + RETENCAO_QUENTE).timestamp()),
+        "ttl": None if na_fila_humana else _ttl_quente(a),
     }
     return {k: _serializar(v) for k, v in bruto.items() if v is not None}
 

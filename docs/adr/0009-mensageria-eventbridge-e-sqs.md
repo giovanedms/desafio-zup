@@ -21,7 +21,7 @@ Fatos em sa-east-1 (da documentação oficial da AWS; os links principais estão
 | Serviço | Fato relevante |
 |---|---|
 | EventBridge Classic | PutEvents 600/s padrão (**6.000 aprovados na conta**), Invocations 1.100/s (**20.000 aprovados**); entrega **sem ordem**, at-least-once; retry de 24 h / 185 tentativas |
-| SNS Standard | Publish **300 msg/s** padrão |
+| SNS | Publish: **300 mensagens/s por conta** em sa-east-1 nos tópicos Standard (3.000 nos FIFO), somando `Publish` e `PublishBatch` de todos os tópicos da conta; quota ajustável |
 | SQS FIFO high-throughput | 4.500 TPS por ação sem batch (45.000 com batch) |
 | Kinesis | Ordem por partition key; até 1 MB/s ou 1.000 registros/s por shard; retenção de até 365 dias |
 | MSK | Só Provisioned em sa-east-1 (sem Serverless). O piso de ~US$ 894/mês da pesquisa é **us-east-1, Express**; o de sa-east-1 não foi verificado |
@@ -51,7 +51,7 @@ Fatos em sa-east-1 (da documentação oficial da AWS; os links principais estão
 | Opção | Ordem por chave | Vazão em sa-east-1 | Custo e operação | Veredito |
 |---|---|---|---|---|
 | **EventBridge + SQS** (escolhida) | Não (consumidor tolera) | 6.000 PutEvents/s aprovados; ajustável | Pago por uso, zero operação | **Agora** |
-| SNS → SQS | Não (FIFO sim, com limites) | 300 msg/s padrão | Pago por uso | Avaliado abaixo (regra → SNS → N filas): ganha invocations, perde filtro e replay por consumidor |
+| SNS → SQS | Não (FIFO sim, com limites) | 300 msg/s padrão por conta (Standard); ajustável | Pago por uso | Avaliado abaixo (regra → SNS → N filas): ganha invocations, perde filtro e replay por consumidor |
 | SQS FIFO (`MessageGroupId` = contrato) | Sim, por grupo | 4.500 TPS sem batch | Pago por uso | Bom para **um** consumidor que precise de ordem estrita por contrato |
 | Kinesis Data Streams | Sim, por partition key | Escala por shard (on-demand) | Pago por shard-hora | Bom para data platform e antifraude em stream, com replay de dias |
 | MSK (Kafka) | Sim, por partição | Muito alta | Piso de cluster provisionado, operação de Kafka | Quando a plataforma do banco já opera Kafka como backbone (o Itaú usa Kafka em casos públicos) |
@@ -63,7 +63,7 @@ O padrão alternativo é uma regra por evento entregando num tópico SNS, com um
 - **filtro por consumidor no EventBridge:** cada consumidor hoje escolhe os `detail-type` na regra dele, com o archive e as métricas por regra. Com SNS, o filtro vai para a filter policy da assinatura, outra sintaxe e outro lugar para auditar;
 - **replay por consumidor:** o replay do archive escolhe as regras de destino. Com uma regra só na frente do SNS, um replay para a contabilização reentrega para todas as filas. Os consumidores são idempotentes, então não quebra, mas vira ruído e custo;
 - **mais um salto e mais um par retry/DLQ:** regra → SNS (DLQ do target) e SNS → SQS (redrive policy da assinatura), dois lugares para falhar e monitorar;
-- **outra quota a pedir, e maior:** o EventBridge entrega no SNS via `Publish`, e o SNS Standard tem 300 msg/s padrão em sa-east-1. O pico pede ~10.500/s, um aumento de ~35×, contra 20.000 → 25.000 nas invocations (o pedido que já foi aprovado uma vez saiu de 1.100 para 20.000).
+- **outra quota a pedir, e maior:** o EventBridge entrega no SNS via `Publish`, e a quota de mensagens publicadas do SNS em sa-east-1 é de 300/s por conta nos tópicos Standard, somando todos os tópicos e contando mensagem, não chamada (o `PublishBatch` não alivia). O pico pede ~10.500/s, um aumento de ~35×, contra 20.000 → 25.000 nas invocations (o pedido que já foi aprovado uma vez saiu de 1.100 para 20.000). A quota do SNS também é ajustável: o argumento é o tamanho do aumento a pedir, não um teto que impeça o desenho.
 
 **Fica de fora** porque a quota de invocations é ajustável e o aumento necessário é pequeno, enquanto o filtro e o replay por consumidor valem mais para o consumidor contábil. **Entra** se o aumento de invocations for negado, ou se o número de consumidores por evento crescer: cada consumidor novo de `TransacaoAutorizada` soma ~5.000 invocations/s no pico. Nesse caso, o SNS entra **só** para os eventos de fan-out largo (antifraude, notificações, data platform) e a contabilização mantém a regra própria, com filtro e replay.
 
@@ -85,6 +85,8 @@ O padrão alternativo é uma regra por evento entregando num tópico SNS, com um
 ## Referências
 
 - EventBridge quotas: https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-quota.html
+- SNS quotas ("Publish API throttling per account": sa-east-1 está em "All other supported Regions", 300 mensagens/s Standard e 3.000 FIFO; consultado em 21/10/2026): https://docs.aws.amazon.com/general/latest/gr/sns.html
 - SQS FIFO high throughput: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/high-throughput-fifo.html
+- SQS quotas (FIFO de alta vazão em sa-east-1: 4.500 TPS sem batch, 45.000 com batch): https://docs.aws.amazon.com/general/latest/gr/sqs-service.html
 - Kinesis quotas: https://docs.aws.amazon.com/streams/latest/dev/service-sizes-and-limits.html
 - microservices.io — Idempotent consumer: https://microservices.io/patterns/communication-style/idempotent-consumer.html

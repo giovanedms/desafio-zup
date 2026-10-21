@@ -9,6 +9,7 @@ Estados:
           │                                                       └──encaminhar──▶ RECONCILIACAO_MANUAL
           └──encaminhar (órfã que não dá para decidir com segurança)──▶ RECONCILIACAO_MANUAL
     APROVADA (RESERVA vencida, sem hold e sem vencedor) ──encaminhar_reserva_sem_hold──▶ RECONCILIACAO_MANUAL
+    RECONCILIACAO_MANUAL (RESERVA_SEM_HOLD) ──capturar | estornar (o vencedor aparece)──▶ CAPTURADA | ESTORNADA
 
 COMPENSANDO é gravado ANTES de qualquer chamada ao limite: dali em diante o cliente não retoma mais a chave
 (recebe "encerrada sem resultado"), então reconciliador e cliente nunca disputam o mesmo efeito. O progresso
@@ -17,6 +18,9 @@ continua dele. Compensar e encaminhar registram evento: a trilha durável inclui
 
 Uma RESERVA aprovada sai de APROVADA por exatamente um caminho: captura, estorno ou expiração. Quem
 decide qual é o BC Limites (a operação que remove o hold vence; as outras recebem RESERVA_NAO_ENCONTRADA).
+A fila humana por falta de hold (RESERVA_SEM_HOLD) não é um quarto desfecho: o expirador a usa quando o vencedor
+não apareceu. Se ele aparece depois (já tinha removido o hold e ainda não tinha concluído), é ele quem encerra
+a reserva, e a resposta do limite à operação dele é a prova (`encerravel_pelo_vencedor`).
 
 `resultado` guarda o desfecho ORIGINAL (o que o replay devolve); `status` é o estado atual.
 Uma aprovação estornada depois continua respondendo "aprovada" a um replay da chave original.
@@ -195,6 +199,16 @@ class Autorizacao:
     def reserva_pendente(self) -> bool:
         """Hold ainda vivo: aprovado e nem capturado, nem estornado, nem expirado."""
         return self.tipo is TipoOperacao.RESERVA and self.status is StatusAutorizacao.APROVADA
+
+    @property
+    def encerravel_pelo_vencedor(self) -> bool:
+        """A captura/estorno que venceu a disputa no limite ainda pode encerrar esta original? APROVADA, ou
+        RESERVA que o expirador pôs na fila humana por falta de hold (RESERVA_SEM_HOLD): o hold sumiu porque esse
+        vencedor o removeu e ainda não tinha concluído. Operação NOVA sobre ela continua recusada (409)."""
+        return self.status is StatusAutorizacao.APROVADA or (
+            self.status is StatusAutorizacao.RECONCILIACAO_MANUAL
+            and self.motivo_da_reconciliacao is MotivoDaReconciliacao.RESERVA_SEM_HOLD
+        )
 
     @property
     def eh_captura(self) -> bool:
@@ -382,17 +396,25 @@ class Autorizacao:
 
     def estornar(self, agora: datetime) -> Autorizacao:
         """Marca a ORIGINAL como estornada (o evento sai da autorização de ESTORNO)."""
-        self._exigir(StatusAutorizacao.APROVADA, "estornar")
+        self._exigir_encerravel("estornar")
         if self.tipo not in (TipoOperacao.RESERVA, TipoOperacao.DEBITO):
             raise TransicaoInvalida(f"{self.tipo} não é estornável")
-        return replace(self, status=StatusAutorizacao.ESTORNADA, atualizada_em=agora)
+        return self._encerrada(StatusAutorizacao.ESTORNADA, agora)
 
     def capturar(self, agora: datetime) -> Autorizacao:
         """Marca a RESERVA original como capturada (os eventos saem da autorização de captura)."""
-        self._exigir(StatusAutorizacao.APROVADA, "capturar")
+        self._exigir_encerravel("capturar")
         if self.tipo is not TipoOperacao.RESERVA:
             raise TransicaoInvalida(f"{self.tipo} não é capturável")
-        return replace(self, status=StatusAutorizacao.CAPTURADA, atualizada_em=agora)
+        return self._encerrada(StatusAutorizacao.CAPTURADA, agora)
+
+    def _exigir_encerravel(self, acao: str) -> None:
+        if not self.encerravel_pelo_vencedor:
+            raise TransicaoInvalida(f"não é possível {acao} a partir de {self.status}")
+
+    def _encerrada(self, status: StatusAutorizacao, agora: datetime) -> Autorizacao:
+        """Sai da fila humana, se estava nela: o motivo deixa de valer quando o vencedor encerra."""
+        return replace(self, status=status, motivo_da_reconciliacao=None, atualizada_em=agora)
 
     def expirar(self, saldos: SaldosDoLimite, agora: datetime, id_evento: str) -> Autorizacao:
         self._exigir(StatusAutorizacao.APROVADA, "expirar")

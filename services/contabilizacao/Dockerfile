@@ -61,7 +61,7 @@ COPY --from=build /opt/venv /opt/venv
 
 USER 10001:10001
 
-# Sem HTTP: o loop toca /tmp/contabilizacao.heartbeat a cada iteração (long poll de 10 s);
+# Sem HTTP: o loop toca /tmp/contabilizacao.heartbeat a cada iteração SEM exceção (long poll de 10 s);
 # saudável se mexeu nos últimos 30 s.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=15s --retries=3 \
     CMD ["python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/contabilizacao.heartbeat')<30 else 1)"]

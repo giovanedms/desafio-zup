@@ -82,9 +82,10 @@ def main() -> None:
         try:
             uma_iteracao(sqs, url_fila, caso_de_uso)
         except Exception:
-            log.exception("iteração falhou; tentando de novo")
+            log.exception("iteração falhou; heartbeat não renovado")
             time.sleep(1)
-        HEARTBEAT.touch()
+        else:
+            HEARTBEAT.touch()  # só em volta sem exceção: o healthcheck da imagem reprova o poller que só falha
 
 
 if __name__ == "__main__":

@@ -5,8 +5,9 @@ httpx.Client (configurados no composition root). O retry é SEGURO porque a oper
 `id_operacao`: repetir devolve JA_APLICADA com os saldos atuais, nunca aplica duas vezes.
 
 Prazo propagado: cada tentativa de aplicar leva `X-Prazo-Ms` (agora + PRAZO_POR_TENTATIVA). O limites não
-escreve se o prazo venceu enquanto a requisição esperava na fila dele, então nenhuma escrita cai muito
-depois de o chamador desistir: é isso que torna verdadeira a premissa de tempo do reconciliador.
+começa a escrever se o prazo venceu enquanto a requisição esperava na fila dele, e a escrita que começou
+termina dentro do orçamento de timeouts e retries do limites (ADR-0006): é isso que torna verdadeira a premissa
+de tempo do reconciliador.
 
 Dinheiro: corpo serializado com simplejson (Decimal como número exato) e resposta lida com
 `parse_float=Decimal`; float nunca toca o valor.

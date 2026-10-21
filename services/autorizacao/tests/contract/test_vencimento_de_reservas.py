@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
@@ -186,3 +187,107 @@ def test_item_na_fila_humana_fica_sem_ttl_e_no_indice_rm(
     assert "venc_shard" not in item
     eventos = cliente_dynamodb_local.scan(TableName=outbox)["Items"]
     assert any(e["detail_type"]["S"] == "TransacaoEmReconciliacaoManual" for e in eventos)
+
+
+# --- F7-1 (painel 7): o vencedor que ainda não concluiu encerra a reserva que foi para a fila sem hold -----
+
+
+def _vencedor_em_curso(
+    repositorio: Repositorio, id_reserva: str, tipo: TipoOperacao
+) -> Autorizacao:
+    nova = Autorizacao.iniciar(
+        PedidoDeAutorizacao(
+            "CTR-1", "0001-1", Decimal("150.00"), "BRL", tipo, id_autorizacao_original=id_reserva
+        ),
+        id_autorizacao=f"vencedor-{tipo.value.lower()}", impressao_digital="imp",
+        client_id="canal-pos", agora=VENCIDA, correlation_id="corr-1", traceparent=None,
+    )  # fmt: skip
+    repositorio.registrar(nova)
+    return nova
+
+
+def _vencedor_encerra(repositorio: Repositorio, reserva: Autorizacao, como: str) -> None:
+    """Captura e estorno encerram no `concluir`; a expiração, no `registrar_expiracao`."""
+    if como == "expiracao":
+        repositorio.registrar_expiracao(reserva.expirar(SALDOS, VENCIDA, "ev-exp"))
+        return
+    tipo = TipoOperacao.DEBITO if como == "captura" else TipoOperacao.ESTORNO
+    vencedor = _vencedor_em_curso(repositorio, reserva.id_autorizacao, tipo)
+    aprovado = vencedor.aprovar(SALDOS, VENCIDA, f"ev-{como}", reserva)
+    original = reserva.capturar(VENCIDA) if como == "captura" else reserva.estornar(VENCIDA)
+    repositorio.concluir(aprovado, original)
+
+
+@pytest.mark.parametrize(
+    ("como", "status"),
+    [
+        ("captura", StatusAutorizacao.CAPTURADA),
+        ("estorno", StatusAutorizacao.ESTORNADA),
+        ("expiracao", StatusAutorizacao.EXPIRADA),
+    ],
+)
+def test_vencedor_encerra_reserva_que_o_expirador_pos_na_fila_sem_hold(
+    repositorio: Repositorio, como: str, status: StatusAutorizacao
+) -> None:
+    reserva = aprovada(repositorio, "reserva")  # o que o vencedor validou: APROVADA
+    repositorio.encaminhar_reserva(reserva.encaminhar_reserva_sem_hold(VENCIDA, "ev-rm"))
+
+    _vencedor_encerra(repositorio, reserva, como)
+
+    gravada = repositorio.obter("reserva")
+    assert gravada is not None and gravada.status is status
+    assert gravada.motivo_da_reconciliacao is None
+
+
+def test_fila_humana_por_outro_motivo_nao_e_encerrada_por_quem_conclui(
+    repositorio: Repositorio,
+) -> None:
+    """A condição olha o MOTIVO: só a reserva sem hold espera o vencedor. A porta confere a gravada; o que se
+    grava vem do agregado (aqui, uma reserva aprovada com o mesmo id, como o vencedor a teria validado)."""
+    orfa = Autorizacao.iniciar(
+        PedidoDeAutorizacao("CTR-1", "0001-1", Decimal("150.00"), "BRL", TipoOperacao.RESERVA),
+        id_autorizacao="orfa", impressao_digital="imp", client_id="canal-pos",
+        agora=AGORA, correlation_id="corr-1", traceparent=None,
+    )  # fmt: skip
+    repositorio.registrar(orfa)
+    repositorio.concluir(
+        orfa.encaminhar_para_reconciliacao(MotivoDaReconciliacao.FORA_DO_PRAZO, AGORA, "ev-m"),
+        None,
+    )
+    como_validada = replace(aprovada(repositorio, "outra"), id_autorizacao="orfa")
+
+    with pytest.raises(OriginalJaEncerrada):
+        _vencedor_encerra(repositorio, como_validada, "captura")
+    gravada = repositorio.obter("orfa")
+    assert gravada is not None and gravada.status is StatusAutorizacao.RECONCILIACAO_MANUAL
+
+
+def test_marca_em_reserva_na_fila_sem_hold_so_vale_para_o_estorno_que_ja_a_tinha(
+    repositorio: Repositorio,
+) -> None:
+    reserva = aprovada(repositorio, "reserva")
+    assert repositorio.marcar_estorno("reserva", "e1") is None
+    repositorio.encaminhar_reserva(reserva.encaminhar_reserva_sem_hold(VENCIDA, "ev-rm"))
+
+    assert repositorio.marcar_estorno("reserva", "e1") is None  # retomada: o limite decide
+    assert repositorio.marcar_estorno("reserva", "e2") == ""  # estorno novo: não é mais APROVADA
+    assert repositorio.marcar_estorno("reserva", "e2", substituir="e1") == ""
+
+
+@pytest.mark.integracao
+def test_reserva_encerrada_pelo_vencedor_sai_da_fila_rm_e_volta_a_ter_ttl(
+    cliente_dynamodb_local: DynamoDBClient, tabelas_autorizacoes: tuple[str, str]
+) -> None:
+    tabela, outbox = tabelas_autorizacoes
+    repositorio = RepositorioDeAutorizacoesDynamoDB(cliente_dynamodb_local, tabela, outbox)
+    reserva = aprovada(repositorio, "reserva")
+    repositorio.encaminhar_reserva(reserva.encaminhar_reserva_sem_hold(VENCIDA, "ev-rm"))
+
+    _vencedor_encerra(repositorio, reserva, "captura")
+
+    item = cliente_dynamodb_local.get_item(
+        TableName=tabela, Key={"pk": {"S": "AUT#reserva"}}, ConsistentRead=True
+    )["Item"]
+    assert item["status"]["S"] == "CAPTURADA"
+    assert not {"orfa_shard", "orfa_lease_ms", "motivo_da_reconciliacao"} & set(item)
+    assert int(item["ttl"]["N"]) == int((AGORA + timedelta(days=30)).timestamp())

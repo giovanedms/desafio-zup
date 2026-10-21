@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | **0. Bootstrap da conta** | Manual, uma vez por conta (seção 2) | Administrador da Organization | — | Sim |
 | **1. Ambiente `esteira`** (`infra/terraform/environments/esteira`, 5 recursos) | Terraform | Administrador, uma vez; **nunca** a própria esteira | `esteira/terraform.tfstate` | Sim |
-| **2. Ambiente `sandbox`** (`infra/terraform/environments/sandbox`, 203 recursos) | Terraform | Esteira (push na `main`) ou `make deploy` | `sandbox/terraform.tfstate` | Não: é o que o destroy remove |
+| **2. Ambiente `sandbox`** (`infra/terraform/environments/sandbox`, 209 recursos) | Terraform | Esteira (push na `main`) ou `make deploy` | `sandbox/terraform.tfstate` | Não: é o que o destroy remove |
 
 Além delas, a AWS cria sozinha alguns recursos ao primeiro uso de certos serviços (seção 5). O Terraform não os gerencia.
 
@@ -26,7 +26,7 @@ flowchart LR
   DES -->|"token OIDC"| STS
   STS --> ROLE["role desafio-zup-esteira (camada 1)"]
   ROLE --> TF["terraform: state no S3 (camada 0)"]
-  TF --> SBX["sandbox: 203 recursos (camada 2)"]
+  TF --> SBX["sandbox: 209 recursos (camada 2)"]
 ```
 
 ## 2. Camada 0 — bootstrap da conta
@@ -43,7 +43,7 @@ Feito à mão em 19/10/2026. Configuração conferida pela API em 20/10/2026.
 | **CloudTrail `desafio-zup-trail`** (região de origem sa-east-1) | Multi-região; eventos de serviços globais; validação de integridade dos arquivos; eventos de gerenciamento de leitura e escrita; **sem** eventos de dados, sem chave KMS própria, sem envio ao CloudWatch Logs | Trilha de auditoria (ADR-0017) |
 | **Bucket `desafio-zup-cloudtrail-<conta>`** (sa-east-1) | Versionado; SSE-S3; Object Lock em modo `GOVERNANCE` por 1 dia; lifecycle `expira-30d` (objetos em 30 dias, versões não correntes em 1 dia); Block Public Access; policy com TLS obrigatório e escrita só do trail (`aws:SourceArn`) | WORM com retenção curta, para demonstrar o mecanismo (ADR-0017). Na produção, o ADR-0017 define Object Lock em modo `COMPLIANCE` por 10 anos para a trilha de eventos (archive e Firehose → S3). Para o CloudTrail, `docs/compliance.md` liga a trilha à Res. ANPD 15/2024 (registro de incidentes por 5 anos) |
 | **Budget `desafio-zup-mensal`** | Custo mensal de US$ 30. Alertas por e-mail: gasto real acima de 50%, 80% e 100% e previsão acima de 100%. **Sem budget action** | **Alerta, não teto**: nada é bloqueado ou desligado. Com o sandbox no ar (~US$ 7/dia, seção 7), os US$ 30 acabam em ~4 dias. Quem encerra o gasto é o destroy |
-| **Quotas** (sa-east-1) | EventBridge `PutEvents`: aumento para 6.000 TPS aprovado. EventBridge `Invocations`: aumento para 20.000 TPS aprovado. Lambda, execuções concorrentes: 1.000 em vigor (o pedido para 1.000 foi encerrado como caso de suporte). Fargate On-Demand vCPU: 140 (valor da conta, sem pedido). Pedidos de 19/10/2026 | Dimensionamento do pico de 5.000 TPS (ADR-0001, 0004 e 0009). PutEvents e Invocations aprovados **não cobrem** o mix com captura: pedir 12.000 e 25.000 (`docs/capacidade.md`, seção 1.1) |
+| **Quotas** (sa-east-1) | EventBridge `PutEvents`: aumento para 6.000 TPS aprovado. EventBridge `Invocations`: aumento para 20.000 TPS aprovado. Lambda, execuções concorrentes: 1.000 em vigor (o pedido para 1.000 foi encerrado como caso de suporte). Fargate On-Demand vCPU: 140 (valor da conta, sem pedido). Pedidos de 19/10/2026. A pedir antes de pico: quota de throughput por tabela do DynamoDB, ~75.000 WRU/s (`docs/capacidade.md` §1.6) | Dimensionamento do pico de 5.000 TPS (ADR-0001, 0004 e 0009). PutEvents e Invocations aprovados **não cobrem** o mix com captura: pedir 12.000 e 25.000 (`docs/capacidade.md`, seção 1.1) |
 
 **Para reproduzir em outra conta**, nesta ordem:
 
@@ -104,7 +104,7 @@ AWS_PROFILE=desafio-zup terraform -chdir=infra/terraform/environments/esteira ap
 
 As variáveis `repositorio_github`, `id_dono_github`, `id_repositorio_github` e `branch_de_deploy` têm default para este repositório. Em um fork, os IDs mudam e precisam ser passados.
 
-## 4. Camada 2 — ambiente `sandbox` (203 recursos)
+## 4. Camada 2 — ambiente `sandbox` (209 recursos)
 
 | Módulo | Recursos | Conteúdo |
 |---|---:|---|
@@ -116,19 +116,19 @@ As variáveis `repositorio_github`, `id_dono_github`, `id_repositorio_github` e 
 | `ecr` | 4 | 2 repositórios (`autorizacao`, `limites`) e as lifecycle policies. O `desafio-zup/relay` saiu do conjunto padrão |
 | `eventos` | 27 | Bus, archive, 4 regras, 4 targets (com retry explícito e DLQ de entrega), 9 filas SQS (inclui a `financas-entrega-dlq`), 4 queue policies, 4 redrive-allow |
 | `lambdas` | 22 | 4 funções, 3 event source mappings, 1 schedule, 4 roles e 4 políticas, 2 DLQs, 4 log groups |
-| `observabilidade` | 47 | 30 alarmes e 2 compostos, 9 metric filters, 1 dashboard, 1 regra de Contributor Insights, tópico SNS de alarmes e a policy dele, chave KMS do tópico e o alias. Com `email_alarmes`, mais 1 assinatura. Painel 6: o alarme de 5XX virou burn rate (4 janelas + 2 alarmes compostos), e entraram idade das filas, Errors das 4 Lambdas, IteratorAge do CDC e 2 sinais de log (seção 4.8) |
-| **Total** | **203** | `terraform state list` mostra 204 linhas: a 204ª é o data source `module.api.data.aws_region.atual`. Contado em 21/10/2026, depois do deploy do commit `3598e74` |
+| `observabilidade` | 53 | 32 alarmes e 2 compostos, 13 metric filters, 1 dashboard, 1 regra de Contributor Insights, tópico SNS de alarmes e a policy dele, chave KMS do tópico e o alias. Com `email_alarmes`, mais 1 assinatura. Painel 6: o alarme de 5XX virou burn rate (4 janelas + 2 alarmes compostos), e entraram idade das filas, Errors das 4 Lambdas, IteratorAge do CDC e 2 sinais de log; painel 7: os sinais `outbox-registro-malformado` e `efeito-sem-evento` (2 filtros e 1 alarme cada) e o do CDC renomeado para o termo que o código emite (seção 4.8) |
+| **Total** | **209** | `terraform state list` mostra 210 linhas: a 210ª é o data source `module.api.data.aws_region.atual`. 203 contados no deploy do commit `3598e74`; o painel 7 acrescentou 6 (os sinais `outbox-registro-malformado` e `efeito-sem-evento`: 4 metric filters e 2 alarmes), conferidos no `terraform plan` e recontados no state depois do deploy |
 
-**Tags.** O `default_tags` do provider aplica `environment=sandbox`, `team=plataforma-financas`, `managed-by=terraform` e `project=desafio-autorizacao`. Ficam **sem tag 66 recursos de 25 tipos**, todos de tipos que não têm argumento de tags no provider. Pelo state:
+**Tags.** O `default_tags` do provider aplica `environment=sandbox`, `team=plataforma-financas`, `managed-by=terraform` e `project=desafio-autorizacao`. Ficam **sem tag 70 recursos de 25 tipos**, todos de tipos que não têm argumento de tags no provider. Pelo state:
 - **IAM:** `aws_iam_role_policy` (12), `aws_iam_role_policy_attachment` (1).
 - **API Gateway:** `aws_api_gateway_account` (1), `aws_api_gateway_deployment` (1), `aws_api_gateway_method_settings` (1), `aws_api_gateway_usage_plan_key` (3).
 - **Cognito:** `aws_cognito_user_pool_client` (3), `aws_cognito_user_pool_domain` (1), `aws_cognito_resource_server` (1).
 - **Eventos e filas:** `aws_cloudwatch_event_archive` (1), `aws_cloudwatch_event_target` (4), `aws_sqs_queue_policy` (4), `aws_sqs_queue_redrive_allow_policy` (4), `aws_scheduler_schedule` (1).
-- **Observabilidade:** `aws_cloudwatch_dashboard` (1), `aws_cloudwatch_log_metric_filter` (9), `aws_dynamodb_contributor_insights` (2), `aws_kms_alias` (1), `aws_sns_topic_policy` (1).
+- **Observabilidade:** `aws_cloudwatch_dashboard` (1), `aws_cloudwatch_log_metric_filter` (13), `aws_dynamodb_contributor_insights` (2), `aws_kms_alias` (1), `aws_sns_topic_policy` (1).
 - **Rede:** `aws_route` (1), `aws_route_table_association` (2).
 - **Demais:** `aws_ecr_lifecycle_policy` (2), `aws_appautoscaling_policy` (4), `aws_appautoscaling_scheduled_action` (4), `aws_wafv2_web_acl_association` (1).
 
-Os outros 137 têm as 4 tags (conferido pelo `tags_all` no state). O ambiente `esteira` usa as mesmas.
+Os outros 139 têm as 4 tags (conferido pelo `tags_all` no state). O ambiente `esteira` usa as mesmas.
 
 ### 4.1 Rede (`modules/rede`)
 
@@ -149,7 +149,7 @@ Os outros 137 têm as 4 tags (conferido pelo `tags_all` no state). O ambiente `e
 
 | Recurso | Nome | Configuração |
 |---|---|---|
-| REST API | `desafio-autorizacao` | Regional. O body importado parte do contrato `contracts/openapi/autorizacao-v1.yaml`, que traz as 2 rotas (`/v1/contratos/{id_contrato}/autorizacoes` e `.../{id_autorizacao}`) e declara só o esquema `oauth2`. O módulo (`modules/api/main.tf`, `local.especificacao`) acrescenta: a integração de cada rota com o VPC Link, que injeta `X-Client-Id` (do token) e `X-Gateway-Request-Id` (= `$context.requestId`, a junção com o log do serviço); o validador `parametros` (só parâmetros: barra a falta do `Idempotency-Key`; o **corpo não é validado na borda**, o serviço é a autoridade e responde o 422 do contrato); os esquemas `cognito` (authorizer do user pool) e `api_key` (header `x-api-key`); e as **12 gateway responses** em RFC 9457 (`ACCESS_DENIED`, `BAD_REQUEST_BODY`, `BAD_REQUEST_PARAMETERS`, `DEFAULT_4XX`, `DEFAULT_5XX`, `INTEGRATION_TIMEOUT`, `INVALID_API_KEY`, `MISSING_AUTHENTICATION_TOKEN`, `QUOTA_EXCEEDED`, `THROTTLED`, `UNAUTHORIZED` e `WAF_FILTERED`). O `DEFAULT_4XX` fixa 400, e a AWS aplica esse status a todo 4XX sem resposta própria: por isso `WAF_FILTERED`, `INVALID_API_KEY` e `MISSING_AUTHENTICATION_TOKEN` têm entrada explícita (403 `SEM_PERMISSAO`). As respostas ficam dentro do body porque, como resources separados, eram apagadas a cada reimportação (achado no deploy 1.0.1) |
+| REST API | `desafio-autorizacao` | Regional. O body importado parte do contrato `contracts/openapi/autorizacao-v1.yaml`, que traz as 2 rotas (`/v1/contratos/{id_contrato}/autorizacoes` e `.../{id_autorizacao}`) e declara os esquemas `oauth2` e `api_key` (`x-api-key`), exigidos juntos; o módulo os troca pelo `cognito` e pela mesma `api_key`, e o `UNAUTHORIZED` leva `WWW-Authenticate: Bearer`. O módulo (`modules/api/main.tf`, `local.especificacao`) acrescenta: a integração de cada rota com o VPC Link, que injeta `X-Client-Id` (do token) e `X-Gateway-Request-Id` (= `$context.requestId`, a junção com o log do serviço); o validador `parametros` (só parâmetros: barra a falta do `Idempotency-Key`; o **corpo não é validado na borda**, o serviço é a autoridade e responde o 422 do contrato); os esquemas `cognito` (authorizer do user pool) e `api_key` (header `x-api-key`); e as **12 gateway responses** em RFC 9457 (`ACCESS_DENIED`, `BAD_REQUEST_BODY`, `BAD_REQUEST_PARAMETERS`, `DEFAULT_4XX`, `DEFAULT_5XX`, `INTEGRATION_TIMEOUT`, `INVALID_API_KEY`, `MISSING_AUTHENTICATION_TOKEN`, `QUOTA_EXCEEDED`, `THROTTLED`, `UNAUTHORIZED` e `WAF_FILTERED`). O `DEFAULT_4XX` fixa 400, e a AWS aplica esse status a todo 4XX sem resposta própria: por isso `WAF_FILTERED`, `INVALID_API_KEY` e `MISSING_AUTHENTICATION_TOKEN` têm entrada explícita (403 `SEM_PERMISSAO`). As respostas ficam dentro do body porque, como resources separados, eram apagadas a cada reimportação (achado no deploy 1.0.1) |
 | Deployment e stage | `v1` | Redeploy quando muda o hash do body. X-Ray ligado. Access log JSON em `/aws/apigateway/desafio-autorizacao-v1` (`requestId`, `extendedRequestId`, IP, método, rota, status, latências, `clientId`). Execution log nível `ERROR` em `API-Gateway-Execution-Logs_<api-id>/v1`. Métricas por método. Sem cache |
 | Configuração da conta (`aws_api_gateway_account`) | — | Aponta para a role `desafio-autorizacao-apigw-cloudwatch` (`AmazonAPIGatewayPushToCloudWatchLogs`). É configuração da conta e da região, não da API |
 | VPC Link | `desafio-autorizacao-nlb` | Integração do REST (v1) com o NLB. **Timeout da integração: 10 s** (`var.timeout_integracao_ms`; era 29 s, painel 6 D7). A conta está no `modules/api/variables.tf`: 10 s cobrem a falha transitória que as tentativas do código absorvem (um timeout no `limites` com a nova tentativa, ~4 s, ou 2-3 timeouts seguidos numa chamada ao DynamoDB). O `max_attempts: 3` do botocore são 3 tentativas **novas**, 4 no total, até 8 s por chamada mais o backoff; o pior caso teórico (~34 s) nem cabia nos 29 s. Acima de 10 s o canal recebe 504 `TEMPO_ESGOTADO` e repete com a mesma `Idempotency-Key` (replay) |
@@ -297,7 +297,9 @@ Dashboard `desafio-autorizacao`. Log groups: 10, todos com retenção de 7 dias 
 | `lambda-erros-<função>` (4: `relay`, `sweeper`, `cdc-limites`, `contabilizacao`) | `Errors` soma (5 min) | ≥ 1. Falha parcial de lote não conta (aparece no IteratorAge e na DLQ). Runbook R12 |
 | `idade-da-fila-<fila>` (3: `contabilizacao`, `antifraude`, `notificacoes`) | `ApproximateAgeOfOldestMessage` máximo (1 min) | > 300 s (`var.idade_fila_limite_s`, acima da visibilidade de 180 s). A fila do legado tem o alarme próprio abaixo. No sandbox, `antifraude` e `notificacoes` não têm consumidor: o alarme delas entra em ALARM 5 min depois do primeiro evento e fica até as mensagens expirarem, e isso é o sinal certo (ninguém consome). Runbook R13 |
 | `motivo-desconhecido-do-limite` | `desafio-zup/autorizacao MotivoDesconhecidoDoLimite`, alimentada por 2 metric filters: `{ $.evento = "motivo_desconhecido_do_limite" }` em `/ecs/autorizacao` (linha JSON pura) e o termo `"motivo_desconhecido_do_limite"` em `/ecs/reconciliador` (linha com prefixo de data e logger); soma em 5 min | ≥ 1. Runbook R14 |
-| `cdc-registro-descartado` | `desafio-zup/relay RegistrosDoCdcDescartados` (termo `cdc_registro_descartado` no log group do CDC), soma em 5 min | ≥ 1. Runbook R14 |
+| `cdc-registro-malformado` | `desafio-zup/relay RegistrosDoCdcMalformados` (termo `cdc_registro_malformado` no log group do CDC: a linha do registro devolvido como falha do lote), soma em 5 min | ≥ 1. Runbook R14 |
+| `outbox-registro-malformado` | `desafio-zup/relay RegistrosDoOutboxMalformados`, alimentada por 2 metric filters do termo `outbox_registro_malformado`: `/aws/lambda/desafio-relay` (registro devolvido como falha do lote) e `/aws/lambda/desafio-sweeper` (item antigo ainda no outbox, a cada rodada); soma em 5 min | ≥ 1. Runbook R14 |
+| `efeito-sem-evento` | `desafio-zup/autorizacao EfeitoAplicadoComOriginalEncerrada`, alimentada por 2 metric filters: `{ $.evento = "efeito_aplicado_com_original_encerrada" }` em `/ecs/autorizacao` e o termo em `/ecs/reconciliador`; soma em 5 min | ≥ 1: captura ou estorno aplicou efeito exclusivo com a original já encerrada por outro (invariante quebrado, dinheiro sem evento). Runbook R14 |
 | `guarda-de-idempotencia` | `desafio-zup/limites OperacoesNaGuarda` máximo (5 min) | > 2.000 entradas |
 | `reservas-ativas-no-item` | `desafio-zup/limites ReservasAtivas` máximo (5 min) | > 2.000 reservas num contrato (`var.limite_reservas_ativas`) |
 | `defasagem-do-legado` | `ApproximateAgeOfOldestMessage` máximo da fila `legado-contratos` (1 min) | > 300 s (`var.defasagem_legado_limite_s`, ADR-0014) |
@@ -306,7 +308,7 @@ Dashboard `desafio-autorizacao`. Log groups: 10, todos com retenção de 7 dias 
 | `reconciliador-hold_perdido` | `ReservasSemHold` (`reserva_PERDEU_O_HOLD`), soma em 15 min | ≥ 20 |
 | `reconciliador-varreduras_com_erro` | `RodadasComVarreduraComErro` (rodadas cuja linha traz o campo `varreduras_com_erro`: alguma varredura levantou exceção), soma em 2 min | ≥ 2 (de ~4 rodadas). O heartbeat só renova em rodada sem exceção e o healthcheck reprova acima de 90 s: com 2 rodadas com erro, a task está a uma rodada de ser reciclada. Runbook R8 |
 
-- **Metric filters (9):** os três de sinal de log (`motivo_desconhecido_do_limite` por seletor JSON no `/ecs/autorizacao` e por termo no `/ecs/reconciliador`; `cdc_registro_descartado` por termo no log group do CDC, que usa `log_format = Text`; filtro sem linha correspondente é inofensivo), os quatro do reconciliador (três de desfecho e `varreduras_com_erro`), sobre `/ecs/reconciliador` (namespace `desafio-zup/autorizacao`), e dois sobre a mesma linha JSON `guarda_de_idempotencia` em `/ecs/limites` (namespace `desafio-zup/limites`): `OperacoesNaGuarda` (`$.operacoes_na_guarda`) e `ReservasAtivas` (`$.reservas_ativas`). A linha sai quando a guarda **ou** as reservas do contrato passam de 200 entradas.
+- **Metric filters (13):** os sete de sinal de log (`motivo_desconhecido_do_limite` por seletor JSON no `/ecs/autorizacao` e por termo no `/ecs/reconciliador`; `cdc_registro_malformado` por termo no log group do CDC e `outbox_registro_malformado` nos do relay e do sweeper, que usam `log_format = Text`; `efeito_aplicado_com_original_encerrada` por seletor JSON no `/ecs/autorizacao` e por termo no `/ecs/reconciliador`; o termo é o `evento` da linha que o código emite, e `relay/tests/unit/test_sinais_de_log.py` cruza os dois lados), os quatro do reconciliador (três de desfecho e `varreduras_com_erro`), sobre `/ecs/reconciliador` (namespace `desafio-zup/autorizacao`), e dois sobre a mesma linha JSON `guarda_de_idempotencia` em `/ecs/limites` (namespace `desafio-zup/limites`): `OperacoesNaGuarda` (`$.operacoes_na_guarda`) e `ReservasAtivas` (`$.reservas_ativas`). A linha sai quando a guarda **ou** as reservas do contrato passam de 200 entradas.
 - **Dashboard:** o widget de idade da mensagem mais antiga inclui a fila `legado-contratos`, e há um widget de reservas ativas por contrato.
 - **Regra de Contributor Insights `desafio-autorizacao-guarda-por-contrato`:** em `/ecs/limites`, os contratos com mais `operacoes_na_guarda` (ADR-0016, runbook R8).
 - Todos usam `treat_missing_data = notBreaching`: ausência de dado conta como OK. Fila vazia ou função sem invocação não dispara alarme.
@@ -418,7 +420,7 @@ Preços **de sa-east-1 na AWS Pricing API**, consultados em 20/10/2026. Os itens
 | NLB | US$ 0,034/h, mais US$ 0,00825 por LCU-hora (≈ 0 parado) | ~0,82 |
 | IPv4 público | 6 tasks × US$ 0,005/h | ~0,72 |
 | WAF | US$ 5/mês pelo web ACL + US$ 1/mês por regra (3), rateado por hora; mais US$ 0,60 por milhão de requisições | ~0,27 |
-| Alarmes | 42 métricas de alarme (30 alarmes da stack, dos quais as 4 janelas do burn rate têm 2 métricas cada, + 8 do target tracking) × US$ 0,135/mês, mais 2 alarmes compostos (US$ 0,50/mês cada no preço de lista, não conferido para sa-east-1) | ~0,22 |
+| Alarmes | 44 métricas de alarme (32 alarmes da stack, dos quais as 4 janelas do burn rate têm 2 métricas cada, + 8 do target tracking) × US$ 0,135/mês, mais 2 alarmes compostos (US$ 0,50/mês cada no preço de lista, não conferido para sa-east-1) | ~0,23 |
 | Chave KMS dos alarmes | US$ 1/mês por chave gerenciada pelo cliente (preço de lista da AWS, não conferido na Pricing API de sa-east-1), mais requisições só quando um alarme muda de estado | ~0,03 |
 | **Fixo** | | **≈ 7** |
 
@@ -440,7 +442,7 @@ O Cost Explorer da conta ainda mostrava US$ 0 em 20/10/2026, porque os dados de 
 ## 8. Como conferir este inventário
 
 ```bash
-# Init com o bucket de state da conta (o backend é parcial) e contagem dos recursos gerenciados (203; o data source fica de fora)
+# Init com o bucket de state da conta (o backend é parcial) e contagem dos recursos gerenciados (209; o data source fica de fora)
 AWS_PROFILE=desafio-zup terraform -chdir=infra/terraform/environments/sandbox init -backend-config="bucket=desafio-zup-tfstate-<conta>"
 AWS_PROFILE=desafio-zup terraform -chdir=infra/terraform/environments/sandbox state list | grep -vc '\.data\.'
 # Mesma conta para o ambiente da esteira (5)

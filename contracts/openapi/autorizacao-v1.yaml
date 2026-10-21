@@ -21,7 +21,14 @@ info:
     `Content-Type: application/json` e corpo fixo, sem `correlation_id` (ver o catálogo).
 
     **Validação do corpo:** a autoridade é o serviço. O gateway não valida o corpo (só a presença dos parâmetros obrigatórios),
-    então o mesmo corpo recebe o mesmo status local e na AWS: fora deste schema ou da regra de domínio → 422.
+    então o mesmo corpo recebe o mesmo status local e na AWS: fora deste schema ou da regra de domínio → 422. Campo opcional
+    se omite: `null` explícito está fora do schema (nenhum campo é `nullable`) → 422. Nome repetido no mesmo objeto
+    (RFC 7493 §2.3) → 400.
+
+    **Autenticação:** toda chamada leva as duas credenciais do consumidor, exigidas juntas pelo gateway: o token OAuth 2.0
+    (`Authorization: Bearer`, client credentials no Cognito, com o escopo da operação) e a API key do usage plan dele
+    (`x-api-key`, que define quota e throttling). Sem token → 401 com `WWW-Authenticate`; sem API key ou com escopo
+    insuficiente → 403.
 
     **Versionamento:** major no path (`/v1`). Dentro de um major só entram mudanças aditivas. Depreciação anunciada com os headers
     `Deprecation` (RFC 9745) e `Sunset` (RFC 8594) e `Link rel="deprecation"`; prazo mínimo de 6 meses entre Deprecation e Sunset.
@@ -32,8 +39,10 @@ servers:
     description: Ambiente ilustrativo (domínio reservado .example, RFC 2606)
 tags:
   - name: Autorizações
+# Um requisito com os dois esquemas = os dois são exigidos juntos (OpenAPI 3.0.3, Security Requirement Object).
 security:
   - oauth2: [autorizacoes/write]
+    api_key: []
 paths:
   /v1/contratos/{id_contrato}/autorizacoes:
     post:
@@ -122,6 +131,7 @@ paths:
       description: Leitura do estado atual. Não altera nada e não exige Idempotency-Key.
       security:
         - oauth2: [autorizacoes/read]
+          api_key: []
       parameters:
         - $ref: '#/components/parameters/IdContrato'
         - $ref: '#/components/parameters/IdAutorizacao'
@@ -152,6 +162,13 @@ components:
           scopes:
             autorizacoes/write: Criar autorizações (formato de escopo do Cognito, resource-server/escopo)
             autorizacoes/read: Consultar autorizações
+    api_key:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: |
+        API key do usage plan do consumidor (quota diária e throttling por consumidor; o WAF também agrega a taxa por
+        ela). Não substitui o token: o gateway exige os dois. Ausente ou inválida → 403 `SEM_PERMISSAO`.
 
   parameters:
     IdContrato:
@@ -201,8 +218,13 @@ components:
       description: Métodos suportados pelo recurso (RFC 9110 §10.2.1).
       schema: { type: string, example: POST }
     IdempotentReplayed:
-      description: Presente (valor `true`) quando a resposta é um replay idempotente.
+      description: |
+        Presente (valor `true`) quando a resposta é um replay idempotente: da aprovação (200) ou de uma recusa
+        registrada (402/404/409/422, mesmo status e corpo da primeira resposta).
       schema: { type: string, enum: ['true'] }
+    WWWAuthenticate:
+      description: Desafio do 401 (RFC 9110 §11.6.1 e §15.5.2; esquema Bearer da RFC 6750 §3).
+      schema: { type: string, example: Bearer }
     RetryAfter:
       description: Segundos sugeridos antes de tentar de novo.
       schema: { type: integer, minimum: 1 }
@@ -311,7 +333,8 @@ components:
             efeito; a mesma chave não é mais retomada (use uma nova).
             RECONCILIACAO_MANUAL: não dá para concluir com segurança de forma automática (passou do prazo em que
             reenviar ao limite é seguro, ou a reversão foi recusada); uma pessoa decide. Raro: exige o reconciliador
-            ou o limite parados por minutos.
+            ou o limite parados por minutos. Uma RESERVA vencida cujo hold sumiu sem vencedor à vista também vem
+            para cá; se a captura ou o estorno que levou o hold concluir depois, ela sai como CAPTURADA ou ESTORNADA.
         motivo_recusa:
           type: string
           enum: [LIMITE_INSUFICIENTE, CONTRATO_INATIVO, CREDITO_EXCEDE_UTILIZADO, CONTRATO_NAO_ENCONTRADO, ORIGINAL_JA_ENCERRADA, RESERVA_DIVERGENTE, RESERVA_NAO_ENCONTRADA, ESTORNO_EM_ANDAMENTO, RECUSA_DO_LIMITE, CONTA_DIVERGENTE]
@@ -363,7 +386,7 @@ components:
       description: |
         Sintaxe inválida, antes de qualquer regra:
         - `/problemas/requisicao-mal-formada`: corpo que não é JSON (serviço; inclui `NaN`/`Infinity`, que não são JSON pela
-          RFC 8259 §6); na AWS, também header obrigatório ausente ou vazio,
+          RFC 8259 §6, e objeto com nome repetido, proibido pela RFC 7493 §2.3); na AWS, também header obrigatório ausente ou vazio,
           como `Idempotency-Key` (gateway, `BAD_REQUEST_PARAMETERS`: ele só confere a presença dos parâmetros).
         - `/problemas/idempotency-key-invalida`: `Idempotency-Key` ausente (local) ou fora do formato UUID (serviço).
         Campo desconhecido, tipo errado ou campo obrigatório ausente no corpo NÃO são 400: são 422 (`RegraDeDominioViolada`).
@@ -371,7 +394,9 @@ components:
     NaoAutenticado:
       description: |
         Token ausente/inválido (emitido pelo gateway). No acesso direto ao serviço, `X-Client-Id` ausente ou fora de
-        `^[A-Za-z0-9._-]{1,64}$`. Ver `/problemas/nao-autenticado`.
+        `^[A-Za-z0-9._-]{1,64}$`. Sempre com `WWW-Authenticate: Bearer`. Ver `/problemas/nao-autenticado`.
+      headers:
+        WWW-Authenticate: { $ref: '#/components/headers/WWWAuthenticate' }
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     SemPermissao:
       description: |
@@ -380,6 +405,8 @@ components:
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     LimiteInsuficiente:
       description: Recusa por regra de negócio — limite disponível menor que o valor. A recusa é registrada e publicada (TransacaoRecusada).
+      headers:
+        Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problema' }
@@ -395,6 +422,8 @@ components:
             trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
     ContratoNaoEncontrado:
       description: Contrato inexistente na réplica do core (fail-closed). Ver `/problemas/contrato-nao-encontrado`.
+      headers:
+        Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     AutorizacaoNaoEncontrada:
       description: Autorização inexistente para o contrato informado, ou criada por outro canal (não revela a existência).
@@ -410,6 +439,7 @@ components:
         Não existe 409 por contenção de concorrência: reservas no mesmo contrato são serializadas pelo banco (ADR-0005).
       headers:
         Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     MetodoNaoPermitido:
       description: |
@@ -425,8 +455,8 @@ components:
       description: |
         JSON bem formado que viola o schema `PedidoDeAutorizacao` ou uma regra de domínio. O serviço é a autoridade (o gateway
         não valida o corpo). Por `codigo`:
-        - `VALIDACAO_DE_DOMINIO` (com `erros`): campo obrigatório ausente, tipo errado, campo desconhecido, `metadata` fora da
-          allowlist, corpo que não é objeto, enum/pattern violado; valor ≤ 0 ou com mais de 2 casas; moeda ≠ BRL; ESTORNO sem
+        - `VALIDACAO_DE_DOMINIO` (com `erros`): campo obrigatório ausente, tipo errado (inclusive `null` em campo
+          opcional), campo desconhecido, `metadata` fora da allowlist, corpo que não é objeto, enum/pattern violado; valor ≤ 0 ou com mais de 2 casas; moeda ≠ BRL; ESTORNO sem
           `id_autorizacao_original`; `id_autorizacao_original` em RESERVA/CREDITO; `id_contrato` do corpo ≠ path; parâmetro
           de path fora do pattern (inclusive `id_autorizacao` que não é UUID, no GET); recusa do limite sem código próprio.
           `erros` traz no máximo 20 itens (`erros_omitidos` diz quantos ficaram de fora).
@@ -438,6 +468,8 @@ components:
         - `AUTORIZACAO_ORIGINAL_INVALIDA` (ESTORNO ou captura): original inexistente, de outro contrato ou de outro canal;
           tipo da original não estornável (só RESERVA e DEBITO) ou não capturável (só RESERVA); original não APROVADA;
           estorno com valor diferente do original (estorno parcial não é suportado na v1); captura maior que o reservado.
+      headers:
+        Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
     LimiteDeRequisicoes:
       description: |

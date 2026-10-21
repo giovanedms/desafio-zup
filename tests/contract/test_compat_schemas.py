@@ -302,6 +302,17 @@ def test_remover_combinador_afrouxa_e_e_verde(tmp_path: Path) -> None:
         pytest.param({"minItems": 1}, ".tags: minItems", id="minItems-novo"),
         pytest.param({"maxItems": 5}, ".tags: maxItems", id="maxItems-novo"),
         pytest.param({"uniqueItems": True}, ".tags: uniqueItems", id="uniqueItems-novo"),
+        # B-4 (painel 7): tupla (items em lista) e as palavras-chave de array que o gate não compara.
+        pytest.param(
+            {"items": [{"type": "string"}]}, ".tags: items em lista", id="items-lista-novo"
+        ),
+        pytest.param({"contains": {"const": "x"}}, ".tags: contains novo", id="contains-novo"),
+        pytest.param(
+            {"prefixItems": [{"type": "string"}]}, ".tags: prefixItems novo", id="prefixItems-novo"
+        ),
+        pytest.param(
+            {"additionalItems": False}, ".tags: additionalItems novo", id="additionalItems-novo"
+        ),
     ],
 )
 def test_aperto_em_lista_quebra(tmp_path: Path, depois: dict[str, Any], esperado: str) -> None:
@@ -313,6 +324,182 @@ def test_aperto_em_lista_quebra(tmp_path: Path, depois: dict[str, Any], esperado
     novo_dir = _gravar(tmp_path / "novo", novo)
     quebras, _ = compat.comparar_diretorios(base_dir, novo_dir)
     assert any(esperado in q for q in quebras), quebras
+
+
+@pytest.mark.parametrize(
+    ("antes", "depois"),
+    [
+        pytest.param({"type": "string"}, [{"type": "string"}], id="schema-unico-vira-tupla"),
+        pytest.param(
+            [{"type": "string"}], [{"type": "string", "maxLength": 3}], id="tupla-alterada"
+        ),
+        pytest.param([{"type": "string"}], {"type": "string"}, id="tupla-vira-schema-unico"),
+    ],
+)
+def test_items_em_lista_qualquer_mudanca_quebra(
+    tmp_path: Path, antes: dict[str, Any] | list[Any], depois: dict[str, Any] | list[Any]
+) -> None:
+    base = copy.deepcopy(BASE)
+    base["properties"]["data"]["properties"]["tags"] = {"type": "array", "items": antes}
+    novo = copy.deepcopy(base)
+    novo["properties"]["data"]["properties"]["tags"]["items"] = depois
+    quebras, _ = compat.comparar_diretorios(
+        _gravar(tmp_path / "base", base), _gravar(tmp_path / "novo", novo)
+    )
+    assert any(".tags: items em lista" in q for q in quebras), quebras
+
+
+# B-4 (painel 7): palavras-chave que o gate não compara entram como quebra (fail-closed), uma por caso.
+SEM_COMPARACAO = [
+    pytest.param(
+        "data",
+        {"if": {"properties": {"status": {"const": "A"}}}, "then": {"required": ["taxa"]}},
+        "$.data: if novo",
+        id="if-then",
+    ),
+    pytest.param("data", {"then": {"required": ["taxa"]}}, "$.data: then novo", id="then"),
+    pytest.param("data", {"else": {"required": ["taxa"]}}, "$.data: else novo", id="else"),
+    pytest.param(
+        "data",
+        {"propertyNames": {"pattern": "^(valor|status)$"}},
+        "$.data: propertyNames novo",
+        id="propertyNames",
+    ),
+    pytest.param(
+        "data",
+        {"dependentRequired": {"taxa": ["quantia"]}},
+        "$.data: dependentRequired novo",
+        id="dependentRequired",
+    ),
+    pytest.param(
+        "data",
+        {"dependentSchemas": {"taxa": {"required": ["quantia"]}}},
+        "$.data: dependentSchemas novo",
+        id="dependentSchemas",
+    ),
+    pytest.param(
+        "data",
+        {"unevaluatedProperties": False},
+        "$.data: unevaluatedProperties novo",
+        id="unevaluatedProperties",
+    ),
+    pytest.param(
+        "$", {"definitions": {"x": {"type": "string"}}}, "$: definitions novo", id="definitions"
+    ),
+    pytest.param("valor", {"x-regra-nova": True}, ".valor: x-regra-nova novo", id="desconhecida"),
+]
+
+
+@pytest.mark.parametrize(("no", "restricoes", "esperado"), SEM_COMPARACAO)
+def test_palavra_chave_sem_comparacao_quebra(
+    tmp_path: Path, no: str, restricoes: dict[str, Any], esperado: str
+) -> None:
+    quebras, _ = _rodar(tmp_path, _restringir(no, **restricoes))
+    assert any(esperado in q for q in quebras), quebras
+
+
+def test_tirar_palavra_chave_sem_comparacao_tambem_quebra(tmp_path: Path) -> None:
+    """O gate não sabe se tirar afrouxa (sem `prefixItems`, o `items` passa a valer desde a posição 0)."""
+    com_if = copy.deepcopy(BASE)
+    com_if["properties"]["data"]["if"] = {"required": ["status"]}
+    base_dir = _gravar(tmp_path / "base", com_if)
+    novo_dir = _gravar(tmp_path / "novo", BASE)
+    quebras, _ = compat.comparar_diretorios(base_dir, novo_dir)
+    assert quebras == [
+        f"{NOME}:$.data: if novo, alterado ou removido (palavra-chave sem comparação no gate)"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("antes", "depois"),
+    [
+        pytest.param(
+            "http://json-schema.org/draft-04/schema#",
+            "http://json-schema.org/draft-07/schema#",
+            id="draft-04-para-07",
+        ),
+        pytest.param(None, "https://json-schema.org/draft/2020-12/schema", id="criado"),
+        pytest.param("http://json-schema.org/draft-04/schema#", None, id="removido"),
+    ],
+)
+def test_trocar_o_schema_quebra(tmp_path: Path, antes: str | None, depois: str | None) -> None:
+    base, novo = copy.deepcopy(BASE), copy.deepcopy(BASE)
+    for schema, valor in ((base, antes), (novo, depois)):
+        if valor is not None:
+            schema["$schema"] = valor
+    quebras, _ = compat.comparar_diretorios(
+        _gravar(tmp_path / "base", base), _gravar(tmp_path / "novo", novo)
+    )
+    assert any("$: $schema alterado" in q for q in quebras), quebras
+
+
+@pytest.mark.parametrize(
+    "anotacoes",
+    [
+        {"description": "outra descrição"},
+        {"title": "Outro título"},
+        {"examples": ["CTR-1"]},
+        {"default": "x"},
+        {"$comment": "nota"},
+    ],
+)
+def test_mudar_anotacao_e_verde(tmp_path: Path, anotacoes: dict[str, Any]) -> None:
+    """Documentação não muda o que o schema aceita: editar a descrição de um campo não exige novo major."""
+    assert _rodar(tmp_path, _restringir("valor", **anotacoes)) == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("depois", "quebra"),
+    [
+        pytest.param({"type": "string", "maxLength": 3}, True, id="apertado"),
+        pytest.param({"type": "number", "maxLength": 10}, True, id="tipo-alterado"),
+        pytest.param({"type": "string"}, False, id="afrouxado"),
+    ],
+)
+def test_additional_properties_schema_contra_schema(
+    tmp_path: Path, depois: dict[str, Any], quebra: bool
+) -> None:
+    """Antes, schema contra schema não era comparado: só `false` ou schema no lugar de `true` quebravam."""
+    base = copy.deepcopy(BASE)
+    base["properties"]["data"]["additionalProperties"] = {"type": "string", "maxLength": 10}
+    novo = copy.deepcopy(base)
+    novo["properties"]["data"]["additionalProperties"] = depois
+    quebras, _ = compat.comparar_diretorios(
+        _gravar(tmp_path / "base", base), _gravar(tmp_path / "novo", novo)
+    )
+    assert any("$.data{*}" in q for q in quebras) is quebra, quebras
+
+
+def test_mutacoes_do_juiz_no_schema_real_reprovam(tmp_path: Path) -> None:
+    """B-4: as 5 mutações que passavam no gate (PoC do juiz), aplicadas ao schema REAL de TransacaoAutorizada."""
+    alvo = "transacao-autorizada.v1.schema.json"
+    real = json.loads((RAIZ / "contracts/events" / alvo).read_text(encoding="utf-8"))
+
+    def if_then(s: dict[str, Any]) -> None:
+        s["$schema"] = "http://json-schema.org/draft-07/schema#"
+        s["properties"]["data"]["if"] = {"properties": {"tipo_operacao": {"const": "DEBITO"}}}
+        s["properties"]["data"]["then"] = {"required": ["id_estabelecimento"]}
+
+    def property_names(s: dict[str, Any]) -> None:
+        s["properties"]["data"]["propertyNames"] = {"pattern": "^(event_id|id_contrato)$"}
+
+    def dependent_required(s: dict[str, Any]) -> None:
+        s["properties"]["data"]["dependentRequired"] = {"valor": ["campo_que_nao_existe"]}
+
+    def contains(s: dict[str, Any]) -> None:
+        s["properties"]["data"]["properties"]["valor"]["contains"] = {"const": 1}
+
+    def tupla(s: dict[str, Any]) -> None:
+        s["properties"]["data"]["items"] = [{"type": "string"}]
+
+    base_dir = _gravar(tmp_path / "base", real, alvo)
+    for n, mutacao in enumerate((if_then, property_names, dependent_required, contains, tupla)):
+        novo = copy.deepcopy(real)
+        mutacao(novo)
+        quebras, _ = compat.comparar_diretorios(
+            base_dir, _gravar(tmp_path / f"novo{n}", novo, alvo)
+        )
+        assert quebras, mutacao.__name__
 
 
 # ---------------------------------------------------------------- quebras aceitas (registro explícito)

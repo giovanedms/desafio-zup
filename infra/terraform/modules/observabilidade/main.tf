@@ -418,8 +418,13 @@ resource "aws_cloudwatch_metric_alarm" "idade_da_fila" {
 # Sinais de log sem métrica nativa: um alarme por sinal, alimentado por um ou mais metric filters (mesma métrica).
 # O padrão segue o formato de cada log group: no /ecs/autorizacao a linha é JSON puro (seletor JSON); no
 # /ecs/reconciliador ela vem com prefixo de data e logger, e no Lambda (log_format Text) com nível e request id, então
-# lá o filtro casa o TERMO, como os do reconciliador. Filtro sem linha correspondente é inofensivo: a métrica fica em 0.
+# lá o filtro casa o TERMO, como os do reconciliador. O termo é o campo `evento` que o código emite (relay/src/relay):
+# filtro sem linha correspondente não acusa nada, e a métrica fica em 0 para sempre.
 locals {
+  # Log group de cada Lambda do relay: o módulo lambdas cria "/aws/lambda/<função>" e aponta o logging_config para ele.
+  log_group_relay   = "/aws/lambda/${var.funcoes_lambda["relay"]}"
+  log_group_sweeper = "/aws/lambda/${var.funcoes_lambda["sweeper"]}"
+
   alarmes_de_sinal = {
     # O limites devolveu um motivo de recusa que o autorizacao não conhece: o leitor tolerante mapeia para
     # RECUSA_DO_LIMITE, mas o contrato interno mudou sem o cliente acompanhar (painel 6, E-N6).
@@ -428,11 +433,24 @@ locals {
       metrica   = "MotivoDesconhecidoDoLimite"
       descricao = "O autorizacao (API ou reconciliador) recebeu do limites um motivo de recusa fora do enum que conhece (vira RECUSA_DO_LIMITE). Runbook R14."
     }
-    # Registro do Stream de limites que o CDC descartou sem publicar LimiteAlterado (painel 6, F-6).
-    cdc-registro-descartado = {
+    # Registro do Stream de limites que o CDC não converte (painel 6, F-6): volta como falha do lote, nunca é descartado.
+    cdc-registro-malformado = {
       namespace = "desafio-zup/relay"
-      metrica   = "RegistrosDoCdcDescartados"
-      descricao = "O relay-cdc-limites descartou registro do Stream de limites (LimiteAlterado não publicado). Runbook R14."
+      metrica   = "RegistrosDoCdcMalformados"
+      descricao = "O relay-cdc-limites recebeu do Stream de limites registro que não converte em LimiteAlterado (sem as imagens ou sem campo do contrato). O registro volta como falha do lote: retry do ESM e, esgotadas as tentativas, a referência do lote (shard e sequências) vai para a relay-cdc-limites-dlq; o Stream guarda o registro por 24 h. Runbook R14."
+    }
+    # Item do outbox sem os campos que o relay publica (painel 7, F7-5): mesma política do CDC.
+    outbox-registro-malformado = {
+      namespace = "desafio-zup/relay"
+      metrica   = "RegistrosDoOutboxMalformados"
+      descricao = "Item OUTBOX# sem os campos que o relay publica: o relay devolve o registro como falha do lote (retry do ESM e, esgotadas as tentativas, a referência do lote na relay-dlq) e, com criado_em_ms válido, o sweeper o loga a cada rodada enquanto ele estiver no outbox. O evento de domínio não sai até o item ser corrigido. Runbook R14."
+    }
+    # Efeito exclusivo aplicado no limite com a original já encerrada por outro (painel 7, N4): invariante quebrado,
+    # dinheiro movido sem evento até alguém decidir. A autorização fica em processamento e cai na fila humana.
+    efeito-sem-evento = {
+      namespace = "desafio-zup/autorizacao"
+      metrica   = "EfeitoAplicadoComOriginalEncerrada"
+      descricao = "Captura ou estorno aplicou efeito exclusivo no limite, mas a original já estava encerrada por outro (invariante quebrado): a autorização fica em processamento, sem evento, e vai para a fila humana pelo reconciliador. Runbook R14."
     }
   }
 
@@ -447,10 +465,30 @@ locals {
       log_group = var.log_group_reconciliador
       padrao    = "\"motivo_desconhecido_do_limite\""
     }
-    cdc-registro-descartado = {
-      alarme    = "cdc-registro-descartado"
+    cdc-registro-malformado = {
+      alarme    = "cdc-registro-malformado"
       log_group = var.log_group_cdc
-      padrao    = "\"cdc_registro_descartado\""
+      padrao    = "\"cdc_registro_malformado\""
+    }
+    outbox-registro-malformado-relay = {
+      alarme    = "outbox-registro-malformado"
+      log_group = local.log_group_relay
+      padrao    = "\"outbox_registro_malformado\""
+    }
+    outbox-registro-malformado-sweeper = {
+      alarme    = "outbox-registro-malformado"
+      log_group = local.log_group_sweeper
+      padrao    = "\"outbox_registro_malformado\""
+    }
+    efeito-sem-evento-autorizacao = {
+      alarme    = "efeito-sem-evento"
+      log_group = var.log_group_autorizacao
+      padrao    = "{ $.evento = \"efeito_aplicado_com_original_encerrada\" }"
+    }
+    efeito-sem-evento-reconciliador = {
+      alarme    = "efeito-sem-evento"
+      log_group = var.log_group_reconciliador
+      padrao    = "\"efeito_aplicado_com_original_encerrada\""
     }
   }
 }

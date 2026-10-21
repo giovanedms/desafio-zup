@@ -52,9 +52,12 @@ class RepositorioDeAutorizacoesEmMemoria:
     ) -> str | None:
         with self._lock:
             original = self._itens.get(id_original)
-            if original is None or original.status is not StatusAutorizacao.APROVADA:
+            if original is None:
                 return ""
             dono = self._marcas_de_estorno.get(id_original)
+            if original.status is not StatusAutorizacao.APROVADA:
+                # Reserva na fila humana por falta de hold: só a retomada do estorno que já tinha a marca segue.
+                return None if original.encerravel_pelo_vencedor and dono == id_estorno else ""
             if dono is not None and dono not in (id_estorno, substituir):
                 return dono
             self._marcas_de_estorno[id_original] = id_estorno
@@ -80,7 +83,7 @@ class RepositorioDeAutorizacoesEmMemoria:
                 raise LeasePerdido(autorizacao.id_autorizacao)
             if original_encerrada is not None:
                 original = self._itens.get(original_encerrada.id_autorizacao)
-                if original is None or original.status is not StatusAutorizacao.APROVADA:
+                if original is None or not original.encerravel_pelo_vencedor:
                     raise OriginalJaEncerrada(original_encerrada.id_autorizacao)
                 self._itens[original_encerrada.id_autorizacao] = original_encerrada.sem_eventos()
             self._itens[autorizacao.id_autorizacao] = autorizacao.sem_eventos()
@@ -119,7 +122,7 @@ class RepositorioDeAutorizacoesEmMemoria:
     def registrar_expiracao(self, expirada: Autorizacao) -> None:
         with self._lock:
             gravada = self._itens.get(expirada.id_autorizacao)
-            if gravada is None or gravada.status is not StatusAutorizacao.APROVADA:
+            if gravada is None or not gravada.encerravel_pelo_vencedor:
                 raise OriginalJaEncerrada(expirada.id_autorizacao)
             self._itens[expirada.id_autorizacao] = expirada.sem_eventos()
             self.outbox.extend(expirada.eventos)

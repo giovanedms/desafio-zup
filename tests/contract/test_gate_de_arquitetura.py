@@ -19,6 +19,11 @@ RAIZ = Path(__file__).resolve().parents[2]
 
 # pacote → (módulos das camadas, módulo do núcleo, nome do contrato `forbidden` que deve ficar BROKEN)
 CASOS = {
+    "plataforma": (
+        ("problemas", "observabilidade", "eventos"),
+        "problemas",
+        "plataforma: sem framework nem AWS SDK",
+    ),
     "autorizacao": (
         ("adapters", "application", "domain"),
         "domain",

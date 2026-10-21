@@ -27,7 +27,7 @@ from relay.cdc_limites import (
 )
 from relay.eventbridge import PublicadorEventBridge
 from relay.nucleo import EventoPendente, Outbox, Publicador, ResultadoDoLote, processar
-from relay.outbox_dynamodb import OutboxDynamoDB, de_registro_do_stream
+from relay.outbox_dynamodb import ItemDeOutboxMalformado, OutboxDynamoDB, de_registro_do_stream
 from relay.sweeper import varrer
 
 if TYPE_CHECKING:
@@ -73,8 +73,9 @@ class LeitorDeStream:
 
     Iterador expirado (15 min sem uso) retoma DEPOIS da última sequência lida no shard
     (AFTER_SEQUENCE_NUMBER), não do começo; só volta ao TRIM_HORIZON se nada foi lido ainda ou se os dados
-    já foram aparados (TrimmedDataAccessException). Registro malformado do CDC é logado e pulado: aqui não
-    há DLQ (na Lambda ele volta como falha do lote e vai para a DLQ do ESM).
+    já foram aparados (TrimmedDataAccessException). Registro malformado (do CDC ou do outbox) é logado e
+    pulado: aqui não há DLQ (na Lambda ele volta como falha do lote e vai para a DLQ do ESM). O item malformado
+    do outbox fica na tabela, e passada a idade mínima o sweeper o loga de novo a cada varredura.
     """
 
     def __init__(
@@ -127,21 +128,16 @@ class LeitorDeStream:
             return self._iterador_inicial(id_shard)
 
     def _converter(self, id_shard: str, registro: Mapping[str, Any]) -> EventoPendente | None:
+        sequencia = registro.get("dynamodb", {}).get("SequenceNumber")
+        linha: dict[str, str | None]
         try:
             return self._conversor(registro)
         except RegistroMalformado as erro:
-            sequencia = registro.get("dynamodb", {}).get("SequenceNumber")
-            log.error(
-                json.dumps(
-                    {
-                        "evento": "cdc_registro_malformado",
-                        "shard": id_shard,
-                        "sequencia": sequencia,
-                        "erro": str(erro),
-                    }
-                )
-            )
-            return None
+            linha = {"evento": "cdc_registro_malformado", "erro": str(erro)}
+        except ItemDeOutboxMalformado as erro:
+            linha = {"evento": "outbox_registro_malformado", "pk": erro.pk, "erro": str(erro)}
+        log.error(json.dumps({**linha, "shard": id_shard, "sequencia": sequencia}))
+        return None
 
     def ler(self) -> list[EventoPendente]:
         agora = time.monotonic()
@@ -255,8 +251,9 @@ def main() -> None:
                         )
                     )
         except Exception:
-            log.exception("iteração falhou; tentando de novo")
-        HEARTBEAT.touch()
+            log.exception("iteração falhou; heartbeat não renovado")
+        else:
+            HEARTBEAT.touch()  # só em volta sem exceção: o healthcheck da imagem reprova o relay que só falha
         time.sleep(INTERVALO_S)
 
 

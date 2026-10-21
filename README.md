@@ -26,7 +26,7 @@ make demo      # roteiro ponta a ponta (ver abaixo)
 **O que a demo mostra:**
 
 1. aprovação (201), replay idempotente (200, corpo idêntico byte a byte) e chave reutilizada (422);
-2. **100 reservas paralelas de R$ 100 num limite de R$ 1.000 → exatamente 10 aprovadas e 90 recusadas (402), saldo final zero**;
+2. **100 reservas de R$ 100, disparadas por 50 clientes em paralelo num limite de R$ 1.000 → exatamente 10 aprovadas e 90 recusadas (402), disponível final zero**;
 3. débito, estorno (o segundo estorno da mesma autorização → 409), crédito, contrato bloqueado (422) e contrato inexistente (404);
 4. **captura de reserva** (DEBITO que referencia a RESERVA, parcial) e disputa pelo hold: 10 capturas × 10 estornos em paralelo → exatamente 1 vence e os outros 19 recebem 409 (`{201: 1, 409: 19}`), com reservado final zero;
 5. erros RFC 9457 e dinheiro exato (`12345678.91` preservado);
@@ -68,7 +68,7 @@ docs/
 
 1. `docs/arquitetura/documento-de-arquitetura.md`: o mapa, em 10 min.
 2. `docs/adr/0005` (concorrência) e `0006` (idempotência): onde está o problema difícil.
-3. `services/limites/tests/contract/test_porta_repositorio.py`: a mesma suíte rodando em memória e no DynamoDB, com a corrida de 100 threads.
+3. `services/limites/tests/contract/test_porta_repositorio.py`: a mesma suíte rodando em memória e no DynamoDB, com a corrida de 100 reservas em 32 threads.
 4. `docs/cobertura-requisitos.md`: cada requisito do enunciado → onde está → nível de evidência.
 
 ## Limitações que pesam
@@ -86,7 +86,7 @@ A lista completa está em `docs/cobertura-requisitos.md` (Limitações declarada
 
 **Local:** `make deploy EXPECTED_ACCOUNT_ID=<conta> CONFIRMO="CONFIRMO: deploy na conta desafio-zup" [TAG=1.0.4] [ARQ=amd64|arm64]` (pacotes das Lambdas, repositórios ECR, build e push das imagens e apply, nessa ordem; runbook R6).
 
-O que existe na conta (203 recursos do sandbox, ambiente `esteira`, bootstrap), configuração, custo e desvios: `docs/operacao/infraestrutura.md`.
+O que existe na conta (209 recursos do sandbox, ambiente `esteira`, bootstrap), configuração, custo e desvios: `docs/operacao/infraestrutura.md`.
 
 - O deploy exige a frase de confirmação e confere a conta.
 - O state fica em S3 com KMS.

@@ -5,6 +5,9 @@ Dentro do mesmo major (mesmo nome de arquivo `*.vN.schema.json`) só entram camp
 Sai com 1 se houver quebra.
 Também é quebra todo APERTO de restrição: o schema novo passaria a recusar um evento que o da base
 aceitava (reentrega, replay do archive, produtor ainda na versão anterior). Afrouxar não quebra.
+Fail-closed: palavra-chave que o gate não sabe comparar (`if`/`then`/`else`, `propertyNames`, `contains`,
+`dependentRequired`, `prefixItems`, `definitions`, qualquer uma de draft futuro) é quebra se nova, alterada ou
+removida; trocar o `$schema` (o draft) é quebra, porque muda o que as outras palavras-chave significam.
 
 Quebra aceita (`--aceitas`, ex.: contracts/events/quebras-aceitas.json): lista explícita e auditável de
 quebras que o gate deixa passar, cada uma com schema, caminho, regra, motivo e data. Só casa a quebra
@@ -40,6 +43,43 @@ CONTAGENS = (
     ("maxItems", False),
     ("minProperties", True),
     ("maxProperties", False),
+)
+
+# Tudo o que o gate compara com regra própria. O que ficar fora (e fora de ANOTACOES) cai na regra fail-closed.
+COMPARADAS = frozenset(
+    {
+        "$schema",
+        "type",
+        "enum",
+        "const",
+        "required",
+        "properties",
+        "items",
+        "additionalProperties",
+        "uniqueItems",
+        "multipleOf",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        *RESTRICOES_TEXTUAIS,
+        *ESTRUTURAIS,
+        *(chave for chave, _ in CONTAGENS),
+    }
+)
+
+# Só documentação: não muda o que o schema aceita (a descrição de um campo pode mudar sem novo major).
+ANOTACOES = frozenset(
+    {
+        "title",
+        "description",
+        "examples",
+        "default",
+        "$comment",
+        "readOnly",
+        "writeOnly",
+        "deprecated",
+    }
 )
 
 CAMPOS_DA_QUEBRA_ACEITA = ("schema", "caminho", "regra", "motivo", "data")
@@ -141,10 +181,32 @@ def _comparar_restricoes(
     if mn is not None and (mb is None or mb % mn != 0):
         quebras.append(f"{caminho}: multipleOf novo ou apertado {mb} -> {mn}")
 
-    # Consumidor tolerante (ADR-0008): fechar o objeto a campos extras recusa evento com campo novo.
+    # Consumidor tolerante (ADR-0008): fechar o objeto a campos extras recusa evento com campo novo. Schema
+    # contra schema compara recursivamente (_comparar_subesquemas).
     ab, an = base.get("additionalProperties", True), novo.get("additionalProperties", True)
     if (an is False and ab is not False) or (isinstance(an, dict) and ab is True):
         quebras.append(f"{caminho}: additionalProperties restringido {ab!r} -> {an!r}")
+
+
+def _comparar_sem_regra(
+    base: dict[str, Any], novo: dict[str, Any], caminho: str, quebras: list[str]
+) -> None:
+    """`$schema` e palavras-chave fora de COMPARADAS/ANOTACOES: qualquer mudança é quebra (fail-closed)."""
+    # O draft muda o significado das outras palavras-chave (draft-04 ignora `if`/`propertyNames`; o 2020-12 lê
+    # `items` de outro jeito): trocar, criar ou tirar o `$schema` é quebra.
+    if base.get("$schema") != novo.get("$schema"):
+        quebras.append(
+            f"{caminho}: $schema alterado {base.get('$schema')!r} -> {novo.get('$schema')!r}"
+        )
+
+    # Fail-closed: o gate não sabe se a mudança aperta, então qualquer mudança quebra, inclusive tirar (sem o
+    # `prefixItems`, o `items` do 2020-12 passa a valer desde a posição 0; sem um `minContains: 0`, o `contains`
+    # passa a exigir um item).
+    for chave in sorted((base.keys() | novo.keys()) - COMPARADAS - ANOTACOES):
+        if base.get(chave) != novo.get(chave):
+            quebras.append(
+                f"{caminho}: {chave} novo, alterado ou removido (palavra-chave sem comparação no gate)"
+            )
 
 
 def comparar_no(
@@ -179,6 +241,7 @@ def comparar_no(
         quebras.append(f"{caminho}.{campo}: campo novo em required")
 
     _comparar_restricoes(base, novo, caminho, quebras)
+    _comparar_sem_regra(base, novo, caminho, quebras)
 
     props_base = base.get("properties", {})
     props_novo = novo.get("properties", {})
@@ -196,9 +259,26 @@ def comparar_no(
             fixo=caminho.endswith("$") and nome in ATRIBUTOS_FIXOS,
         )
 
+    _comparar_subesquemas(base, novo, caminho, quebras, avisos)
+
+
+def _comparar_subesquemas(
+    base: dict[str, Any], novo: dict[str, Any], caminho: str, quebras: list[str], avisos: list[str]
+) -> None:
+    """Os nós que têm schema dentro, fora `properties`: `items` e `additionalProperties`."""
     # `items` novo compara contra o schema vazio (que aceita tudo): qualquer restrição nele é aperto.
     if isinstance(novo.get("items"), dict) and isinstance(base.get("items", {}), dict):
         comparar_no(base.get("items", {}), novo["items"], f"{caminho}[]", quebras, avisos)
+    # `items` em lista (tupla, draft-04 a 07) valida por posição: o gate não compara lista, então qualquer
+    # mudança que envolva lista (nova, alterada, ou trocada por schema único) é quebra.
+    ib, inovo = base.get("items"), novo.get("items")
+    if (isinstance(ib, list) or isinstance(inovo, list)) and ib != inovo:
+        quebras.append(f"{caminho}: items em lista (tupla) novo, alterado ou removido")
+
+    # additionalProperties schema contra schema: apertar o schema dos campos extras é aperto.
+    ab, an = base.get("additionalProperties"), novo.get("additionalProperties")
+    if isinstance(ab, dict) and isinstance(an, dict):
+        comparar_no(ab, an, f"{caminho}{{*}}", quebras, avisos)
 
 
 def comparar_diretorios(base: Path, novo: Path) -> tuple[list[str], list[str]]:

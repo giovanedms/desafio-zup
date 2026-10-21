@@ -55,6 +55,12 @@ _log = logging.getLogger(__name__)
 
 _DUAS_CASAS = Decimal("0.01")
 _TRACEPARENT = re.compile(r"^[0-9a-f]{2}-(?P<trace_id>[0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
+# `X-Prazo-Ms`: só dígitos ASCII (`isdigit` aceita `²`, que o latin-1 do header entrega e `int` recusa) e no máximo
+# 13, o que vai até o ano 2286 e deixa `int` e `fromtimestamp` sem caminho para levantar.
+_PRAZO_MS = re.compile(r"[0-9]{1,13}")
+# Teto de `erros[]` no 422, o mesmo da API pública: um corpo com milhares de campos extras não pode virar resposta
+# maior que ele.
+MAX_ERROS_POR_PROBLEMA = 20
 
 # Mesmo padrão de `IdContrato` no contrato OpenAPI: 20 posições é o NUM-CONTRATO do registro do legado
 # (ACL, `traducao.py`); aceitar mais seria publicar ids que a réplica nunca terá.
@@ -110,10 +116,33 @@ def _erro_de_campo(campo: str, mensagem: str) -> dict[str, str]:
     return {"campo": campo, "mensagem": mensagem}
 
 
+def _lista_de_erros(erros: list[dict[str, str]]) -> dict[str, object]:
+    """`erros[]` com no máximo MAX_ERROS_POR_PROBLEMA itens; `erros_omitidos` diz quantos ficaram de fora."""
+    extras: dict[str, object] = {"erros": erros[:MAX_ERROS_POR_PROBLEMA]}
+    if len(erros) > MAX_ERROS_POR_PROBLEMA:
+        extras["erros_omitidos"] = len(erros) - MAX_ERROS_POR_PROBLEMA
+    return extras
+
+
+class _NomeRepetido(ValueError):
+    """Objeto JSON com o mesmo nome duas vezes."""
+
+
+def _objeto_sem_nome_repetido(pares: list[tuple[str, Any]]) -> dict[str, Any]:
+    """RFC 8259 §4: com nome repetido cada parser escolhe um valor (o `json` fica com o último). Quem lê o primeiro
+    (um proxy, um log, o cliente em outra linguagem) veria outra operação que a aplicada: recusa em vez de escolher."""
+    objeto = dict(pares)
+    if len(objeto) != len(pares):
+        raise _NomeRepetido
+    return objeto
+
+
 def _ler_operacao(corpo: bytes) -> OperacaoDeLimite:
-    """JSON cru -> operação de domínio. `_Rejeicao` 400 (sintaxe) ou 422 (validação)."""
+    """JSON cru -> operação de domínio. `_Rejeicao` 400 (sintaxe, nome repetido) ou 422 (validação)."""
     try:
-        bruto = json.loads(corpo, parse_float=Decimal)
+        bruto = json.loads(corpo, parse_float=Decimal, object_pairs_hook=_objeto_sem_nome_repetido)
+    except _NomeRepetido as erro:
+        raise _Rejeicao("REQUISICAO_MAL_FORMADA", "O corpo repete o nome de um campo.") from erro
     except (
         ValueError,
         RecursionError,
@@ -126,7 +155,9 @@ def _ler_operacao(corpo: bytes) -> OperacaoDeLimite:
             _erro_de_campo(".".join(str(parte) for parte in e["loc"]) or "corpo", e["msg"])
             for e in erro.errors(include_url=False, include_context=False, include_input=False)
         ]
-        raise _Rejeicao("VALIDACAO_DE_DOMINIO", "Operação inválida.", {"erros": erros}) from erro
+        raise _Rejeicao(
+            "VALIDACAO_DE_DOMINIO", "Operação inválida.", _lista_de_erros(erros)
+        ) from erro
     try:
         return _para_operacao(requisicao)
     except ValorMonetarioInvalido as erro:
@@ -207,8 +238,12 @@ def _limite_json(limite: Limite) -> dict[str, object]:
 
 
 def _prazo(cabecalho: str | None) -> datetime | None:
-    """`X-Prazo-Ms`: epoch em ms até quando o chamador espera. Ausente ou inválido = sem prazo."""
-    if not cabecalho or not cabecalho.isdigit():
+    """`X-Prazo-Ms`: epoch em ms até quando o chamador espera. Ausente ou inválido = sem prazo. Inválido também deixa
+    uma linha de log: sem prazo, a premissa do reconciliador (nenhuma escrita começa depois dele) não vale."""
+    if cabecalho is None:
+        return None
+    if not _PRAZO_MS.fullmatch(cabecalho):
+        _log.warning(json.dumps({"evento": "prazo_invalido_ignorado", "valor": cabecalho[:32]}))
         return None
     return datetime.fromtimestamp(int(cabecalho) / 1000, UTC)
 
@@ -260,6 +295,9 @@ def criar_app(aplicar: AplicarOperacaoNoLimite, consultar: ConsultarLimite) -> F
         openapi_url=None,  # o contrato é contracts/openapi/limites-interno-v1.yaml, não a spec gerada
         docs_url=None,
         redoc_url=None,
+        # Barra final é rota inexistente (404), não 307 para a rota sem barra: o redirect fica fora do contrato e
+        # monta um `Location` absoluto com o Host recebido.
+        redirect_slashes=False,
     )
 
     @app.middleware("http")
@@ -289,7 +327,9 @@ def criar_app(aplicar: AplicarOperacaoNoLimite, consultar: ConsultarLimite) -> F
             _erro_de_campo(".".join(str(parte) for parte in e["loc"][1:]) or "requisicao", e["msg"])
             for e in erro.errors()
         ]
-        return _problema(request, "VALIDACAO_DE_DOMINIO", "Parâmetro inválido.", {"erros": erros})
+        return _problema(
+            request, "VALIDACAO_DE_DOMINIO", "Parâmetro inválido.", _lista_de_erros(erros)
+        )
 
     @app.get("/saude")
     async def saude() -> dict[str, str]:

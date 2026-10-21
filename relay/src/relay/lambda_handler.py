@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import boto3
+from botocore.config import Config
 
 from relay.cdc_limites import (
     SOURCE_NO_BUS,
@@ -18,10 +19,16 @@ from relay.cdc_limites import (
 )
 from relay.eventbridge import PublicadorEventBridge
 from relay.nucleo import EventoPendente, processar
-from relay.outbox_dynamodb import OutboxDynamoDB, de_registro_do_stream
+from relay.outbox_dynamodb import ItemDeOutboxMalformado, OutboxDynamoDB, de_registro_do_stream
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
+
+# Endpoint só o da AWS: uma `AWS_ENDPOINT_URL[_<SERVIÇO>]` na configuração da função (ou um `~/.aws/config`) não
+# desvia o relay, o sweeper nem o CDC. Mesma trava dos composition roots dos serviços.
+SO_ENDPOINT_DA_AWS = Config(  # type: ignore[call-arg]  # os stubs do botocore não declaram o parâmetro (existe desde o 1.31)
+    ignore_configured_endpoint_urls=True,
+)
 
 
 @dataclass(frozen=True)
@@ -40,33 +47,56 @@ def componentes() -> Componentes:
         regiao = os.environ.get("AWS_REGION")
         _componentes = Componentes(
             publicador=PublicadorEventBridge(
-                boto3.client("events", region_name=regiao), os.environ["BUS"]
+                boto3.client("events", region_name=regiao, config=SO_ENDPOINT_DA_AWS),
+                os.environ["BUS"],
             ),
             outbox=OutboxDynamoDB(
-                boto3.client("dynamodb", region_name=regiao), os.environ["TABELA_OUTBOX"]
+                boto3.client("dynamodb", region_name=regiao, config=SO_ENDPOINT_DA_AWS),
+                os.environ["TABELA_OUTBOX"],
             ),
         )
     return _componentes
 
 
 def handler(evento: dict[str, Any], contexto: object) -> dict[str, list[dict[str, str]]]:
+    """Stream do outbox → bus. Falhou = só o item volta (batchItemFailures).
+
+    Item malformado também volta como falha, logado com o `pk`: o ESM tenta de novo e, esgotadas as tentativas,
+    manda o lote para a DLQ on-failure (com alarme). O item fica no outbox. Nunca é descartado em silêncio.
+    """
     c = componentes()
     pendentes: list[EventoPendente] = []
     sequencia_de: dict[str, str] = {}
+    malformados: list[str] = []
     for registro in evento.get("Records", []):
-        pendente = de_registro_do_stream(registro)
+        sequencia = registro["dynamodb"]["SequenceNumber"]
+        try:
+            pendente = de_registro_do_stream(registro)
+        except ItemDeOutboxMalformado as erro:
+            log.error(
+                json.dumps(
+                    {
+                        "evento": "outbox_registro_malformado",
+                        "pk": erro.pk,
+                        "sequencia": sequencia,
+                        "erro": str(erro),
+                    }
+                )
+            )
+            malformados.append(sequencia)
+            continue
         if pendente is not None:
             pendentes.append(pendente)
-            sequencia_de[pendente.id_evento] = registro["dynamodb"]["SequenceNumber"]
+            sequencia_de[pendente.id_evento] = sequencia
     resultado = processar(pendentes, c.publicador, c.outbox)
     log.info(
-        '{"msg":"lote","publicados":%d,"falhos":%d}',
+        '{"msg":"lote","publicados":%d,"falhos":%d,"malformados":%d}',
         len(resultado.publicados),
         len(resultado.falhos),
+        len(malformados),
     )
-    return {
-        "batchItemFailures": [{"itemIdentifier": sequencia_de[i]} for i in sorted(resultado.falhos)]
-    }
+    falhas = [sequencia_de[i] for i in sorted(resultado.falhos)] + malformados
+    return {"batchItemFailures": [{"itemIdentifier": s} for s in falhas]}
 
 
 @dataclass(frozen=True)
@@ -84,7 +114,9 @@ def componentes_cdc_limites() -> ComponentesCdcLimites:
     if _cdc_limites is None:
         _cdc_limites = ComponentesCdcLimites(
             publicador=PublicadorEventBridge(
-                boto3.client("events", region_name=os.environ.get("AWS_REGION")),
+                boto3.client(
+                    "events", region_name=os.environ.get("AWS_REGION"), config=SO_ENDPOINT_DA_AWS
+                ),
                 os.environ["BUS"],
                 source=SOURCE_NO_BUS,
             ),

@@ -29,7 +29,7 @@ Toda autorização concluída precisa virar evento para contabilidade, antifraud
 ## Consequências
 
 - **Positivas:**
-  - Nenhum evento perdido nem fantasma.
+  - Nenhum evento perdido nem fantasma: item do outbox que o relay não consegue ler volta como falha do lote (DLQ do ESM) e continua no outbox, com o alarme `outbox-registro-malformado`. O custo é head-of-line blocking: devolver o registro como falha faz o ESM recuar o checkpoint do shard, e os registros seguintes dele esperam até as tentativas se esgotarem (até 5, com bisect). É a escolha certa para dinheiro (fail-closed), e o `IteratorAge` alarma o atraso.
   - Comportamento local idêntico ao da AWS (o mesmo relay), sem divergência Pipes × emulador.
   - O outbox vazio é sinal de saúde: dá para alarmar por tamanho e idade do item mais velho.
 - **Negativas:**

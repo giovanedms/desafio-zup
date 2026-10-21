@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -102,3 +103,53 @@ def test_uma_iteracao_apaga_so_o_que_processou(caso: SincronizarComLegado) -> No
 
     assert desfechos == {"CRIADO": 1, "FALHA": 1, "IGNORADO": 1}
     assert sqs.apagadas == ["rh0", "rh2"]  # a inválida fica para o redrive → DLQ
+
+
+def test_mensagem_que_falha_nao_impede_renovar_o_heartbeat(
+    caso: SincronizarComLegado, tmp_path: Path
+) -> None:
+    """Falha de mensagem é desfecho tratado (reentrega e DLQ); doente é a iteração que levanta."""
+    batida = tmp_path / "limites-acl.heartbeat"
+
+    assert consumidor.iterar_e_sinalizar(SqsFalso(["lixo"]), "url", caso, batida) is True
+    assert batida.exists()
+
+
+class _SqsQueSeRecupera:
+    """`receive_message` levanta nas `falhas` primeiras chamadas, depois devolve a fila vazia uma vez e, na seguinte,
+    interrompe o `while True` de `main` (KeyboardInterrupt não é Exception: atravessa o `except` do loop)."""
+
+    def __init__(self, falhas: int) -> None:
+        self.falhas = falhas
+        self.chamadas = 0
+
+    def receive_message(self, **_: Any) -> dict[str, Any]:
+        self.chamadas += 1
+        if self.chamadas <= self.falhas:
+            raise RuntimeError("fila inalcançável")
+        if self.chamadas == self.falhas + 1:
+            return {}
+        raise KeyboardInterrupt
+
+
+def test_main_so_renova_o_heartbeat_em_iteracao_sem_excecao(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACL com a fila inalcançável não pode manter a task verde: o healthcheck (< 30 s) depende de o heartbeat
+    envelhecer. Quando a iteração volta a passar, ele renova."""
+    batida = tmp_path / "limites-acl.heartbeat"
+    vivo_a_cada_falha: list[bool] = []
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:4566")
+    monkeypatch.setattr(consumidor, "HEARTBEAT", batida)
+    monkeypatch.setattr(consumidor, "cliente_aws", lambda *_a, **_k: _SqsQueSeRecupera(falhas=3))
+    monkeypatch.setattr(consumidor, "construir_sincronizacao", lambda _c: None)
+    monkeypatch.setattr(consumidor, "_esperar_fila", lambda *_a, **_k: "url")
+    monkeypatch.setattr(
+        consumidor.time, "sleep", lambda _s: vivo_a_cada_falha.append(batida.exists())
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        consumidor.main()
+
+    assert vivo_a_cada_falha == [False, False, False]
+    assert batida.exists()

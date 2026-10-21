@@ -74,13 +74,15 @@ paths:
           description: Contrato inexistente na réplica do core.
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
         '400':
-          description: Corpo que não é JSON válido.
+          description: |
+            Corpo que não é JSON válido, ou com o mesmo nome de campo duas vezes no mesmo objeto (RFC 8259 §4: cada
+            parser ficaria com um valor; o serviço recusa em vez de escolher).
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
         '422':
           description: |
             Operação inválida: valor ausente, ≤ 0 ou com mais de 2 casas; tipo desconhecido; `id_reserva` ausente em
             LIBERAR_RESERVA/CAPTURAR_RESERVA; `valor_reservado` ausente em CAPTURAR_RESERVA; captura maior que o reservado;
-            `id_conta` fora do pattern.
+            `id_conta` fora do pattern. `erros` traz no máximo 20 itens (`erros_omitidos` diz quantos ficaram de fora).
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problema' } } }
         '500':
           $ref: '#/components/responses/ErroInterno'
@@ -172,9 +174,12 @@ components:
       in: header
       required: false
       description: |
-        Epoch em ms até quando o chamador espera. Se a requisição esperar na fila além dele, o serviço NÃO escreve
-        e devolve 503: nenhuma escrita cai muito depois de o chamador desistir (premissa do reconciliador).
-      schema: { type: integer, minimum: 0 }
+        Epoch em ms até quando o chamador espera. Conferido uma vez, antes da primeira escrita: se a requisição esperou
+        na fila além dele, o serviço NÃO escreve e devolve 503. A escrita que começa dentro do prazo não é interrompida
+        e pode cair depois dele, limitada pelos timeouts e retries do acesso ao banco (premissa do reconciliador, que
+        só pergunta pela operação com o lease da autorização vencido há mais de 60 s). Fora do formato (só dígitos,
+        até 13) é ignorado, como se ausente.
+      schema: { type: integer, minimum: 0, maximum: 9999999999999 }
     Traceparent:
       name: traceparent
       in: header
@@ -288,9 +293,14 @@ components:
         codigo: { type: string }
         correlation_id: { type: string, format: uuid }
         trace_id: { type: string, nullable: true }
+        erros_omitidos:
+          type: integer
+          minimum: 1
+          description: Presente quando `erros` foi cortado nos 20 primeiros itens; quantos ficaram de fora.
         erros:
           type: array
-          description: Detalhe por campo nos erros de validação (422).
+          maxItems: 20
+          description: Detalhe por campo nos erros de validação (422), no máximo 20 (ver `erros_omitidos`).
           items:
             type: object
             required: [campo, mensagem]

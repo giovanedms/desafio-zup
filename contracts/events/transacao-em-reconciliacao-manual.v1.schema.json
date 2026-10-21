@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-04/schema#",
   "id": "https://financas.example/schemas/eventos/transacao-em-reconciliacao-manual/1.0.json",
   "title": "TransacaoEmReconciliacaoManual v1 (CloudEvent estruturado)",
-  "description": "Autorização (ou reserva sem hold) que não dava para concluir com segurança de forma automática e foi para a fila humana. É a trilha durável do caso de efeito incerto. Publicado pelo BC Autorização; evolução só com campos opcionais.",
+  "description": "Autorização (ou reserva sem hold) que não dava para concluir com segurança de forma automática e foi para a fila humana. É a trilha durável do caso de efeito incerto. Com motivo RESERVA_SEM_HOLD não é terminal: o vencedor que concluir depois publica o ReservaCapturada, TransacaoEstornada ou ReservaExpirada da reserva. Publicado pelo BC Autorização; evolução só com campos opcionais.",
   "type": "object",
   "required": [
     "specversion",

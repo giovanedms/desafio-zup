@@ -80,6 +80,10 @@ _GATEWAY_REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _CLIENT_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Teto de `erros[]` no 422: um corpo com milhares de campos extras não pode virar resposta maior que ele.
 MAX_ERROS_POR_PROBLEMA = 20
+# Desafio do 401 (RFC 9110 §11.6.1 e §15.5.2: o 401 DEVE trazer WWW-Authenticate). O esquema é o do contrato
+# público, Bearer (RFC 6750 §3; `realm` é opcional), igual ao da gateway response UNAUTHORIZED; localmente o
+# X-Client-Id faz as vezes do token.
+DESAFIO_DE_AUTENTICACAO = "Bearer"
 
 IdContrato = Annotated[str, Path(pattern=r"^[A-Za-z0-9-]{1,20}$")]  # NUM-CONTRATO do legado (ACL)
 # `format: uuid` do contrato: sem o pattern, um id de 2 KB chegava à chave do DynamoDB e virava 500.
@@ -177,32 +181,47 @@ def _numero_exato(valor: object) -> Decimal:
     return Decimal(valor)
 
 
+def _sem_null(valor: object) -> object:
+    """Campo opcional se OMITE: o contrato (OpenAPI 3.0, sem `nullable`) recusa `null` explícito. O default
+    None de quem omitiu não passa por aqui (o pydantic não valida defaults)."""
+    if valor is None:
+        raise ValueError("null não é aceito; omita o campo")
+    return valor
+
+
+_SEM_NULL = BeforeValidator(_sem_null)
+
+
 class GeoRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    uf: Annotated[str | None, Field(pattern=r"^[A-Z]{2}$")] = None
-    municipio_ibge: Annotated[str | None, Field(pattern=r"^[0-9]{7}$")] = None
+    uf: Annotated[str | None, Field(pattern=r"^[A-Z]{2}$"), _SEM_NULL] = None
+    municipio_ibge: Annotated[str | None, Field(pattern=r"^[0-9]{7}$"), _SEM_NULL] = None
 
 
 class MetadataRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    canal: Literal["APP", "WEB", "POS", "PIX", "BACKOFFICE"] | None = None
-    id_rastreio_canal: Annotated[str | None, Field(max_length=64, pattern=_ID_FORMA_LIVRE)] = None
-    geo: GeoRequest | None = None
+    canal: Annotated[Literal["APP", "WEB", "POS", "PIX", "BACKOFFICE"] | None, _SEM_NULL] = None
+    id_rastreio_canal: Annotated[
+        str | None, Field(max_length=64, pattern=_ID_FORMA_LIVRE), _SEM_NULL
+    ] = None
+    geo: Annotated[GeoRequest | None, _SEM_NULL] = None
 
 
 class PedidoRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    id_contrato: str | None = None
+    id_contrato: Annotated[str | None, _SEM_NULL] = None
     id_conta: Annotated[str, Field(pattern=r"^[A-Za-z0-9-]{1,16}$")]
     valor: Annotated[Decimal, BeforeValidator(_numero_exato)]
     moeda: Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
     tipo_operacao: Literal["DEBITO", "CREDITO", "RESERVA", "ESTORNO"]
-    id_estabelecimento: Annotated[str | None, Field(max_length=64, pattern=_ID_FORMA_LIVRE)] = None
-    id_autorizacao_original: Annotated[str | None, Field(pattern=_UUID_REGEX)] = None
-    metadata: MetadataRequest | None = None
+    id_estabelecimento: Annotated[
+        str | None, Field(max_length=64, pattern=_ID_FORMA_LIVRE), _SEM_NULL
+    ] = None
+    id_autorizacao_original: Annotated[str | None, Field(pattern=_UUID_REGEX), _SEM_NULL] = None
+    metadata: Annotated[MetadataRequest | None, _SEM_NULL] = None
 
 
 class _Rejeicao(Exception):
@@ -340,7 +359,11 @@ def _exigir_client_id(request: Request) -> str:
     # header faz as vezes do token.
     client_id = (request.headers.get("x-client-id") or "").strip()
     if not _CLIENT_ID.fullmatch(client_id):
-        raise _Rejeicao("NAO_AUTENTICADO", "Identificação do cliente ausente ou fora do formato.")
+        raise _Rejeicao(
+            "NAO_AUTENTICADO",
+            "Identificação do cliente ausente ou fora do formato.",
+            headers={"WWW-Authenticate": DESAFIO_DE_AUTENTICACAO},
+        )
     return client_id
 
 
@@ -369,10 +392,33 @@ def _constante_nao_json(nome: str) -> object:
     raise ValueError(f"{nome} não é um número JSON")
 
 
+class _NomeRepetido(ValueError):
+    """Objeto JSON com o mesmo nome duas vezes."""
+
+
+def _objeto_sem_nome_repetido(pares: list[tuple[str, object]]) -> dict[str, object]:
+    """Recusa nome repetido em qualquer objeto do corpo. A RFC 8259 §4 deixa o comportamento a cargo de cada
+    parser (no `json` do Python, o último vence) e a RFC 7493 §2.3 (I-JSON) proíbe: com `"valor"` duas vezes,
+    um WAF ou um log que lesse o primeiro veria outro valor que o aplicado e o gravado na impressão digital."""
+    objeto = dict(pares)
+    if len(objeto) != len(pares):
+        raise _NomeRepetido("nome repetido no objeto")
+    return objeto
+
+
 def _ler_pedido(corpo: bytes, id_contrato: str) -> PedidoDeAutorizacao:
     """JSON cru -> pedido de domínio. `_Rejeicao` 400 (sintaxe) ou 422 (validação)."""
     try:
-        bruto = json.loads(corpo, parse_float=Decimal, parse_constant=_constante_nao_json)
+        bruto = json.loads(
+            corpo,
+            parse_float=Decimal,
+            parse_constant=_constante_nao_json,
+            object_pairs_hook=_objeto_sem_nome_repetido,
+        )
+    except _NomeRepetido as erro:
+        raise _Rejeicao(
+            "REQUISICAO_MAL_FORMADA", "O corpo repete um nome dentro do mesmo objeto JSON."
+        ) from erro
     except (ValueError, RecursionError) as erro:
         raise _Rejeicao("REQUISICAO_MAL_FORMADA", "O corpo não é um JSON válido.") from erro
     try:
@@ -490,6 +536,8 @@ def criar_app(  # noqa: PLR0915 - rotas registradas em closure, como no serviço
         openapi_url=None,  # o contrato é contracts/openapi/autorizacao-v1.yaml, não a spec gerada
         docs_url=None,
         redoc_url=None,
+        # Barra final é rota inexistente (404 do catálogo), não 307 sem corpo para um Location montado do Host.
+        redirect_slashes=False,
     )
     em_voo = 0
     trava = threading.Lock()
@@ -597,7 +645,7 @@ def criar_app(  # noqa: PLR0915 - rotas registradas em closure, como no serviço
         try:
             client_id = _exigir_client_id(request)
         except _Rejeicao as rejeicao:
-            return _problema(request, rejeicao.codigo, rejeicao.detail)
+            return _problema(request, rejeicao.codigo, rejeicao.detail, headers=rejeicao.headers)
         try:
             autorizacao = await run_in_threadpool(
                 consultar.executar, id_contrato, id_autorizacao.lower(), client_id

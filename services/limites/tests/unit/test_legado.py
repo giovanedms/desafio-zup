@@ -73,8 +73,11 @@ def test_ida_e_volta_do_formato_legado() -> None:
         ("CTR-2026-SP-000000001-A", "0001-1", "1.00"),  # 23 posições: truncar faria colidir com -B
         ("CTR-1", "0001-12345678-9-XY", "1.00"),  # conta com 18 posições
         ("CTR-1", "0001-1", "1000000000000000.00"),  # 10^15: não cabe nos 17 dígitos
+        # `\n` final: `match` com `$` aceitava, o registro saía com 84 posições e `traduzir` devolvia `CTR-1`
+        ("CTR-1\n", "0001-1", "1.00"),
+        ("CTR-1", "0001-1\n", "1.00"),
     ],
-    ids=["contrato", "conta", "valor"],
+    ids=["contrato", "conta", "valor", "contrato-com-quebra-de-linha", "conta-com-quebra-de-linha"],
 )
 def test_formatar_falha_em_vez_de_truncar(id_contrato: str, id_conta: str, concedido: str) -> None:
     grande = AtualizacaoDoLegado(

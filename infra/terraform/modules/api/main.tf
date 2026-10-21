@@ -42,6 +42,9 @@ locals {
     }
   }
 
+  # O contrato declara `oauth2` (o que o consumidor vê) e `api_key` (header x-api-key, o mesmo daqui). O body troca
+  # os dois pelo que o gateway executa: o authorizer do Cognito no lugar do oauth2 e a mesma API key. `security` e
+  # `securitySchemes` são SUBSTITUÍDOS (não somados), então declarar a API key no contrato não muda o que é importado.
   especificacao = merge(local.contrato, {
     paths    = local.paths
     security = [{ cognito = [local.escopo_write], api_key = [] }]
@@ -105,6 +108,8 @@ locals {
       responseParameters = merge(
         { "gatewayresponse.header.Content-Type" = "'application/problem+json'" },
         r.retry_after == null ? {} : { "gatewayresponse.header.Retry-After" = "'${r.retry_after}'" },
+        # RFC 9110 §15.5.2: o 401 DEVE trazer WWW-Authenticate. Mesmo desafio do serviço (Bearer, RFC 6750 §3).
+        r.status == 401 ? { "gatewayresponse.header.WWW-Authenticate" = "'Bearer'" } : {},
       )
       responseTemplates = {
         "application/problem+json" = jsonencode({

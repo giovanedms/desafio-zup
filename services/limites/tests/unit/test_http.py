@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
-from limites.adapters.inbound.http import criar_app
+from limites.adapters.inbound.http import MAX_ERROS_POR_PROBLEMA, criar_app
 from limites.adapters.outbound.dynamodb import ArmazenamentoIndisponivel, ContencaoPersistente
 from limites.adapters.outbound.memoria import RepositorioDeLimitesEmMemoria
 from limites.application.casos_de_uso import AplicarOperacaoNoLimite, ConsultarLimite
@@ -474,6 +477,92 @@ def test_prazo_no_futuro_aplica_normalmente(cliente: TestClient) -> None:
 
     assert resposta.status_code == 200
     assert resposta.json()["resultado"] == "APLICADA"
+
+
+@pytest.mark.parametrize(
+    "prazo",
+    [b"\xb2", b"\xb9", b"1000000000000000000", b"99999999999999999999", b"9" * 4301],
+    ids=[
+        "sobrescrito-2",
+        "sobrescrito-1",
+        "alem-do-ano-9999",
+        "alem-do-time_t",
+        "alem-do-teto-do-int",
+    ],
+)
+def test_prazo_fora_do_formato_e_ignorado_em_vez_de_500(
+    cliente: TestClient, prazo: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`_prazo`: inválido = sem prazo. Bytes crus pelo ASGITransport: o TestClient recodifica header não ASCII em
+    UTF-8 (`²` chegaria como `Â²`), e o servidor entrega o byte do socket, que a Starlette decodifica em latin-1."""
+
+    async def enviar() -> httpx.Response:
+        transporte = httpx.ASGITransport(app=cliente.app)
+        async with httpx.AsyncClient(transport=transporte, base_url="http://limites") as http:
+            return await http.post(
+                OPERACOES, content=_corpo("DEBITAR", "10.00"), headers={"X-Prazo-Ms": prazo}
+            )
+
+    with caplog.at_level(logging.WARNING):
+        resposta = asyncio.run(enviar())
+
+    assert resposta.status_code == 200
+    assert resposta.json()["resultado"] == "APLICADA"
+    assert any("prazo_invalido_ignorado" in r.getMessage() for r in caplog.records)
+
+
+def test_422_corta_erros_em_20_e_diz_quantos_ficaram_de_fora(cliente: TestClient) -> None:
+    """Sem teto, cada campo extra virava um item: resposta maior que o corpo que a provocou."""
+    extras = {f"extra{i}": "x" for i in range(50)}
+
+    muitos = cliente.post(OPERACOES, content=_corpo("RESERVAR", "10.00", **extras))
+    um = cliente.post(OPERACOES, content=_corpo("RESERVAR", "10.00", extra="x"))
+
+    assert muitos.status_code == 422
+    assert len(muitos.json()["erros"]) == MAX_ERROS_POR_PROBLEMA == 20
+    assert muitos.json()["erros_omitidos"] == 30
+    assert "erros_omitidos" not in um.json()
+
+
+@pytest.mark.parametrize(
+    "corpo",
+    [
+        b'{"id_operacao": "%s", "tipo": "RESERVAR", "valor": 1.00, "valor": 999.00}',
+        b'{"id_operacao": "%s", "tipo": "RESERVAR", "tipo": "RESERVAR", "valor": 1.00}',
+    ],
+    ids=["valor-diferente", "mesmo-valor"],
+)
+def test_nome_de_campo_repetido_devolve_400_sem_escrever(
+    cliente: TestClient, repositorio: RepositorioDeLimitesEmMemoria, corpo: bytes
+) -> None:
+    """O `json` ficaria com o último `valor` (999,00), e quem lê o primeiro veria 1,00."""
+    resposta = cliente.post(OPERACOES, content=corpo % _novo_id().encode())
+
+    assert resposta.status_code == 400
+    assert resposta.headers["content-type"] == PROBLEM_JSON
+    assert resposta.json()["codigo"] == "REQUISICAO_MAL_FORMADA"
+    limite = repositorio.obter(CTR)
+    assert limite is not None
+    assert limite.reservado == Decimal("0.00")
+
+
+@pytest.mark.parametrize(
+    ("metodo", "caminho"),
+    [("POST", f"{OPERACOES}/"), ("GET", f"/interno/v1/contratos/{CTR}/limite/")],
+    ids=["operacoes", "limite"],
+)
+def test_barra_final_e_rota_inexistente_sem_redirect(
+    cliente: TestClient, repositorio: RepositorioDeLimitesEmMemoria, metodo: str, caminho: str
+) -> None:
+    corpo = _corpo("DEBITAR", "10.00") if metodo == "POST" else None
+
+    resposta = cliente.request(metodo, caminho, content=corpo, follow_redirects=False)
+
+    assert resposta.status_code == 404
+    assert "location" not in resposta.headers
+    limite = repositorio.obter(CTR)
+    assert limite is not None
+    assert limite.utilizado == Decimal("0.00")
 
 
 def test_conta_divergente_e_recusa_200_e_o_mesmo_id_com_a_conta_certa_aplica(

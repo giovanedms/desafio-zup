@@ -17,8 +17,9 @@ vencido há mais que a GRACA, ASSUME o lease (CAS) — se perder, alguém (o pr�
     aprovado não aumentam a exposição; terminar é mais seguro que desfazer.
 
 Por que a leitura decide. Uma escrita da operação original só cai até alguns segundos depois do envio: o
-limites recusa aplicar se o prazo do chamador (`X-Prazo-Ms`, ~2 s por tentativa) já venceu na fila dele, e o
-SDK do DynamoDB tem timeout. O reconciliador só age com o lease vencido há mais de 60 s. Então, quando ele
+limites recusa começar a aplicar se o prazo do chamador (`X-Prazo-Ms`, ~2 s por tentativa) já venceu na fila
+dele, e a escrita que começou termina dentro do orçamento de timeouts e retries do cliente DynamoDB do limites
+(pior caso ~38 s, ADR-0006). O reconciliador só age com o lease vencido há mais de 60 s. Então, quando ele
 pergunta, nada mais vai chegar. DEBITO depende da guarda (5 min): fora do PRAZO_DE_REAPLICACAO a resposta
 "não está na guarda" não prova nada e o caso vai para a fila. RESERVA não depende: o hold é durável e só a
 própria compensação o remove de uma autorização não aprovada.

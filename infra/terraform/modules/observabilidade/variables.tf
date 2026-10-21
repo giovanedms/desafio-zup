@@ -126,8 +126,13 @@ variable "idade_fila_limite_s" {
 }
 
 variable "funcoes_lambda" {
-  description = "Chave curta -> nome da função Lambda. Cada uma ganha alarme de Errors >= 1 em 5 min."
+  description = "Chave curta -> nome da função Lambda. Cada uma ganha alarme de Errors >= 1 em 5 min; o log group de relay e sweeper (/aws/lambda/<função>) recebe o metric filter de outbox_registro_malformado."
   type        = map(string)
+
+  validation {
+    condition     = alltrue([for k in ["relay", "sweeper"] : contains(keys(var.funcoes_lambda), k)])
+    error_message = "funcoes_lambda precisa das chaves relay e sweeper (metric filter de item de outbox malformado)."
+  }
 }
 
 variable "cdc_funcao" {
@@ -141,7 +146,7 @@ variable "log_group_autorizacao" {
 }
 
 variable "log_group_cdc" {
-  description = "Nome do log group da função relay-cdc-limites (origem da linha cdc_registro_descartado)."
+  description = "Nome do log group da função relay-cdc-limites (origem da linha cdc_registro_malformado)."
   type        = string
 }
 

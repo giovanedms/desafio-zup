@@ -63,14 +63,16 @@ class IdsSequenciais:
 
 @dataclass
 class LimitesFalso:
-    """Dublê do port com as MESMAS pré-condições do agregado `Limite` real (LSP), não mais permissivo que ele:
-    idempotência antes de qualquer recusa; conta divergente da titular → CONTA_DIVERGENTE; RESERVAR/DEBITAR
-    exigem disponível; CREDITAR/ESTORNAR_DEBITO exigem utilizado ≥ valor; LIBERAR/CAPTURAR exigem o hold com o
-    valor gravado. Saldos com as invariantes do real: disponível = concedido − utilizado − reservado, e
-    utilizado/reservado nunca negativos."""
+    """Dublê do port com as pré-condições do agregado `Limite` real (`Limite.diagnosticar`), na mesma ordem:
+    idempotência antes de qualquer recusa; conta divergente da titular → CONTA_DIVERGENTE; LIBERAR/CAPTURAR
+    exigem o hold com o valor gravado; RESERVAR/DEBITAR exigem contrato ATIVO e disponível; CREDITAR/
+    ESTORNAR_DEBITO exigem utilizado ≥ valor. Saldos com as invariantes do real: disponível = concedido −
+    utilizado − reservado, e utilizado/reservado nunca negativos. O que ele NÃO reproduz: a guarda de 5 min (aqui
+    o id fica para sempre) e o RESERVAR repetido com o hold vivo depois que a guarda esqueceu."""
 
     concedido: Decimal = Decimal("1000.00")
     contas: dict[str, str] = field(default_factory=lambda: {CTR: "0001-1"})  # contrato → titular
+    inativos: set[str] = field(default_factory=set)  # contratos BLOQUEADOS/ENCERRADOS no core
     indisponivel: bool = False
     utilizado: Decimal = Decimal("0.00")
     holds: dict[str, Decimal] = field(default_factory=dict)
@@ -115,6 +117,8 @@ class LimitesFalso:
         if operacao.id_conta is not None and operacao.id_conta != self.contas[id_contrato]:
             return "CONTA_DIVERGENTE"
         match operacao.tipo:
+            case TipoNoLimite.RESERVAR | TipoNoLimite.DEBITAR if id_contrato in self.inativos:
+                return "CONTRATO_INATIVO"
             case TipoNoLimite.RESERVAR | TipoNoLimite.DEBITAR:
                 return "LIMITE_INSUFICIENTE" if self.disponivel < operacao.valor else None
             case TipoNoLimite.CREDITAR | TipoNoLimite.ESTORNAR_DEBITO:
@@ -884,3 +888,103 @@ def test_todo_motivo_de_recusa_tem_detalhe() -> None:
         if m not in _DETALHE_DO_MOTIVO and _CODIGO_DA_RECUSA[m] not in _DETALHE_DA_RECUSA
     ]
     assert sem_detalhe == []
+
+
+# --- painel 7 -------------------------------------------------------------------------------------
+
+_BASE = '"id_conta": "0001-1", "moeda": "BRL", "tipo_operacao": "RESERVA"'
+
+
+@pytest.mark.parametrize(
+    "conteudo",
+    [
+        f'{{{_BASE}, "valor": 1.00, "valor": 999.00}}'.encode(),
+        f'{{{_BASE}, "valor": 1.00, "metadata": {{"canal": "POS", "canal": "APP"}}}}'.encode(),
+    ],
+    ids=["valor-repetido", "repetido-dentro-do-metadata"],
+)
+def test_nome_repetido_no_corpo_e_400_e_nada_chega_ao_limite(
+    cliente: TestClient, limites: LimitesFalso, conteudo: bytes
+) -> None:
+    """A7-2: antes, o último `valor` vencia (201 reservando R$ 999,00 num corpo que começa com R$ 1,00)."""
+    resposta = cliente.post(URL, content=conteudo, headers=_cabecalhos())
+
+    assert resposta.status_code == 400
+    assert resposta.headers["content-type"] == PROBLEM_JSON
+    assert resposta.json()["codigo"] == "REQUISICAO_MAL_FORMADA"
+    assert limites.aplicadas == {}
+
+
+# Os 6 corpos do juiz (A7-1) e os 2 opcionais que faltavam: inválidos no schema PedidoDeAutorizacao (nenhum
+# campo é `nullable`), antes 201.
+CORPOS_COM_NULL: dict[str, dict[str, object]] = {
+    "metadata": {"metadata": None},
+    "id_estabelecimento": {"id_estabelecimento": None},
+    "id_autorizacao_original": {"id_autorizacao_original": None},
+    "id_contrato": {"id_contrato": None},
+    "metadata.geo": {"metadata": {"canal": "POS", "geo": None}},
+    "metadata.canal": {"metadata": {"canal": None}},
+    "metadata.id_rastreio_canal": {"metadata": {"id_rastreio_canal": None}},
+    "metadata.geo.uf": {"metadata": {"geo": {"uf": None}}},
+}
+
+
+@pytest.mark.parametrize(("campo", "extra"), CORPOS_COM_NULL.items(), ids=list(CORPOS_COM_NULL))
+def test_null_em_campo_opcional_e_422_como_no_contrato(
+    cliente: TestClient, limites: LimitesFalso, campo: str, extra: dict[str, object]
+) -> None:
+    resposta = cliente.post(URL, content=_corpo(**extra), headers=_cabecalhos())
+
+    assert resposta.status_code == 422
+    problema = resposta.json()
+    assert problema["codigo"] == "VALIDACAO_DE_DOMINIO"
+    assert [e["campo"] for e in problema["erros"]] == [campo]
+    assert limites.aplicadas == {}
+
+
+@pytest.mark.parametrize("metodo", ["POST", "GET"])
+def test_barra_final_e_404_do_catalogo_e_nao_307(cliente: TestClient, metodo: str) -> None:
+    """A7-5: o 307 saía sem corpo, fora do contrato, com Location absoluto montado do Host."""
+    caminho = f"{URL}/" if metodo == "POST" else f"{URL}/{uuid.uuid4()}/"
+
+    resposta = cliente.request(
+        metodo, caminho, content=_corpo(), headers=_cabecalhos(), follow_redirects=False
+    )
+
+    assert resposta.status_code == 404
+    assert resposta.headers["content-type"] == PROBLEM_JSON
+    assert resposta.json()["codigo"] == "RECURSO_NAO_ENCONTRADO"
+    assert "location" not in resposta.headers
+
+
+def test_401_traz_www_authenticate_no_post_e_no_get(cliente: TestClient) -> None:
+    """G7-5: RFC 9110 §15.5.2, o 401 DEVE trazer pelo menos um desafio."""
+    sem_client_id = _cabecalhos()
+    del sem_client_id["X-Client-Id"]
+
+    post = cliente.post(URL, content=_corpo(), headers=sem_client_id)
+    get = cliente.get(f"{URL}/{uuid.uuid4()}")
+
+    assert post.status_code == get.status_code == 401
+    assert post.headers["www-authenticate"] == get.headers["www-authenticate"] == "Bearer"
+
+
+def test_contrato_inativo_e_422_registrado_e_o_replay_e_identico(limites: LimitesFalso) -> None:
+    """O dublê recusa CONTRATO_INATIVO como o agregado real (RESERVAR/DEBITAR); a captura não exige ATIVO."""
+    cliente = _cliente(limites)
+    reserva = cliente.post(URL, content=_corpo(), headers=_cabecalhos()).json()
+    limites.inativos.add(CTR)
+    cabecalhos = _cabecalhos()
+
+    primeira = cliente.post(URL, content=_corpo(), headers=cabecalhos)
+    replay = cliente.post(URL, content=_corpo(), headers=cabecalhos)
+    captura = cliente.post(
+        URL,
+        content=_corpo(tipo_operacao="DEBITO", id_autorizacao_original=reserva["id_autorizacao"]),
+        headers=_cabecalhos(),
+    )
+
+    assert primeira.status_code == replay.status_code == 422
+    assert primeira.json()["codigo"] == "CONTRATO_INATIVO"
+    assert replay.content == primeira.content and replay.headers["idempotent-replayed"] == "true"
+    assert captura.status_code == 201

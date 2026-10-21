@@ -1,4 +1,4 @@
 # Operação
-`slo.md`: SLIs, o que conta como falha (inclusive o 503 de load shedding), SLO de 99,9%/mês e error budget; a política de burn-rate em duas janelas está desenhada, não implementada.
-`runbooks.md`: R1–R9 (DLQ/replay de eventos, outbox, aumento de quota e warm throughput pré-pico, órfãs, failover regional desenhado, deploy, reconciliação manual, hold e contrato quente, defasagem do legado). Matriz: PAP-01, RN-04.
-`infraestrutura.md`: o que existe na conta AWS (inventário dos 203 recursos do sandbox, ambiente `esteira`, bootstrap), esteira, custo e desvios do sandbox.
+`slo.md`: SLIs, o que conta como falha (inclusive o 503 de load shedding), SLO de 99,9%/mês e error budget; a política de burn-rate em duas janelas está implementada na IaC (`modules/observabilidade`: 4 janelas e 2 alarmes compostos).
+`runbooks.md`: R1–R14 (DLQ/replay de eventos, outbox, aumento de quota e warm throughput pré-pico, órfãs, failover regional desenhado, deploy, reconciliação manual, hold e contrato quente, defasagem do legado e, de R10 a R14, um por grupo de alarmes: burn rate do SLO, p99, erros de Lambda e CDC atrasado, idade de fila, motivo de recusa desconhecido e registro do CDC malformado). Matriz: PAP-01, RN-04.
+`infraestrutura.md`: o que existe na conta AWS (inventário dos 209 recursos do sandbox, ambiente `esteira`, bootstrap), esteira, custo e desvios do sandbox.

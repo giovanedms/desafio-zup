@@ -163,10 +163,24 @@ def test_concluir_classifica_o_cancelamento_por_indice_e_codigo(
         _repositorio(cliente).concluir(estorno, original)
 
 
-def test_condicao_no_outbox_e_defeito_e_sobe_como_esta() -> None:
-    """Id de evento repetido no outbox não é estado a tratar (é bug): nem LeasePerdido nem 503."""
+def test_condicao_no_outbox_e_503_repetivel_com_linha_de_erro(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F7-10 (painel 7): id de evento repetido no outbox subia como ClientError (500 sem Retry-After). A
+    transação foi cancelada inteira e a próxima tentativa gera ids novos: é 503 repetível, com log de anomalia."""
     cliente, stub = _cliente()
     _cancelada(stub, "None", "ConditionalCheckFailed")
+    aprovada = _nova().aprovar(SALDOS, AGORA, str(uuid.uuid4()))
+
+    with stub, pytest.raises(ArmazenamentoIndisponivel):
+        _repositorio(cliente).concluir(aprovada, None)
+    assert "id_de_evento_repetido_no_outbox" in caplog.text
+
+
+def test_cancelamento_por_validacao_continua_subindo_como_esta() -> None:
+    """O que não é condição nem transitório (ex.: item inválido) é defeito: sobe o erro original."""
+    cliente, stub = _cliente()
+    _cancelada(stub, "None", "ValidationError")
     aprovada = _nova().aprovar(SALDOS, AGORA, str(uuid.uuid4()))
 
     with stub, pytest.raises(ClientError, match="TransactionCanceled"):
@@ -226,8 +240,8 @@ class Ids:
 
 @pytest.mark.parametrize(
     "falha",
-    [("TransactionConflict",), ("ThrottlingError",)],
-    ids=["conflito", "estrangulamento"],
+    [("TransactionConflict",), ("ThrottlingError",), ("None", "ConditionalCheckFailed")],
+    ids=["conflito", "estrangulamento", "id-de-evento-repetido-no-outbox"],
 )
 def test_transacao_cancelada_por_conflito_no_post_e_503_com_retry_after(
     falha: tuple[str, ...],

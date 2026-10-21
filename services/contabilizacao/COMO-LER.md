@@ -8,7 +8,7 @@ Não tem API HTTP. Na AWS roda como Lambda com a fila como gatilho; no ambiente 
 
 1. **Entrada**, um adapter por ambiente:
    - **AWS:** `adapters/inbound/lambda_sqs.py → handler`. Event source mapping da fila `contabilizacao`, lotes de 10, `ReportBatchItemFailures` (`infra/terraform/modules/lambdas/main.tf`).
-   - **Local:** `adapters/inbound/poller.py → uma_iteracao`. Long poll de 10 s, até 10 mensagens; apaga a mensagem só depois do sucesso. Toca `/tmp/contabilizacao.heartbeat` a cada volta, e o `HEALTHCHECK` do Dockerfile lê esse arquivo.
+   - **Local:** `adapters/inbound/poller.py → uma_iteracao`. Long poll de 10 s, até 10 mensagens; apaga a mensagem só depois do sucesso. Toca `/tmp/contabilizacao.heartbeat` a cada volta sem exceção (volta que falha não renova), e o `HEALTHCHECK` do Dockerfile lê esse arquivo.
 2. **`adapters/inbound/eventbridge_sqs.py → cloudevent_da_mensagem`:** o corpo da mensagem SQS é o envelope do EventBridge, e o `detail` é o CloudEvent. `json.loads(parse_float=Decimal)`: o valor nunca passa por float. Corpo que não é JSON, ou sem `detail` objeto → `EventoInvalido`.
 3. **`application/contabilizar.py → ContabilizarEvento.executar`:**
    1. `EventoRecebido.de_cloudevent` (`domain/regras.py`): **leitor tolerante**. Lê só `id`, `source`, `time` e `data`; o nome do evento vem de `data.event_type`. Campo novo não quebra; campo mínimo faltando → `EventoInvalido`.
@@ -86,6 +86,6 @@ Cada evento gera um lançamento **autocontido**, e saldo de conta é soma, que �
 | "E se o estorno chegar antes da autorização?" | "Ordem de chegada" + property test |
 | "O centavo sobrevive ao caminho EventBridge → SQS → consumidor?" | `parse_float=Decimal` na entrada; `tests/integration/test_fluxo_eventbridge_sqs.py` leva `12345678901234.56` do `PutEvents` até o lançamento no DynamoDB (LocalStack) |
 | "Qual a data contábil de uma compra às 23h30 em São Paulo?" | A local, não a UTC: `test_data_contabil_e_a_data_de_sao_paulo` |
-| "Por que inbox, se o id do lançamento já é determinístico?" | Hoje há as duas proteções. Deduplicar só pelo lançamento e dispensar a inbox é a alavanca 3 de `docs/capacidade.md` §5 (inbox + lançamento custam 4,3 WRU por autorização) |
+| "Por que inbox, se o id do lançamento já é determinístico?" | Hoje há as duas proteções. Deduplicar só pelo lançamento e dispensar a inbox é a alavanca 3 de `docs/capacidade.md` §5 (inbox + lançamento custam 4,3 WRU por evento contabilizado; a captura contabiliza 2) |
 | "Por que Lambda aqui e Fargate na autorização?" | Trabalho assíncrono, orientado a evento e com rajadas; não precisa do Service Connect (ADR-0004) |
 | "Como se corrige um lançamento errado?" | Com outro lançamento: o `Lancamento` é imutável |

@@ -6,8 +6,8 @@
 |---|---|---|
 | Itens de Limite | 80 M contas × 3–5 contratos | 240–400 M itens (~100–160 GB) |
 | Requisições em voo no pico | Lei de Little: 5.000 TPS × ~50 ms | ~250 |
-| Escritas por autorização | **Medido na AWS** (seção 3): `limites` 1,09 + `autorizacoes` 3,06 + `autorizacoes-outbox` 6,12 + contabilização 2,14 + 2,14 | **~14,6 WRU** (a estimativa inicial, ~6–8, esquecia o outbox e a contabilização) |
-| WRU no pico | 5.000 × 14,6 | ~73 k WRU/s somando as 5 tabelas; a maior é o outbox, ~31 k/s (abaixo dos 40 k por tabela da quota padrão) |
+| Escritas por operação | **Medido na AWS só no DEBITO** (a carga da seção 3): `limites` 1,09 + `autorizacoes` 3,06 + `autorizacoes-outbox` 6,12 + contabilização 2,14 + 2,14. Os outros tipos são **derivados** do código (seção 1.6) | **~14,6 WRU** por DEBITO nas tabelas, mais 2 nos GSIs. Captura ~27 (2 eventos), recusa ~10 (a estimativa inicial, ~6–8, esquecia o outbox e a contabilização) |
+| WRU no pico | 5.000 aprovações + 500 recusas/s, por mix (seção 1.6) | ~89 k (só DEBITO) a ~156 k WRU/s (toda aprovação é captura), tabelas e GSIs somados. O `autorizacoes-outbox` vai a ~34 k, ~49 k e ~64 k/s: **acima dos 40 k por tabela da quota padrão nos dois mixes com captura** |
 | Eventos no pico | Depende do mix: captura publica **2** eventos (seção 1.1) | 5,5 k a **10,5 k** entradas de PutEvents/s (quota aprovada: **6.000**; estoura com mais de 10% de capturas) |
 | Invocations no pico | Regras casadas por evento (seção 1.1) | 16 k a **21 k**/s (quota aprovada: **20.000**; estoura com mais de 80% de capturas) |
 | Teto por contrato | 1.000 WCU/s por partição, com a guarda de 5 min no item (o custo por escrita cresce com a taxa) | ~8 op/s sustentadas (conta no ADR-0016) |
@@ -36,7 +36,7 @@ No pico de 5.000 aprovações/s + ~500 recusas/s:
 | Cartão: metade reserva, metade captura | 8.000 | 18.500 |
 | **Pior caso: toda aprovação é captura** (reservas feitas antes do pico) | **10.500** | **21.000** |
 
-**As quotas aprovadas não bastam.** Com uma fração *f* das aprovações sendo captura, são 5.500 + 5.000·*f* entradas/s e 16.000 + 5.000·*f* invocations/s: PutEvents 6.000 estoura a partir de *f* = 10%; Invocations 20.000 aguenta o mix de cartão usando 92% da quota e estoura a partir de *f* = 80%. **Pedir: PutEvents 12.000/s e Invocations 25.000/s** (pior caso + ~15–20%). A tabela de quotas da AWS fala em requisições de PutEvents por segundo e não diz se uma requisição de 10 entradas (o lote do relay) conta 1 ou 10: a conta acima usa a leitura conservadora (entradas). O fan-out por SNS cortaria as invocations (ADR-0009), com outros custos.
+**As quotas aprovadas não bastam.** Com uma fração *f* das aprovações sendo captura, são 5.500 + 5.000·*f* entradas/s e 16.000 + 5.000·*f* invocations/s: PutEvents 6.000 estoura a partir de *f* = 10%; Invocations 20.000 aguenta o mix de cartão usando 92% da quota e estoura a partir de *f* = 80%. **Pedir: PutEvents 12.000/s e Invocations 25.000/s** (pior caso + ~15–20%), **e a quota de WRU por tabela do DynamoDB, ~75.000/s**, que o `autorizacoes-outbox` estoura a partir de ~21% de capturas (seção 1.6). A tabela de quotas da AWS fala em requisições de PutEvents por segundo e não diz se uma requisição de 10 entradas (o lote do relay) conta 1 ou 10: a conta acima usa a leitura conservadora (entradas). O fan-out por SNS cortaria as invocations (ADR-0009), com outros custos.
 
 **Lambdas do caminho assíncrono.** A concorrência da conta (1.000) é compartilhada. O consumidor contábil tem teto de **200** no ESM (`concorrencia_maxima_sqs`): com lotes de ~100 ms, ~10.000 eventos/s, o dobro do pior mix (estimativa: a duração por lote não foi medida na AWS). Relay e CDC usam uma execução por shard de Stream (o número de shards a 5.000 TPS não foi medido). O CDC do `LimiteAlterado` lê **todo** registro do Stream da tabela `limites`, porque toda operação incrementa a `versao` e gera um `MODIFY`: ~5.000 registros/s no pico para publicar quase nada (só mudança de `concedido` ou `status` vira evento). A correção estrutural é um outbox próprio do `limites` no `ATUALIZADO` (ADR-0014). O relay filtra `INSERT` no ESM e não é mais invocado pelos `REMOVE` que ele mesmo gera.
 
@@ -87,9 +87,35 @@ Com canais desiguais a conta é a mesma: o autorizador de cartões leva a maior 
 
 **Sem acesso por conta.** A tabela `limites` tem só `id_contrato` como chave e nenhum GSI por `id_conta` (`modules/dados/main.tf`): listar os 3–5 contratos de uma conta hoje é Scan. O enunciado não pede essa consulta, mas uma plataforma de 80 M de contas vai precisar dela. O caminho é um GSI por `id_conta` com projeção `KEYS_ONLY`: reserva e débito não mudam `id_conta`, então o índice não é escrito no caminho quente.
 
+### 1.6 Escritas no DynamoDB por operação e por mix
+
+Na AWS foi medido só o DEBITO (a carga do k6 da seção 3, consumo por tabela). Os outros tipos são **derivados**: a sequência de escritas de cada um, lida no código, com os valores medidos onde o item é o mesmo e as regras de cobrança da AWS. Escrita de item até 1 KB custa 1 WRU; escrita transacional, 2 WRU por KB; `DeleteItem` e `BatchWriteItem` cobram pelo tamanho do item apagado; escrita condicional que falha também consome; e cada escrita num GSI é cobrada à parte, no índice. Os tamanhos são estimados a partir do código (`_para_item` e `_item_do_outbox` em `autorizacao/adapters/outbound/dynamodb.py`) com as regras de tamanho de item da AWS: a autorização tem menos de 1 KB (483 a 760 bytes); o item do outbox leva o CloudEvent inteiro e tem de 1.064 a 1.260 bytes, conforme o tipo de evento e a presença de `traceparent`. Na cobrança, 2 KB. Daí os 6,12 medidos no outbox: 4 do `Put` na transação e 2 do delete do relay.
+
+| Operação (por chamada) | `limites` | `autorizacoes` | `autorizacoes-outbox` | Contabilização (inbox + lançamento) | Tabelas | GSIs |
+|---|---|---|---|---|---|---|
+| DEBITO (**medido**); CREDITO e RESERVA aprovados fazem as mesmas escritas | 1,09 | 3,06: `PutItem` condicional (1) + `Put` na transação (2) | 6,12 | 4,28 | **14,6** | 2 no `gsi_orfas` (entra ao registrar, sai ao concluir); a RESERVA soma 1 no `gsi_vencimentos` |
+| Captura | ~1,1 | ~5,1: mais o `Update` da reserva original na mesma transação (2) | ~12,2: 2 eventos | ~8,6: 2 eventos | **~27,0** | 3 (a original sai do `gsi_vencimentos`) |
+| Recusa | ~1,1 (a escrita condicional que falha é cobrada) | 3,06 | 6,12 | 0 (`TransacaoRecusada` não vai para a contabilização) | ~10,3 | 2 |
+| Estorno | ~1,1 | ~6,1: mais a marca `estorno_em_curso` na original (1) e o `Update` da original na transação (2) | 6,12 | 4,28 | ~17,6 | 2; 4 se a original é RESERVA |
+| Expiração de reserva (assíncrona) | ~1,1 | 2: `Update` da reserva na transação | 6,12 | 4,28 | ~13,5 | 1 |
+
+Os 3,06 medidos no `autorizacoes` batem com a conta da tabela sozinha (1 + 2): as escritas nos GSIs não cabem nesse número e entram à parte, derivadas, a ~1 WRU cada (entrada menor que 1 KB com projeção `ALL`).
+
+No pico de 5.000 aprovações/s + ~500 recusas/s, com os mixes da seção 1.1, em WRU/s:
+
+| Mix | `autorizacoes-outbox` | `autorizacoes` | Cada tabela da contabilização | `limites` | GSIs | Total |
+|---|---|---|---|---|---|---|
+| Só DEBITO | ~34 k | ~17 k | ~11 k | ~6 k | ~11 k | ~89 k |
+| Cartão: metade reserva, metade captura | **~49 k** | ~22 k | ~16 k | ~6 k | ~16 k | ~125 k |
+| Pior caso: toda aprovação é captura | **~64 k** | ~27 k | ~21 k | ~6 k | ~16 k | ~156 k |
+
+**O outbox estoura a quota padrão.** Em on-demand, a quota é de 40.000 WRU/s por tabela, ajustável, e vale também para cada GSI isoladamente. Com uma fração *f* das aprovações sendo captura, o outbox recebe 33.660 + 30.600·*f* WRU/s e passa de 40.000 a partir de *f* ≈ 21%. As outras tabelas e os GSIs ficam abaixo de 40 k nos três mixes; o maior é o `autorizacoes`, ~27 k no pior caso. **Pedir ~75.000 WRU/s por tabela** (pior caso + ~15%, a mesma folga da seção 1.1). O warm throughput do ADR-0013 foi dimensionado com o DEBITO (61.000 no outbox = 2 × 5.000 × 6,12); a mesma regra de 2× o pico dá ~98 k no mix de cartão.
+
+Fontes: consumo por operação, https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/read-write-operations.html; escrita em GSI, https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html; quotas, https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html.
+
 ## 2. Medição local (LocalStack) — o que ela prova e o que não prova
 
-**Prova (corretude):** a corrida de 100 reservas paralelas termina com 10 × 201 e 90 × 402, saldo final 0 e invariantes preservadas, pela API HTTP ponta a ponta (`make demo`).
+**Prova (corretude):** a corrida de 100 reservas de R$ 100, disparadas por 50 clientes em paralelo num limite de R$ 1.000, termina com 10 × 201, 90 × 402 e disponível final 0, pela API HTTP ponta a ponta (`make demo`).
 
 **Não prova (desempenho).** O DynamoDB da LocalStack 4.14 foi medido isoladamente nesta máquina, sem o nosso código:
 
@@ -157,7 +183,7 @@ O RNF de p99 ≤ 150 ms **não foi atingido** em nenhum degrau; o mais perto foi
 | Fargate x86 (sandbox) | `autorizacao` e `limites`: 2 tasks × 0,5 vCPU / 1 GB cada; `limites-acl` e `reconciliador`: 1 task × 0,25 vCPU / 0,5 GB. ~US$ 5,1/dia, o maior custo ocioso |
 | IPv4 público | Um por task (6) × US$ 0,005/h, ~US$ 0,7/dia |
 | NLB + VPC Link | Custo fixo por hora (NLB: US$ 0,034/h) |
-| WAF | US$ 5/mês pelo web ACL + US$ 1/mês por regra (2) |
+| WAF | US$ 5/mês pelo web ACL + US$ 1/mês por regra (3) |
 | DynamoDB, SQS, EventBridge, Lambda | On-demand, centavos em volume de demo |
 | NAT Gateway | **Não usado** (~US$ 68/mês parado em sa-east-1, valor reportado pelo painel de revisão) |
 | Proteção | Budget de US$ 30/mês com alertas; janela curta com destroy |
@@ -172,14 +198,14 @@ Preços **oficiais de sa-east-1** consultados na AWS Pricing API em 20/10/2026: 
 |---|---|---|
 | Fargate x86, CPU a 60% | 106 vCPU × 0,0696 + 212 GB × 0,0076 | ~9,0 |
 | Fargate x86, CPU a ~33% | 200 vCPU × 0,0696 + 400 GB × 0,0076 | ~17,0 |
-| DynamoDB on-demand, escrita | 5.000 × 14,6 WRU × 3.600 s × 0,9375 / 10⁶ | **~246** |
+| DynamoDB on-demand, escrita (tabelas + GSIs, seção 1.6) | 89 k a 156 k WRU/s, conforme o mix, × 3.600 s × 0,9375 / 10⁶ | **~300 a ~526** |
 
-**A conta de banco domina, de longe**, e não a de computação. Por autorização: ~US$ 0,0000137 só em escrita (US$ 13,7 por milhão).
+**A conta de banco domina, de longe**, e não a de computação. Só em escrita no DynamoDB, com os GSIs: ~US$ 15,5 por milhão de DEBITO (16,6 WRU cada) e ~US$ 28 por milhão de capturas (~30 WRU). A versão anterior desta tabela dava US$ 246/h e US$ 13,7 por milhão porque só contava o DEBITO, sem recusas e sem os GSIs. Medidos são só os 14,6 WRU de tabela do DEBITO; o resto é derivado (seção 1.6).
 
 ## 5. Alavancas de custo e latência, em ordem de retorno
 
-1. **Outbox dentro do item da autorização**, publicado pelo Stream da própria tabela `autorizacoes`, em vez de uma tabela de outbox com transação. Some o `autorizacoes-outbox` (6,1 WRU, 42% do total), a transação vira um `PutItem` condicional (a autorização paga 1× em vez de 2×) e sai do caminho síncrono a operação mais lenta (~21 ms → ~4 ms). Estorno e captura continuam com transação (dois itens). Custo: o relay passa a filtrar o Stream da tabela quente pelos itens com evento novo.
+1. **Outbox dentro do item da autorização**, publicado pelo Stream da própria tabela `autorizacoes`, em vez de uma tabela de outbox com transação. Some o `autorizacoes-outbox` (6,1 WRU por evento, 42% das escritas de tabela do DEBITO; 12,2 na captura) e, com ele, a tabela que estoura a quota nos mixes com captura (seção 1.6). A transação vira um `PutItem` condicional e sai do caminho síncrono a operação mais lenta (~21 ms → ~4 ms). O item da autorização passa a levar o evento e, no DEBITO, fica com 1–2 KB: a escrita dele continua em ~2 WRU, e a economia é a do outbox. A conta de quota do `autorizacoes` precisa ser refeita com o item maior. Estorno e captura continuam com transação (dois itens). Custo: o relay passa a filtrar o Stream da tabela quente pelos itens com evento novo.
 2. **Capacidade provisionada com auto scaling, e reserva para a base**, no lugar de on-demand para o tráfego estável; o on-demand fica para o imprevisível. A cotação depende do perfil de tráfego (não medido aqui).
-3. **Contabilização**: inbox + lançamento custam 4,3 WRU por autorização. O lançamento já tem chave determinística (`Lancamento.id_para(source, id)`); avaliar se a escrita condicional dele basta como deduplicação e dispensa o inbox separado.
+3. **Contabilização**: inbox + lançamento custam 4,3 WRU por evento contabilizado (a captura contabiliza 2). O lançamento já tem chave determinística (`Lancamento.id_para(source, id)`); avaliar se a escrita condicional dele basta como deduplicação e dispensa o inbox separado.
 4. **Graviton (ARM64)**: 20% mais barato por vCPU-hora; a vazão por vCPU precisa ser medida antes de contar com ela.
 5. **Runtime compilado** nos serviços quentes: corta a computação (que já é a menor parte) e ajuda o p99.

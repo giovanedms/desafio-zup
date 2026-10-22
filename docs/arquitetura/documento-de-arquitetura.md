@@ -70,15 +70,17 @@ flowchart TB
   LEG[(Legado)] -.-> FILA_LEG
   DA -- Stream do outbox --> RELAY["Lambda relay<br/>+ sweeper (agendado)"]
   DL -- Stream (CDC LimiteAlterado) --> RELAYCDC["Lambda relay-cdc-limites"]
-  RELAY --> BUS{{"EventBridge bus financas<br/>regras por detail-type · archive"}}
+  RELAY --> BUS{{"EventBridge bus financas<br/>uma regra por consumidor · archive 30 dias"}}
   RELAYCDC --> BUS
+  REG[("Schema registry financas<br/>8 JSON Schemas")] -. "contrato dos eventos" .- BUS
   BUS --> Q1[[SQS contabilizacao + DLQ]] --> CTB["Lambda contabilizacao<br/>partidas dobradas + inbox"] --> DC[("DynamoDB lançamentos + inbox")]
-  BUS --> Q2[[SQS antifraude + DLQ]]
-  BUS --> Q3[[SQS notificacoes + DLQ]]
+  BUS --> Q2[[SQS antifraude + DLQ]] --> CAF["Lambda consumidor-antifraude<br/>valida o schema + inbox"] --> DCA[("DynamoDB inbox antifraude")]
+  BUS --> Q3[[SQS notificacoes + DLQ]] --> CNT["Lambda consumidor-notificacoes<br/>valida o schema + inbox"] --> DCN[("DynamoDB inbox notificacoes")]
+  BUS --> FH["Firehose<br/>data platform"] --> S3P[("S3 data platform<br/>partição por tipo e data<br/>SSE-KMS")]
 ```
 Diagrama: [02-containers.svg](diagramas/02-containers.svg).
 
-O diagrama acima (e o SVG) é anterior a três peças que estão na IaC: os consumidores de referência das filas `antifraude` e `notificacoes` (Lambdas `desafio-consumidor-<fila>`, com inbox própria; `services/consumidores`), a regra `para-plataforma-de-dados` do bus → Firehose → S3 (data platform) e o Schema Registry `financas` com os 8 contratos. Detalhe em `docs/operacao/infraestrutura.md`, seções 4.5, 4.6 e 4.10.
+O diagrama inclui as peças que entraram em 21/10: os consumidores de referência das filas `antifraude` e `notificacoes` (Lambdas `desafio-consumidor-<fila>`, com inbox própria; `services/consumidores`), a regra `para-plataforma-de-dados` do bus → Firehose → S3 (data platform) e o Schema Registry `financas` com os 8 contratos. Detalhe em `docs/operacao/infraestrutura.md`, seções 4.5, 4.6 e 4.10.
 
 ## 4. Fluxo síncrono de uma autorização
 

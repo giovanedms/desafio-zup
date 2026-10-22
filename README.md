@@ -31,8 +31,11 @@ Borda: AWS WAF, Cognito (client credentials com escopo), API key e usage plan po
 `financas`, uma regra por consumidor, cada regra com fila SQS e DLQ; schema registry `financas` com os 8 schemas de
 evento.
 
-Diagramas (Mermaid e SVG) em `docs/arquitetura/diagramas/`: contexto, containers, sequência da autorização, fluxo de
-eventos e implantação na AWS. Descrição completa em `docs/arquitetura/documento-de-arquitetura.md`.
+![Containers e fluxos: borda, serviços ECS, tabelas DynamoDB, relay, bus EventBridge, filas e consumidores, data platform](docs/arquitetura/diagramas/02-containers.svg)
+
+Os cinco diagramas (contexto, containers, sequência da autorização, fluxo de eventos e implantação na AWS) estão em
+`docs/arquitetura/diagramas/`, com o fonte Mermaid, SVG e PNG. Descrição completa em
+`docs/arquitetura/documento-de-arquitetura.md`.
 
 ## Mecanismos
 
@@ -83,6 +86,9 @@ UpdateExpression     SET versao = versao + 1, ops.<id_operacao> = :agora,
 - Evolução de schema verificada na CI (`make compat`): mudança incompatível reprova, e palavra-chave do JSON Schema
   que o gate não conhece também reprova.
 - Entrega at-least-once. Os consumidores deduplicam pelo id do evento (inbox) e não dependem de ordem.
+
+![Fluxo de eventos: outbox e CDC, bus financas, regras, filas com DLQ, consumidores e data platform](docs/arquitetura/diagramas/04-fluxo-de-eventos.svg)
+
 - Medido na AWS: o EventBridge reserializa números do `detail` (`1.00` → `1.0`, `99999998.88` → `9.999999888E7`);
   o valor fica preservado até ~15 dígitos significativos (ADR-0011).
 

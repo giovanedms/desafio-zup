@@ -21,10 +21,12 @@ flowchart LR
   R2["regra para-contabilizacao<br/>Autorizada, Estornada,<br/>ReservaExpirada, ReservaCapturada"]
   R3["regra para-notificacoes<br/>Autorizada, Recusada, Estornada"]
   R4["regra limite-alterado-<br/>para-notificacoes<br/>LimiteAlterado"]
+  R5["regra para-plataforma-<br/>de-dados<br/>todos os eventos"]
   BUS --> R1
   BUS --> R2
   BUS --> R3
   BUS --> R4
+  BUS --> R5
 
   Q1[[SQS antifraude]] --> D1[[antifraude-dlq]]
   Q2[[SQS contabilizacao]] --> D2[[contabilizacao-dlq]]
@@ -38,6 +40,20 @@ flowchart LR
   R2 -.-> DLQE
   R3 -.-> DLQE
   R4 -.-> DLQE
+  R5 -.-> DLQE
+  FH["Firehose<br/>data platform"]
+  S3P[("S3 data platform<br/>partição por tipo e data")]
+  R5 --> FH
+  FH --> S3P
+
+  CAF["Lambda desafio-<br/>consumidor-antifraude<br/>valida o schema"]
+  IAF[("DynamoDB<br/>inbox do consumidor<br/>de antifraude")]
+  CNT["Lambda desafio-<br/>consumidor-notificacoes<br/>valida o schema"]
+  INT[("DynamoDB<br/>inbox do consumidor<br/>de notificações")]
+  Q1 --> CAF
+  CAF --> IAF
+  Q3 --> CNT
+  CNT --> INT
 
   CTB["Lambda desafio-contabilizacao"]
   INB[("DynamoDB<br/>contabilizacao-inbox")]

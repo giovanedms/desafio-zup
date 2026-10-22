@@ -17,7 +17,7 @@ flowchart TB
     NLB --> AUT
     AUT -- "8080 (SG por referência)" --> LIMS
     REC -- "8080 (SG por referência)" --> LIMS
-    DDB[("DynamoDB<br/>5 tabelas")]
+    DDB[("DynamoDB<br/>7 tabelas: 5 dos serviços<br/>+ 2 inboxes dos consumidores")]
     EB{{EventBridge}}
     SQS[["SQS<br/>filas dos consumidores"]]
     LEG[["SQS legado-contratos"]]
@@ -38,6 +38,8 @@ flowchart TB
     DDB --> LAM
     LAM --> EB
     EB --> SQS
+    EB --> FH["Firehose<br/>data platform"]
+    FH --> S3P[("S3 data platform<br/>SSE-KMS")]
     SQS --> LAM
     CORE --> LEG
     LEG --> ACL

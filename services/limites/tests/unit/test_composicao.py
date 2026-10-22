@@ -61,6 +61,16 @@ def test_app_sem_endpoint_vale_o_papel_da_task(chamadas: list[dict[str, Any]]) -
     assert chamada["config"].max_pool_connections == 64
 
 
+def test_caminho_quente_faz_3_tentativas_no_total(chamadas: list[dict[str, Any]]) -> None:
+    """A conta do pior caso de escrita (~38 s < 60 s de graça, ADR-0006) supõe 3 tentativas NO TOTAL.
+
+    `max_attempts: 3` seriam 3 NOVAS, 4 no total (~19 s por chamada, ~59 s no pior caso).
+    """
+    main.construir_app(Configuracao("limites", "sa-east-1", None))
+    (chamada,) = chamadas
+    assert chamada["config"].retries == {"mode": "standard", "total_max_attempts": 3}
+
+
 def test_opcoes_somam_aos_padroes_sem_perder_retry_nem_a_trava_de_endpoint(
     chamadas: list[dict[str, Any]],
 ) -> None:

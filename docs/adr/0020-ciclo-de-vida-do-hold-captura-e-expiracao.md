@@ -31,7 +31,7 @@ E um terceiro, achado ao desenhar os dois primeiros: **captura, estorno e expira
 3. **O hold é o árbitro.** Captura, estorno e expiração viram operações que **removem o hold**. A primeira que remove vence. As outras recebem `RECUSADA` com `RESERVA_NAO_ENCONTRADA`, nunca sucesso silencioso. Só o vencedor atualiza a reserva original (`APROVADA → CAPTURADA | ESTORNADA | EXPIRADA`, CAS "ainda APROVADA, ou na fila humana por falta de hold"), então os dois árbitros (limite e autorização) nunca discordam.
    - Prova: 20 capturas + 10 liberações concorrentes do mesmo hold → exatamente 1 `APLICADA`, na suíte de contrato da porta (memória e DynamoDB/LocalStack). Na demo, pela API pública: 10 capturas × 10 estornos → `{201: 1, 409: 19}`.
 4. **Expirador de reservas** no mesmo processo do reconciliador (ECS, Service Connect para chamar o `limites`), a cada 30 s:
-   - acha as vencidas num **GSI esparso** `gsi_vencimentos` (`venc_shard` RV#0..9, `venc_ms`). Só reserva aprovada e pendente tem esses atributos, e o encerramento os remove. Mesmo desenho do `gsi_orfas` (ADR-0006), sem Scan;
+   - acha as vencidas num **GSI esparso** `gsi_vencimentos` (`venc_shard` RV#0..63, `venc_ms`). Só reserva aprovada e pendente tem esses atributos, e o encerramento os remove. Mesmo desenho do `gsi_orfas` (ADR-0006), sem Scan;
    - libera o hold com id **derivado da reserva** (`id_operacao_de_expiracao`). O expirador que cair no meio repete a mesma operação e a guarda do limite absorve;
    - grava `EXPIRADA` + `ReservaExpirada` no outbox numa transação condicionada a "ainda APROVADA".
 5. **Eventos e contabilidade.** A captura publica dois fatos: `TransacaoAutorizada` (tipo `DEBITO`, com `id_autorizacao_original`, campo opcional novo) e **`ReservaCapturada`** (schema v1 novo). A contabilização lança o débito pelo primeiro e a baixa da compensação, pelo valor reservado inteiro, pelo segundo. Um evento, um lançamento.
@@ -54,7 +54,7 @@ E um terceiro, achado ao desenhar os dois primeiros: **captura, estorno e expira
 ## Quando esta decisão deixa de ser boa
 
 - **Captura incremental** (várias capturas parciais do mesmo hold, como em marketplace): o hold precisaria guardar o saldo restante, e a captura deixaria de removê-lo.
-- **Volume de reservas vencendo por segundo** maior que o expirador consegue drenar com 1 task (cada expiração custa uma chamada ao `limites` e uma transação): várias tasks são seguras (a liberação usa o mesmo id derivado e o CAS escolhe quem grava; a perdedora conta `IGNORADA`, não `FALHOU`), mas fariam trabalho repetido. O certo é dividir os 10 shards do índice entre as tasks.
+- **Volume de reservas vencendo por segundo** maior que o expirador consegue drenar com 1 task (cada expiração custa uma chamada ao `limites` e uma transação): várias tasks são seguras (a liberação usa o mesmo id derivado e o CAS escolhe quem grava; a perdedora conta `IGNORADA`, não `FALHOU`), mas fariam trabalho repetido. O certo é dividir os 64 shards do índice entre as tasks.
 - **O canal precisar de `CAPTURA` explícita no enum** (por exemplo, por padrão de mercado da adquirente): vira um valor novo do enum, mudança aditiva na v1 com o mesmo motor por baixo.
 
 ## Alternativas descartadas

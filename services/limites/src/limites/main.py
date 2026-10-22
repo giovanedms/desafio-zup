@@ -85,7 +85,9 @@ def construir_app(config: Configuracao) -> FastAPI:
         config,
         Config(
             max_pool_connections=64,
-            retries={"mode": "standard", "max_attempts": 3},
+            # 3 tentativas NO TOTAL (max_attempts contaria 3 novas, 4 no total): ~12 s por chamada, base da conta
+            # do pior caso de escrita (~38 s) contra os 60 s de graça do reconciliador (ADR-0006).
+            retries={"mode": "standard", "total_max_attempts": 3},
             connect_timeout=1,
             read_timeout=2,
         ),

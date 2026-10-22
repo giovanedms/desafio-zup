@@ -306,12 +306,16 @@ run "observabilidade_alarmes_com_acao" {
     tabelas                 = ["limites"]
     tabelas_com_latencia    = ["limites"]
     cluster_nome            = "desafio"
-    servicos_ecs            = ["autorizacao"]
-    filas                   = ["contabilizacao", "antifraude", "legado-contratos"]
+    servicos_ecs            = ["autorizacao", "limites"]
+    filas                   = ["contabilizacao", "antifraude", "notificacoes", "legado-contratos"]
     fila_legado             = "legado-contratos"
     dlqs                    = ["contabilizacao-dlq", "financas-entrega-dlq"]
     relay_funcao            = "desafio-relay"
     cdc_funcao              = "desafio-relay-cdc-limites"
+    bus_nome                = "financas"
+    regras_do_bus           = ["para-antifraude", "para-contabilizacao", "para-notificacoes", "limite-alterado-para-notificacoes", "para-plataforma-de-dados"]
+    funcoes_consumidoras    = ["desafio-contabilizacao", "desafio-consumidor-antifraude", "desafio-consumidor-notificacoes"]
+    firehose_nome           = "financas-plataforma-de-dados"
     log_group_limites       = "/ecs/limites"
     log_group_reconciliador = "/ecs/reconciliador"
     log_group_autorizacao   = "/ecs/autorizacao"
@@ -398,7 +402,7 @@ run "observabilidade_alarmes_com_acao" {
   # D2: idade da mensagem mais antiga em TODA fila consumidora; a do legado tem o alarme próprio do ADR-0014.
   assert {
     condition = (
-      toset(keys(aws_cloudwatch_metric_alarm.idade_da_fila)) == toset(["contabilizacao", "antifraude"])
+      toset(keys(aws_cloudwatch_metric_alarm.idade_da_fila)) == toset(["contabilizacao", "antifraude", "notificacoes"])
       && alltrue([for a in aws_cloudwatch_metric_alarm.idade_da_fila : a.metric_name == "ApproximateAgeOfOldestMessage" && a.threshold == 300])
     )
     error_message = "Toda fila consumidora (menos a do legado) deve ter alarme de ApproximateAgeOfOldestMessage > 300 s."
@@ -492,6 +496,70 @@ run "observabilidade_alarmes_com_acao" {
   assert {
     condition     = contains(keys(aws_cloudwatch_metric_alarm.dlq), "financas-entrega-dlq")
     error_message = "A DLQ de entrega do EventBridge deve ter alarme."
+  }
+
+  # Fluxo de eventos ponta a ponta no dashboard (demo). Cada widget é achado pelo título e comparado série a série:
+  # as 5 regras do bus (Invocations e FailedInvocations), as filas consumidoras (visíveis e idade da mais antiga, que
+  # já cobre antifraude e notificacoes), as funções consumidoras, o Firehose da data platform e as tasks por service.
+  assert {
+    condition = (
+      one([for w in jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets : w.properties.metrics if w.properties.title == "EventBridge: invocações por regra do bus financas"]) == [
+        for r in ["para-antifraude", "para-contabilizacao", "para-notificacoes", "limite-alterado-para-notificacoes", "para-plataforma-de-dados"] :
+        ["AWS/Events", "Invocations", "EventBusName", "financas", "RuleName", r]
+      ]
+      && one([for w in jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets : w.properties.metrics if w.properties.title == "EventBridge: FailedInvocations por regra (deve ser 0)"]) == [
+        for r in ["para-antifraude", "para-contabilizacao", "para-notificacoes", "limite-alterado-para-notificacoes", "para-plataforma-de-dados"] :
+        ["AWS/Events", "FailedInvocations", "EventBusName", "financas", "RuleName", r]
+      ]
+    )
+    error_message = "O dashboard deve ter Invocations e FailedInvocations de cada regra do bus financas (3 assinaturas, LimiteAlterado e data platform)."
+  }
+
+  assert {
+    condition = (
+      one([for w in jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets : w.properties.metrics if w.properties.title == "SQS: mensagens visíveis nas filas consumidoras"]) == [
+        for q in ["contabilizacao", "antifraude", "notificacoes", "legado-contratos"] : ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", q]
+      ]
+      && one([for w in jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets : w.properties.metrics if w.properties.title == "SQS: idade da mensagem mais antiga (s)"]) == [
+        for q in ["contabilizacao", "antifraude", "notificacoes", "legado-contratos"] : ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", q]
+      ]
+    )
+    error_message = "Cada fila consumidora (contabilizacao, antifraude, notificacoes e a do legado) deve ter mensagens visíveis e idade da mais antiga no dashboard."
+  }
+
+  assert {
+    condition = [
+      for s in one([for w in jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets : w.properties.metrics if w.properties.title == "Consumidores (Lambda): invocações e erros"]) : slice(s, 0, 4)
+      ] == [
+      for p in setproduct(["Invocations", "Errors"], ["desafio-contabilizacao", "desafio-consumidor-antifraude", "desafio-consumidor-notificacoes"]) :
+      ["AWS/Lambda", p[0], "FunctionName", p[1]]
+    ]
+    error_message = "O dashboard deve ter Invocations e Errors da contabilização e dos 2 consumidores de referência."
+  }
+
+  assert {
+    condition = (
+      [
+        for s in one([for w in jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets : w.properties.metrics if w.properties.title == "Data platform (Firehose): registros entregues no S3 e defasagem (s)"]) :
+        [s[0], s[1], s[2], s[3], s[4].stat]
+        ] == [
+        ["AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", "financas-plataforma-de-dados", "Sum"],
+        ["AWS/Firehose", "DeliveryToS3.DataFreshness", "DeliveryStreamName", "financas-plataforma-de-dados", "Maximum"],
+      ]
+      && one([for w in jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets : w.properties.metrics if w.properties.title == "ECS: tasks em execução"]) == [
+        for s in ["autorizacao", "limites"] : ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "desafio", "ServiceName", s]
+      ]
+    )
+    error_message = "O dashboard deve ter DeliveryToS3.Records (soma) e DeliveryToS3.DataFreshness (máximo) do Firehose da data platform e RunningTaskCount (Container Insights) de cada service."
+  }
+
+  # Widgets do mesmo tamanho (12 x 6): posição repetida seria um widget desenhado em cima de outro.
+  assert {
+    condition = (
+      length(distinct([for w in jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets : "${w.x},${w.y}"])) == length(jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets)
+      && alltrue([for w in jsondecode(aws_cloudwatch_dashboard.this.dashboard_body).widgets : w.width == 12 && w.height == 6])
+    )
+    error_message = "Nenhum widget do dashboard pode ocupar a posição de outro."
   }
 }
 
@@ -699,6 +767,7 @@ run "task_roles_menor_privilegio" {
       fila_legado_nome     = "legado-contratos"
       fila_legado_dlq_nome = "legado-contratos-dlq"
       entrega_dlq_nome     = "financas-entrega-dlq"
+      regras_nomes         = ["para-contabilizacao"]
     }
   }
 
@@ -916,6 +985,12 @@ run "eventos_schema_registry_com_os_contratos" {
     )
     error_message = "A policy da DLQ de entrega deve aceitar as 4 regras do módulo e a regra externa da data platform."
   }
+
+  # Nomes que a raiz passa ao dashboard (dimensão RuleName): os mesmos que o CloudWatch publica no bus financas.
+  assert {
+    condition     = output.regras_nomes == ["para-antifraude", "para-contabilizacao", "para-notificacoes", "limite-alterado-para-notificacoes"]
+    error_message = "regras_nomes deve trazer as 3 regras de assinatura e a do LimiteAlterado."
+  }
 }
 
 # --- Data platform: regra do bus -> Firehose (Direct PUT) -> S3 endurecido; roles de menor privilégio ----------------
@@ -1128,6 +1203,12 @@ run "plataforma_de_dados_firehose_para_s3" {
       && aws_cloudwatch_metric_alarm.defasagem.alarm_actions == toset(["arn:aws:sns:sa-east-1:123456789012:desafio-autorizacao-alarmes"])
     )
     error_message = "O alarme de defasagem da entrega no S3 deve notificar o tópico de alarmes."
+  }
+
+  # Nomes que a raiz passa ao dashboard (RuleName do EventBridge e DeliveryStreamName do Firehose).
+  assert {
+    condition     = output.regra_nome == "para-plataforma-de-dados" && output.firehose_nome == "financas-plataforma-de-dados"
+    error_message = "A regra da data platform é para-plataforma-de-dados e o Firehose é financas-plataforma-de-dados."
   }
 }
 

@@ -3,6 +3,11 @@ output "regra_arn" {
   value       = aws_cloudwatch_event_rule.this.arn
 }
 
+output "regra_nome" {
+  description = "Nome da regra da data platform no bus (widgets do EventBridge no dashboard)."
+  value       = aws_cloudwatch_event_rule.this.name
+}
+
 output "bucket_nome" {
   description = "Bucket onde os eventos chegam (prefixo eventos/tipo=<detail-type>/ano=/mes=/dia=)."
   value       = aws_s3_bucket.this.bucket

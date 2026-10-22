@@ -219,6 +219,7 @@ run "consumidores_no_sandbox" {
       fila_legado_nome     = "legado-contratos"
       fila_legado_dlq_nome = "legado-contratos-dlq"
       entrega_dlq_nome     = "financas-entrega-dlq"
+      regras_nomes         = ["para-antifraude", "para-contabilizacao", "para-notificacoes", "limite-alterado-para-notificacoes"]
     }
   }
 

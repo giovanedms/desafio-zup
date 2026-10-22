@@ -38,6 +38,11 @@ output "regras_arns" {
   value       = { for k, r in aws_cloudwatch_event_rule.this : k => r.arn }
 }
 
+output "regras_nomes" {
+  description = "Nomes de todas as regras do módulo no bus: as das assinaturas e a do LimiteAlterado (widgets do EventBridge no dashboard)."
+  value       = concat([for r in aws_cloudwatch_event_rule.this : r.name], [aws_cloudwatch_event_rule.limite_alterado.name])
+}
+
 output "fila_legado_arn" {
   description = "ARN da fila do feed do legado."
   value       = aws_sqs_queue.legado.arn

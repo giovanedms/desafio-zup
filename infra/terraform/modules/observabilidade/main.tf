@@ -83,7 +83,8 @@ resource "aws_sns_topic_subscription" "email" {
   endpoint  = var.email_alarmes
 }
 
-# Dashboard único: API, DynamoDB, ECS, SQS/DLQ e relay.
+# Dashboard único: API, DynamoDB, ECS, SQS/DLQ, relay, guarda do limite e o fluxo de eventos (EventBridge, consumidores
+# Lambda e Firehose da data platform).
 resource "aws_cloudwatch_dashboard" "this" {
   dashboard_name = var.nome
 
@@ -213,6 +214,74 @@ resource "aws_cloudwatch_dashboard" "this" {
           region      = var.regiao, view = "timeSeries", stat = "Maximum", period = 300
           metrics     = [["desafio-zup/limites", "ReservasAtivas"]]
           annotations = { horizontal = [{ label = "alarme", value = var.limite_reservas_ativas }] }
+        }
+      },
+      # Fluxo de eventos ponta a ponta (demo): bus -> filas -> consumidores, e bus -> Firehose -> S3.
+      {
+        type = "metric", x = 0, y = 36, width = 12, height = 6
+        properties = {
+          title  = "EventBridge: invocações por regra do bus ${var.bus_nome}"
+          region = var.regiao, view = "timeSeries", stat = "Sum", period = 60
+          metrics = [
+            for r in var.regras_do_bus : ["AWS/Events", "Invocations", "EventBusName", var.bus_nome, "RuleName", r]
+          ]
+        }
+      },
+      {
+        # A AWS só publica FailedInvocations quando uma entrega falha: gráfico vazio = nenhuma falha. O que esgota o
+        # retry vai para a financas-entrega-dlq (widget de DLQs).
+        type = "metric", x = 12, y = 36, width = 12, height = 6
+        properties = {
+          title  = "EventBridge: FailedInvocations por regra (deve ser 0)"
+          region = var.regiao, view = "timeSeries", stat = "Sum", period = 60
+          metrics = [
+            for r in var.regras_do_bus : ["AWS/Events", "FailedInvocations", "EventBusName", var.bus_nome, "RuleName", r]
+          ]
+        }
+      },
+      {
+        type = "metric", x = 0, y = 42, width = 12, height = 6
+        properties = {
+          title  = "SQS: mensagens visíveis nas filas consumidoras"
+          region = var.regiao, view = "timeSeries", stat = "Maximum", period = 60
+          metrics = [
+            for q in var.filas : ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", q]
+          ]
+        }
+      },
+      {
+        type = "metric", x = 12, y = 42, width = 12, height = 6
+        properties = {
+          title  = "Consumidores (Lambda): invocações e erros"
+          region = var.regiao, view = "timeSeries", stat = "Sum", period = 60
+          metrics = concat(
+            [for f in var.funcoes_consumidoras : ["AWS/Lambda", "Invocations", "FunctionName", f, { label = "${f} Invocations" }]],
+            [for f in var.funcoes_consumidoras : ["AWS/Lambda", "Errors", "FunctionName", f, { label = "${f} Errors" }]],
+          )
+        }
+      },
+      {
+        # Registros entregues (soma, eixo esquerdo) e idade do registro mais antigo ainda no stream (máximo, eixo
+        # direito). Com a regra desligada (plataforma_de_dados_ativa = false) o stream existe e o gráfico fica vazio.
+        type = "metric", x = 0, y = 48, width = 12, height = 6
+        properties = {
+          title  = "Data platform (Firehose): registros entregues no S3 e defasagem (s)"
+          region = var.regiao, view = "timeSeries", period = 60
+          metrics = [
+            ["AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", var.firehose_nome, { stat = "Sum", label = "DeliveryToS3.Records" }],
+            ["AWS/Firehose", "DeliveryToS3.DataFreshness", "DeliveryStreamName", var.firehose_nome, { stat = "Maximum", label = "DeliveryToS3.DataFreshness (s)", yAxis = "right" }],
+          ]
+        }
+      },
+      {
+        # Métrica do Container Insights (ligado no cluster, na raiz): tasks RUNNING por service.
+        type = "metric", x = 12, y = 48, width = 12, height = 6
+        properties = {
+          title  = "ECS: tasks em execução"
+          region = var.regiao, view = "timeSeries", stat = "Average", period = 60
+          metrics = [
+            for s in var.servicos_ecs : ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", var.cluster_nome, "ServiceName", s]
+          ]
         }
       },
     ]

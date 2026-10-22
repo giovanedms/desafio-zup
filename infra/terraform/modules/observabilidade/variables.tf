@@ -51,6 +51,26 @@ variable "dlqs" {
   type        = list(string)
 }
 
+variable "bus_nome" {
+  description = "Nome do event bus de domínio (dimensão EventBusName dos widgets do EventBridge)."
+  type        = string
+}
+
+variable "regras_do_bus" {
+  description = "Nomes das regras do bus exibidas no dashboard (Invocations e FailedInvocations por regra): as das filas consumidoras, a do LimiteAlterado e a da data platform."
+  type        = list(string)
+}
+
+variable "funcoes_consumidoras" {
+  description = "Funções Lambda que consomem as filas (contabilização e consumidores de referência): invocações e erros no dashboard."
+  type        = list(string)
+}
+
+variable "firehose_nome" {
+  description = "Nome do Firehose da data platform (DeliveryToS3.Records e DeliveryToS3.DataFreshness no dashboard)."
+  type        = string
+}
+
 variable "relay_funcao" {
   description = "Nome da função relay."
   type        = string

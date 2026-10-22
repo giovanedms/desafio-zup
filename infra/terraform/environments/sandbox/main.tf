@@ -473,6 +473,10 @@ module "observabilidade" {
   dlqs                    = concat(values(module.eventos.dlqs_nomes), [module.lambdas.relay_dlq_nome, module.lambdas.cdc_limites_dlq_nome, module.eventos.fila_legado_dlq_nome, module.eventos.entrega_dlq_nome])
   relay_funcao            = module.lambdas.relay_nome
   cdc_funcao              = module.lambdas.cdc_limites_nome
+  bus_nome                = module.eventos.bus_nome
+  regras_do_bus           = concat(module.eventos.regras_nomes, [module.plataforma_de_dados.regra_nome])
+  funcoes_consumidoras    = concat([module.lambdas.contabilizacao_nome], values(module.lambdas.consumidores_funcoes))
+  firehose_nome           = module.plataforma_de_dados.firehose_nome
   log_group_limites       = module.limites.log_group_nome
   log_group_reconciliador = module.reconciliador.log_group_nome
   log_group_autorizacao   = module.autorizacao.log_group_nome

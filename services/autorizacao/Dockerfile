@@ -5,7 +5,7 @@
 # Bases fixadas por DIGEST (tag é mutável; o digest, não). A tag fica para leitura e para o Dependabot, que abre PR
 # quando ela anda. Resolvidas em 21/10/2026: uv 0.12.24 e Python 3.13.16 (Debian trixie), índices multi-arquitetura.
 # Fonte do binário do uv.
-FROM ghcr.io/astral-sh/uv:0.13@sha256:9f130421e930bfbdc563c00740466603f8723158e90297d07957c2294640262b AS uv
+FROM ghcr.io/astral-sh/uv:0.13@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff AS uv
 
 # ---- build: resolve e instala só o necessário para o serviço autorizacao num venv isolado ----
 FROM python:3.13-slim@sha256:cf50a4f6ac4f026458b08d5222023d700ac806410dff5e9ca8728fa44f2b850f AS build

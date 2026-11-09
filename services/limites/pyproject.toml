@@ -5,7 +5,7 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
   "fastapi",
   "uvicorn[standard]",
-  "pydantic>=2",
+  "pydantic>=2.14.2",
   "boto3",
   "simplejson>=4.2.0",
   "plataforma",

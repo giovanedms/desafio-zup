@@ -23,7 +23,7 @@ dev = [
   "ruff",
   "import-linter",
   "boto3-stubs[dynamodb,dynamodbstreams,sqs,events]",
-  "types-simplejson>=4.2.0.20261006",
+  "types-simplejson>=4.3.0.20261112",
   "jsonschema>=4.26.0",
 ]
 
